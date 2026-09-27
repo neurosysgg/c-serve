@@ -61,8 +61,8 @@ int ctui_wm_url_parse(const char *url, CTUI_WM_URL *u, char *err,
     port = colon ? colon + 1 : NULL;
   }
   if (hlen == 0 || hlen >= sizeof u->host) {
-    snprintf(err, err_cap, hlen ? "the URL's host is too long"
-                                : "no host in the URL");
+    snprintf(err, err_cap,
+             hlen ? "the URL's host is too long" : "no host in the URL");
     return -1;
   }
   memcpy(u->host, host, hlen);
@@ -70,8 +70,8 @@ int ctui_wm_url_parse(const char *url, CTUI_WM_URL *u, char *err,
     size_t plen = (size_t)(p + alen - port);
     long v = 0;
     for (size_t i = 0; i < plen; i++) {
-      if (port[i] < '0' || port[i] > '9' || (v = v * 10 + (port[i] - '0')) >
-                                                 65535) {
+      if (port[i] < '0' || port[i] > '9' ||
+          (v = v * 10 + (port[i] - '0')) > 65535) {
         snprintf(err, err_cap, "a bad port in the URL");
         return -1;
       }
@@ -299,8 +299,8 @@ static int dechunk(const char *p, const char *end, char **out, size_t *len,
       size = size * 16 + (size_t)d;
     }
     /* after the size: an extension (";..."), spaces, the CR */
-    if (!digits || (c < nl && *c != ';' && *c != ' ' && *c != '\t' &&
-                    *c != '\r')) {
+    if (!digits ||
+        (c < nl && *c != ';' && *c != ' ' && *c != '\t' && *c != '\r')) {
       free(o.s);
       snprintf(err, err_cap, "a bad chunk size");
       return -1;
@@ -346,9 +346,9 @@ int ctui_wm_http_parse(const char *buf, size_t n, CTUI_WM_HTTP_PARSED *out,
     size_t ll = nl ? line_len(p, nl) : 0;
     /* HTTP/1.x NNN[ reason] */
     if (!nl || ll < 12 || strncmp(p, "HTTP/1.", 7) || p[7] < '0' ||
-        p[7] > '9' || p[8] != ' ' ||
-        p[9] < '1' || p[9] > '9' || p[10] < '0' || p[10] > '9' ||
-        p[11] < '0' || p[11] > '9' || (ll > 12 && p[12] != ' ')) {
+        p[7] > '9' || p[8] != ' ' || p[9] < '1' || p[9] > '9' || p[10] < '0' ||
+        p[10] > '9' || p[11] < '0' || p[11] > '9' ||
+        (ll > 12 && p[12] != ' ')) {
       snprintf(err, err_cap, n ? "not an HTTP reply" : "an empty reply");
       return -1;
     }

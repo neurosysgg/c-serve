@@ -79,8 +79,8 @@ static int connect_one(const struct addrinfo *ai, long deadline, char *err,
   return fd;
 }
 
-CTUI_WM_CONN *ctui_wm_conn_open(const CTUI_WM_URL *u, long deadline,
-                                char *err, size_t err_cap) {
+CTUI_WM_CONN *ctui_wm_conn_open(const CTUI_WM_URL *u, long deadline, char *err,
+                                size_t err_cap) {
   struct addrinfo hints = {.ai_family = AF_UNSPEC,
                            .ai_socktype = SOCK_STREAM,
                            .ai_flags = AI_ADDRCONFIG};

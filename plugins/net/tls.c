@@ -154,8 +154,8 @@ fail:
   return NULL;
 }
 
-int ctui_wm_tls_write(CTUI_WM_TLS *t, const char *buf, size_t n,
-                      long deadline, char *err, size_t err_cap) {
+int ctui_wm_tls_write(CTUI_WM_TLS *t, const char *buf, size_t n, long deadline,
+                      char *err, size_t err_cap) {
   while (n > 0) {
     int w = mbedtls_ssl_write(&t->ssl, (const unsigned char *)buf, n);
     if (w > 0) {

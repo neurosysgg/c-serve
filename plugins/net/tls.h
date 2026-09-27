@@ -16,8 +16,8 @@ typedef struct CTUI_WM_TLS CTUI_WM_TLS;
 CTUI_WM_TLS *ctui_wm_tls_open(int fd, const char *host, long deadline,
                               char *err, size_t err_cap);
 /* all of buf: 0, or -1 with why in err */
-int ctui_wm_tls_write(CTUI_WM_TLS *t, const char *buf, size_t n,
-                      long deadline, char *err, size_t err_cap);
+int ctui_wm_tls_write(CTUI_WM_TLS *t, const char *buf, size_t n, long deadline,
+                      char *err, size_t err_cap);
 /* up to n bytes: how many, 0 at the end, -1 with why in err */
 ssize_t ctui_wm_tls_read(CTUI_WM_TLS *t, char *buf, size_t n, long deadline,
                          char *err, size_t err_cap);

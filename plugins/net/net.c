@@ -15,8 +15,8 @@
 
 /* one exchange with u: the whole reply read into *buf, its length *n */
 static int exchange(const CTUI_WM_URL *u, const char *req, size_t req_len,
-                    size_t max, long deadline, char **buf, size_t *n,
-                    char *err, size_t err_cap) {
+                    size_t max, long deadline, char **buf, size_t *n, char *err,
+                    size_t err_cap) {
   CTUI_WM_CONN *c = ctui_wm_conn_open(u, deadline, err, err_cap);
   if (!c) {
     return -1;

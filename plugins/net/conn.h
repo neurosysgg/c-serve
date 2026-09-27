@@ -23,8 +23,8 @@ int ctui_wm_net_wait(int fd, short events, long deadline, char *err,
 
 /* connected (and the TLS handshake done, the host's certificate checked)
  * to u's host, or NULL with why in err */
-CTUI_WM_CONN *ctui_wm_conn_open(const CTUI_WM_URL *u, long deadline,
-                                char *err, size_t err_cap);
+CTUI_WM_CONN *ctui_wm_conn_open(const CTUI_WM_URL *u, long deadline, char *err,
+                                size_t err_cap);
 /* all of buf sent: 0, or -1 with why in err */
 int ctui_wm_conn_write(CTUI_WM_CONN *c, const char *buf, size_t n, char *err,
                        size_t err_cap);

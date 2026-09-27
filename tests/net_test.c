@@ -39,18 +39,18 @@ static void test_urls(void) {
                        !strcmp(u.path, "/v1/forecast?latitude=1&x=%20"),
                    "https URL: host, port 443, path with the query, no "
                    "fragment");
-  CTUI_TEST_ASSERT(ctui_wm_url_parse("HTTP://h:8080?q=1", &u, g_err,
-                                     sizeof g_err) == 0 &&
-                       !u.tls && !strcmp(u.port, "8080") &&
-                       !strcmp(u.path, "/?q=1"),
-                   "http URL: its port, a query without a path gets '/'");
-  CTUI_TEST_ASSERT(ctui_wm_url_parse("http://[::1]:81/x", &u, g_err,
-                                     sizeof g_err) == 0 &&
-                       !strcmp(u.host, "::1") && !strcmp(u.port, "81"),
-                   "an IPv6 literal without its brackets");
-  const char *bad[] = {"ftp://h/",        "https://u:pw@h/", "https://h/a b",
-                       "https://h:0/",    "https://h:70000/", "https:///x",
-                       "https://h:/",     "https://[::1/",   "https://h/\xc3\xa4"};
+  CTUI_TEST_ASSERT(
+      ctui_wm_url_parse("HTTP://h:8080?q=1", &u, g_err, sizeof g_err) == 0 &&
+          !u.tls && !strcmp(u.port, "8080") && !strcmp(u.path, "/?q=1"),
+      "http URL: its port, a query without a path gets '/'");
+  CTUI_TEST_ASSERT(
+      ctui_wm_url_parse("http://[::1]:81/x", &u, g_err, sizeof g_err) == 0 &&
+          !strcmp(u.host, "::1") && !strcmp(u.port, "81"),
+      "an IPv6 literal without its brackets");
+  const char *bad[] = {
+      "ftp://h/",     "https://u:pw@h/",  "https://h/a b",
+      "https://h:0/", "https://h:70000/", "https:///x",
+      "https://h:/",  "https://[::1/",    "https://h/\xc3\xa4"};
   for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
     g_err[0] = '\0';
     CTUI_TEST_ASSERT(ctui_wm_url_parse(bad[i], &u, g_err, sizeof g_err) != 0 &&
@@ -61,23 +61,23 @@ static void test_urls(void) {
   CTUI_WM_URL base, r;
   ctui_wm_url_parse("https://a.example:444/dir/page?x=1", &base, g_err,
                     sizeof g_err);
-  CTUI_TEST_ASSERT(ctui_wm_url_resolve(&base, "http://b/", &r, g_err,
-                                       sizeof g_err) == 0 &&
-                       !r.tls && !strcmp(r.host, "b"),
-                   "an absolute Location");
-  CTUI_TEST_ASSERT(ctui_wm_url_resolve(&base, "//c/p", &r, g_err,
-                                       sizeof g_err) == 0 &&
-                       r.tls && !strcmp(r.host, "c") && !strcmp(r.path, "/p"),
-                   "a scheme-relative Location keeps https");
-  CTUI_TEST_ASSERT(ctui_wm_url_resolve(&base, "/top?y", &r, g_err,
-                                       sizeof g_err) == 0 &&
-                       !strcmp(r.host, "a.example") &&
-                       !strcmp(r.port, "444") && !strcmp(r.path, "/top?y"),
-                   "an absolute path: same host and port");
-  CTUI_TEST_ASSERT(ctui_wm_url_resolve(&base, "other", &r, g_err,
-                                       sizeof g_err) == 0 &&
-                       !strcmp(r.path, "/dir/other"),
-                   "a relative path: from the page's folder");
+  CTUI_TEST_ASSERT(
+      ctui_wm_url_resolve(&base, "http://b/", &r, g_err, sizeof g_err) == 0 &&
+          !r.tls && !strcmp(r.host, "b"),
+      "an absolute Location");
+  CTUI_TEST_ASSERT(
+      ctui_wm_url_resolve(&base, "//c/p", &r, g_err, sizeof g_err) == 0 &&
+          r.tls && !strcmp(r.host, "c") && !strcmp(r.path, "/p"),
+      "a scheme-relative Location keeps https");
+  CTUI_TEST_ASSERT(
+      ctui_wm_url_resolve(&base, "/top?y", &r, g_err, sizeof g_err) == 0 &&
+          !strcmp(r.host, "a.example") && !strcmp(r.port, "444") &&
+          !strcmp(r.path, "/top?y"),
+      "an absolute path: same host and port");
+  CTUI_TEST_ASSERT(
+      ctui_wm_url_resolve(&base, "other", &r, g_err, sizeof g_err) == 0 &&
+          !strcmp(r.path, "/dir/other"),
+      "a relative path: from the page's folder");
 }
 
 static void test_format(void) {
@@ -86,13 +86,13 @@ static void test_format(void) {
   size_t len;
   ctui_wm_url_parse("https://h.example/p?q", &u, g_err, sizeof g_err);
   CTUI_WM_HTTP_REQ get = {.url = "unused"};
-  CTUI_TEST_ASSERT(ctui_wm_http_format(&get, &u, &out, &len) == 0 &&
-                       !strncmp(out, "GET /p?q HTTP/1.1\r\nHost: h.example\r\n",
-                                36) &&
-                       strstr(out, "Connection: close\r\n") &&
-                       !strstr(out, "Content-Length") &&
-                       len > 4 && !strcmp(out + len - 4, "\r\n\r\n"),
-                   "a GET: Host without the default port, no body");
+  CTUI_TEST_ASSERT(
+      ctui_wm_http_format(&get, &u, &out, &len) == 0 &&
+          !strncmp(out, "GET /p?q HTTP/1.1\r\nHost: h.example\r\n", 36) &&
+          strstr(out, "Connection: close\r\n") &&
+          !strstr(out, "Content-Length") && len > 4 &&
+          !strcmp(out + len - 4, "\r\n\r\n"),
+      "a GET: Host without the default port, no body");
   free(out);
 
   ctui_wm_url_parse("http://h:8080/t", &u, g_err, sizeof g_err);
@@ -155,10 +155,10 @@ static void test_replies(void) {
                    "an interim 100 skipped");
   free(p.body);
 
-  CTUI_TEST_ASSERT(parse("HTTP/1.1 204 No Content\r\nContent-Length: 9\r\n\r\n",
-                         &p) == 0 &&
-                       p.len == 0 && p.body && !p.body[0],
-                   "204: no body whatever it says");
+  CTUI_TEST_ASSERT(
+      parse("HTTP/1.1 204 No Content\r\nContent-Length: 9\r\n\r\n", &p) == 0 &&
+          p.len == 0 && p.body && !p.body[0],
+      "204: no body whatever it says");
   free(p.body);
 
   const char *bad[] = {
@@ -220,8 +220,8 @@ static void serve(int ls) {
     size_t n = 0;
     ssize_t r;
     /* the request, its body included (they're small) */
-    while (n < sizeof req - 1 && (r = recv(c, req + n, sizeof req - 1 - n,
-                                           0)) > 0) {
+    while (n < sizeof req - 1 &&
+           (r = recv(c, req + n, sizeof req - 1 - n, 0)) > 0) {
       n += (size_t)r;
       req[n] = '\0';
       char *hend = strstr(req, "\r\n\r\n");
