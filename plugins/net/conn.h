@@ -10,7 +10,10 @@
  * name resolves to, in order, until one answers), TLS on it for https
  * (tls.h). Every call gives up at the deadline (CLOCK_MONOTONIC ms, as
  * ctui_wm_net_now() gives it); only the name lookup can't be cut short
- * (getaddrinfo() has its resolver's own timeouts). */
+ * (getaddrinfo() has its resolver's own timeouts). A long-lived one
+ * (ctui-mail's IMAP and SMTP: the URL only brings host, port and tls)
+ * moves its deadline per exchange and reads lines and counted bytes
+ * through a buffer. */
 
 typedef struct CTUI_WM_CONN CTUI_WM_CONN;
 
@@ -33,5 +36,29 @@ int ctui_wm_conn_write(CTUI_WM_CONN *c, const char *buf, size_t n, char *err,
 ssize_t ctui_wm_conn_read(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
                           size_t err_cap);
 void ctui_wm_conn_close(CTUI_WM_CONN *c);
+
+/* the deadline every call from now on gives up at */
+void ctui_wm_conn_deadline(CTUI_WM_CONN *c, long deadline);
+/* TCP keepalive probes after idle_s quiet seconds (a connection idling
+ * for minutes, like IMAP IDLE, notices a dead peer) */
+void ctui_wm_conn_keepalive(CTUI_WM_CONN *c, int idle_s);
+/* TLS started on a plain connection (after the protocol's STARTTLS), the
+ * certificate checked against host: 0, or -1 with why in err */
+int ctui_wm_conn_starttls(CTUI_WM_CONN *c, const char *host, char *err,
+                          size_t err_cap);
+/* its socket, for a caller polling it with fds of its own; a read may
+ * have data without the socket being readable: see pending() */
+int ctui_wm_conn_fd(const CTUI_WM_CONN *c);
+/* whether a read returns at once (bytes buffered here or in TLS) */
+int ctui_wm_conn_pending(const CTUI_WM_CONN *c);
+
+/* the next line (up to LF; its CRLF or LF not in it), at most max bytes:
+ * its length with *line pointing at it (valid until the next read,
+ * NUL-terminated); -1 with why in err (the peer closed, too long) */
+ssize_t ctui_wm_conn_line(CTUI_WM_CONN *c, const char **line, size_t max,
+                          char *err, size_t err_cap);
+/* exactly n bytes into buf: 0, or -1 with why in err */
+int ctui_wm_conn_bytes(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
+                       size_t err_cap);
 
 #endif

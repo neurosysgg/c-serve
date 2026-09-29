@@ -191,6 +191,10 @@ ssize_t ctui_wm_tls_read(CTUI_WM_TLS *t, char *buf, size_t n, long deadline,
   }
 }
 
+size_t ctui_wm_tls_pending(const CTUI_WM_TLS *t) {
+  return mbedtls_ssl_get_bytes_avail(&t->ssl);
+}
+
 void ctui_wm_tls_close(CTUI_WM_TLS *t) {
   if (!t) {
     return;

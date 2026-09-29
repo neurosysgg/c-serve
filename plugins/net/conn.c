@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +20,10 @@
 struct CTUI_WM_CONN {
   int fd;
   long deadline;
-  CTUI_WM_TLS *tls; /* NULL: plain http */
+  CTUI_WM_TLS *tls; /* NULL: plain */
+  /* what line() read past its line: in[off, len) */
+  char *in;
+  size_t off, len, cap;
 };
 
 long ctui_wm_net_now(void) {
@@ -141,8 +146,9 @@ int ctui_wm_conn_write(CTUI_WM_CONN *c, const char *buf, size_t n, char *err,
   return 0;
 }
 
-ssize_t ctui_wm_conn_read(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
-                          size_t err_cap) {
+/* the socket (or TLS) straight, past the buffer */
+static ssize_t raw_read(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
+                        size_t err_cap) {
   if (c->tls) {
     return ctui_wm_tls_read(c->tls, buf, n, c->deadline, err, err_cap);
   }
@@ -161,6 +167,17 @@ ssize_t ctui_wm_conn_read(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
   }
 }
 
+ssize_t ctui_wm_conn_read(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
+                          size_t err_cap) {
+  if (c->off < c->len) {
+    size_t k = c->len - c->off < n ? c->len - c->off : n;
+    memcpy(buf, c->in + c->off, k);
+    c->off += k;
+    return (ssize_t)k;
+  }
+  return raw_read(c, buf, n, err, err_cap);
+}
+
 void ctui_wm_conn_close(CTUI_WM_CONN *c) {
   if (!c) {
     return;
@@ -169,5 +186,108 @@ void ctui_wm_conn_close(CTUI_WM_CONN *c) {
     ctui_wm_tls_close(c->tls);
   }
   close(c->fd);
+  free(c->in);
   free(c);
+}
+
+void ctui_wm_conn_deadline(CTUI_WM_CONN *c, long deadline) {
+  c->deadline = deadline;
+}
+
+void ctui_wm_conn_keepalive(CTUI_WM_CONN *c, int idle_s) {
+  int on = 1, intvl = 30, cnt = 4;
+  setsockopt(c->fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);
+  setsockopt(c->fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_s, sizeof idle_s);
+  setsockopt(c->fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+  setsockopt(c->fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+}
+
+int ctui_wm_conn_starttls(CTUI_WM_CONN *c, const char *host, char *err,
+                          size_t err_cap) {
+  if (c->tls) {
+    snprintf(err, err_cap, "TLS already");
+    return -1;
+  }
+  /* anything the server sent after its go-ahead would be plaintext
+   * injected ahead of the handshake (CVE-2011-0411's class) */
+  if (c->off < c->len) {
+    snprintf(err, err_cap, "the server sent more before TLS started");
+    return -1;
+  }
+  c->tls = ctui_wm_tls_open(c->fd, host, c->deadline, err, err_cap);
+  return c->tls ? 0 : -1;
+}
+
+int ctui_wm_conn_fd(const CTUI_WM_CONN *c) { return c->fd; }
+
+int ctui_wm_conn_pending(const CTUI_WM_CONN *c) {
+  return c->off < c->len || (c->tls && ctui_wm_tls_pending(c->tls) > 0);
+}
+
+ssize_t ctui_wm_conn_line(CTUI_WM_CONN *c, const char **line, size_t max,
+                          char *err, size_t err_cap) {
+  /* the last line handed out is used up: keep only what follows it */
+  if (c->off > 0) {
+    memmove(c->in, c->in + c->off, c->len - c->off);
+    c->len -= c->off;
+    c->off = 0;
+  }
+  size_t scanned = 0;
+  for (;;) {
+    char *lf = c->len > scanned
+                   ? memchr(c->in + scanned, '\n', c->len - scanned)
+                   : NULL;
+    if (lf) {
+      size_t n = (size_t)(lf - c->in);
+      c->off = n + 1;
+      if (n > 0 && c->in[n - 1] == '\r') {
+        n--;
+      }
+      c->in[n] = '\0';
+      *line = c->in;
+      return (ssize_t)n;
+    }
+    scanned = c->len;
+    if (c->len > max) {
+      snprintf(err, err_cap, "a line over %zu bytes", max);
+      return -1;
+    }
+    if (c->cap - c->len < 4096) {
+      size_t cap = c->cap ? c->cap * 2 : 8192;
+      char *in = realloc(c->in, cap);
+      if (!in) {
+        snprintf(err, err_cap, "out of memory");
+        return -1;
+      }
+      c->in = in;
+      c->cap = cap;
+    }
+    /* one byte kept back for the NUL a line gets */
+    ssize_t r = raw_read(c, c->in + c->len, c->cap - c->len - 1, err, err_cap);
+    if (r < 0) {
+      return -1;
+    }
+    if (r == 0) {
+      snprintf(err, err_cap, "the server closed the connection");
+      return -1;
+    }
+    c->len += (size_t)r;
+  }
+}
+
+int ctui_wm_conn_bytes(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
+                       size_t err_cap) {
+  while (n > 0) {
+    ssize_t r = ctui_wm_conn_read(c, buf, n, err, err_cap);
+    if (r < 0) {
+      return -1;
+    }
+    if (r == 0) {
+      snprintf(err, err_cap, "the server closed the connection");
+      return -1;
+    }
+    buf += r;
+    n -= (size_t)r;
+  }
+  return 0;
 }

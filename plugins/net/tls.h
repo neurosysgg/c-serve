@@ -21,6 +21,9 @@ int ctui_wm_tls_write(CTUI_WM_TLS *t, const char *buf, size_t n, long deadline,
 /* up to n bytes: how many, 0 at the end, -1 with why in err */
 ssize_t ctui_wm_tls_read(CTUI_WM_TLS *t, char *buf, size_t n, long deadline,
                          char *err, size_t err_cap);
+/* bytes decrypted and waiting: a read gets them without the socket being
+ * readable */
+size_t ctui_wm_tls_pending(const CTUI_WM_TLS *t);
 /* a close_notify when it can go at once, then freed (not the fd) */
 void ctui_wm_tls_close(CTUI_WM_TLS *t);
 
