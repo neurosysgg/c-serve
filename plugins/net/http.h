@@ -7,9 +7,9 @@
 
 /* The pure half of the net plugin's HTTP/1.1 client: URLs, the request
  * and the reply, on buffers (no sockets here, so the tests and the fuzzer
- * take it as it is). A reply is read whole (the request says
- * "Connection: close") and parsed at once: status line, headers, then
- * the body by Content-Length, chunked, or up to the end. */
+ * take it as it is). A reply (the request says "Connection: close") is
+ * decoded as it arrives: status line, headers, then the body by
+ * Content-Length, chunked, or up to the end. */
 
 typedef struct {
   int tls;         /* https */
@@ -54,5 +54,45 @@ int ctui_wm_http_parse(const char *buf, size_t n, CTUI_WM_HTTP_PARSED *out,
  * val, trimmed: 1, or 0 if there is none (or it doesn't fit) */
 int ctui_wm_http_header(const CTUI_WM_HTTP_PARSED *p, const char *name,
                         char *val, size_t cap);
+/* the same in a reply the client gave (the `net` slot's `header`) */
+int ctui_wm_http_reply_header(const CTUI_WM_HTTP_REPLY *rep, const char *name,
+                              char *val, size_t cap);
+
+/* A reply decoded as it arrives, fed in pieces of any size: the status
+ * line and headers gathered (interim 1xx replies skipped), then on_head()
+ * called, then the body handed to on_body() decoded (Content-Length, chunked,
+ * or up to the end). ctui_wm_http_parse() is this, fed once. */
+typedef struct CTUI_WM_HTTP_DEC CTUI_WM_HTTP_DEC;
+struct CTUI_WM_HTTP_DEC {
+  /* non-zero from either stops the reply there (fed() then returns 1) */
+  int (*on_head)(CTUI_WM_HTTP_DEC *d); /* optional */
+  int (*on_body)(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n);
+  void *ctx;
+  /* once on_head() is called: */
+  int status;
+  const char *headers; /* the header lines, as in CTUI_WM_HTTP_PARSED */
+  size_t headers_len;
+  size_t head_at; /* where the reply (after interim ones) started in what
+                   * was fed */
+  /* the decoder's own */
+  int state, stopped;
+  char *head; /* the head so far (malloc'd) */
+  size_t head_len, head_cap, fed;
+  unsigned long long left; /* of the Content-Length, or of the chunk */
+  char line[64];           /* a chunk's size line so far */
+  size_t line_len;
+};
+
+/* d ready for a reply (the caller sets on_head, on_body and ctx after) */
+void ctui_wm_http_dec_init(CTUI_WM_HTTP_DEC *d);
+/* n more bytes: 0 = more wanted, 1 = the reply is complete (or stopped:
+ * d->stopped; the bytes after its end are ignored), -1 with why in err
+ * (not HTTP, a bad length or chunk) */
+int ctui_wm_http_dec_feed(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n,
+                          char *err, size_t err_cap);
+/* the server closed: 0 if that ends the reply (a body read to the end),
+ * or -1 with why in err (it ended inside its headers or body) */
+int ctui_wm_http_dec_end(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap);
+void ctui_wm_http_dec_free(CTUI_WM_HTTP_DEC *d);
 
 #endif

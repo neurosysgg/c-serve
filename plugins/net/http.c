@@ -270,131 +270,60 @@ int ctui_wm_http_header(const CTUI_WM_HTTP_PARSED *p, const char *name,
   return header_in(p->headers, p->headers_len, name, val, cap);
 }
 
-/* a chunked body from p..end, decoded into *out */
-static int dechunk(const char *p, const char *end, char **out, size_t *len,
-                   char *err, size_t err_cap) {
-  OUT o = {0};
-  out_add(&o, "", 0);
-  for (;;) {
-    const char *nl = line_end(p, end);
-    if (!nl) {
-      break;
-    }
-    size_t size = 0;
-    const char *c = p;
-    int digits = 0;
-    for (; c < nl; c++, digits++) {
-      int d = *c >= '0' && *c <= '9'   ? *c - '0'
-              : *c >= 'a' && *c <= 'f' ? *c - 'a' + 10
-              : *c >= 'A' && *c <= 'F' ? *c - 'A' + 10
-                                       : -1;
-      if (d < 0) {
-        break;
-      }
-      if (size > (((size_t)-1) >> 4)) {
-        free(o.s);
-        snprintf(err, err_cap, "a chunk too big");
-        return -1;
-      }
-      size = size * 16 + (size_t)d;
-    }
-    /* after the size: an extension (";..."), spaces, the CR */
-    if (!digits ||
-        (c < nl && *c != ';' && *c != ' ' && *c != '\t' && *c != '\r')) {
-      free(o.s);
-      snprintf(err, err_cap, "a bad chunk size");
-      return -1;
-    }
-    p = nl + 1;
-    if (size == 0) {
-      /* the last chunk (trailers after it ignored) */
-      if (o.oom) {
-        free(o.s);
-        snprintf(err, err_cap, "out of memory");
-        return -1;
-      }
-      *out = o.s;
-      *len = o.len;
-      return 0;
-    }
-    if (size > (size_t)(end - p)) {
-      break;
-    }
-    out_add(&o, p, size);
-    p += size;
-    /* the chunk's CRLF */
-    if (p < end && *p == '\r') {
-      p++;
-    }
-    if (p < end && *p == '\n') {
-      p++;
-    } else {
-      break;
-    }
-  }
-  free(o.s);
-  snprintf(err, err_cap, "the reply ended inside its body");
-  return -1;
+int ctui_wm_http_reply_header(const CTUI_WM_HTTP_REPLY *rep, const char *name,
+                              char *val, size_t cap) {
+  return rep->headers &&
+         header_in(rep->headers, rep->headers_len, name, val, cap);
 }
 
-int ctui_wm_http_parse(const char *buf, size_t n, CTUI_WM_HTTP_PARSED *out,
-                       char *err, size_t err_cap) {
-  memset(out, 0, sizeof *out);
-  const char *p = buf, *end = buf + n;
-  for (;;) {
-    const char *nl = line_end(p, end);
-    size_t ll = nl ? line_len(p, nl) : 0;
-    /* HTTP/1.x NNN[ reason] */
-    if (!nl || ll < 12 || strncmp(p, "HTTP/1.", 7) || p[7] < '0' ||
-        p[7] > '9' || p[8] != ' ' || p[9] < '1' || p[9] > '9' || p[10] < '0' ||
-        p[10] > '9' || p[11] < '0' || p[11] > '9' ||
-        (ll > 12 && p[12] != ' ')) {
-      snprintf(err, err_cap, n ? "not an HTTP reply" : "an empty reply");
-      return -1;
-    }
-    out->status = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
-    p = nl + 1;
-    /* the headers, up to the blank line */
-    const char *h = p;
-    for (;;) {
-      nl = line_end(p, end);
-      if (!nl) {
-        snprintf(err, err_cap, "the reply ended inside its headers");
-        return -1;
-      }
-      int blank = line_len(p, nl) == 0;
-      p = nl + 1;
-      if (blank) {
-        break;
-      }
-    }
-    out->headers = h;
-    out->headers_len = (size_t)(p - h);
-    /* an interim reply (100 Continue, ...): the real one follows */
-    if (out->status >= 100 && out->status < 200 && out->status != 101) {
-      continue;
-    }
-    break;
+/* --- decoding a reply as it arrives --- */
+
+#define HEAD_MAX 65536
+
+enum { D_HEAD, D_LEN, D_CLOSE, D_CSIZE, D_CDATA, D_CCR, D_CLF, D_DONE };
+
+void ctui_wm_http_dec_init(CTUI_WM_HTTP_DEC *d) {
+  memset(d, 0, sizeof *d);
+  d->state = D_HEAD;
+}
+
+void ctui_wm_http_dec_free(CTUI_WM_HTTP_DEC *d) {
+  free(d->head);
+  d->head = NULL;
+}
+
+/* HTTP/1.x NNN[ reason] */
+static int status_line(const char *p, size_t ll) {
+  if (ll < 12 || strncmp(p, "HTTP/1.", 7) || p[7] < '0' || p[7] > '9' ||
+      p[8] != ' ' || p[9] < '1' || p[9] > '9' || p[10] < '0' || p[10] > '9' ||
+      p[11] < '0' || p[11] > '9' || (ll > 12 && p[12] != ' ')) {
+    return -1;
   }
-  if (out->status < 200 || out->status == 204 || out->status == 304) {
-    out->body = calloc(1, 1);
-    if (!out->body) {
-      snprintf(err, err_cap, "out of memory");
-      return -1;
-    }
+  return (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
+}
+
+/* the head is complete: an interim reply dropped (0, more head wanted),
+ * or the body's framing chosen (0), or -1 with why in err */
+static int head_done(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
+  if (d->status >= 100 && d->status < 200 && d->status != 101) {
+    d->head_len = 0;
+    d->status = 0;
+    d->head_at = d->fed;
     return 0;
   }
+  const char *nl = memchr(d->head, '\n', d->head_len);
+  d->headers = nl + 1;
+  d->headers_len = (size_t)(d->head + d->head_len - d->headers);
   char v[64];
-  size_t have = (size_t)(end - p), take = have;
-  if (header_in(out->headers, out->headers_len, "Transfer-Encoding", v,
-                sizeof v)) {
+  if (d->status < 200 || d->status == 204 || d->status == 304) {
+    d->state = D_DONE;
+  } else if (header_in(d->headers, d->headers_len, "Transfer-Encoding", v,
+                       sizeof v)) {
     for (char *c = v; *c; c++) {
       *c = (char)(*c >= 'A' && *c <= 'Z' ? *c + 32 : *c);
     }
-    if (strstr(v, "chunked")) {
-      return dechunk(p, end, &out->body, &out->len, err, err_cap);
-    }
-  } else if (header_in(out->headers, out->headers_len, "Content-Length", v,
+    d->state = strstr(v, "chunked") ? D_CSIZE : D_CLOSE;
+  } else if (header_in(d->headers, d->headers_len, "Content-Length", v,
                        sizeof v)) {
     char *e;
     errno = 0;
@@ -403,19 +332,210 @@ int ctui_wm_http_parse(const char *buf, size_t n, CTUI_WM_HTTP_PARSED *out,
       snprintf(err, err_cap, "a bad Content-Length");
       return -1;
     }
-    if (cl > have) {
-      snprintf(err, err_cap, "the reply ended inside its body");
+    d->left = cl;
+    d->state = cl ? D_LEN : D_DONE;
+  } else {
+    d->state = D_CLOSE;
+  }
+  if (d->on_head && d->on_head(d)) {
+    d->stopped = 1;
+  }
+  return 0;
+}
+
+/* one byte of the head (it's small: a byte at a time keeps the line
+ * bookkeeping simple): 0, or -1 with why in err */
+static int head_byte(CTUI_WM_HTTP_DEC *d, char c, char *err, size_t err_cap) {
+  if (d->head_len == d->head_cap) {
+    if (d->head_cap >= HEAD_MAX) {
+      snprintf(err, err_cap, "the reply's headers are over %d bytes", HEAD_MAX);
       return -1;
     }
-    take = (size_t)cl;
+    size_t cap = d->head_cap ? d->head_cap * 2 : 1024;
+    char *h = realloc(d->head, cap);
+    if (!h) {
+      snprintf(err, err_cap, "out of memory");
+      return -1;
+    }
+    d->head = h;
+    d->head_cap = cap;
   }
-  out->body = malloc(take + 1);
-  if (!out->body) {
-    snprintf(err, err_cap, "out of memory");
+  d->head[d->head_len++] = c;
+  d->fed++;
+  if (c != '\n') {
+    return 0;
+  }
+  /* a line ended: the one from after the previous '\n' */
+  size_t at = d->head_len - 1;
+  while (at > 0 && d->head[at - 1] != '\n') {
+    at--;
+  }
+  const char *line = d->head + at;
+  size_t ll = line_len(line, d->head + d->head_len - 1);
+  if (at == 0) {
+    d->status = status_line(line, ll);
+    if (d->status < 0) {
+      d->status = 0;
+      snprintf(err, err_cap, "not an HTTP reply");
+      return -1;
+    }
+    return 0;
+  }
+  return ll == 0 ? head_done(d, err, err_cap) : 0;
+}
+
+/* a chunk's size line (without its LF): 0, or -1 with why in err */
+static int chunk_size(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
+  unsigned long long size = 0;
+  size_t i = 0;
+  for (; i < d->line_len; i++) {
+    char c = d->line[i];
+    int v = c >= '0' && c <= '9'   ? c - '0'
+            : c >= 'a' && c <= 'f' ? c - 'a' + 10
+            : c >= 'A' && c <= 'F' ? c - 'A' + 10
+                                   : -1;
+    if (v < 0) {
+      break;
+    }
+    if (size > (~0ULL >> 4)) {
+      snprintf(err, err_cap, "a chunk too big");
+      return -1;
+    }
+    size = size * 16 + (unsigned)v;
+  }
+  /* after the size: an extension (";..."), spaces, the CR */
+  char c = i < d->line_len ? d->line[i] : '\0';
+  if (i == 0 || (c && c != ';' && c != ' ' && c != '\t' && c != '\r')) {
+    snprintf(err, err_cap, "a bad chunk size");
     return -1;
   }
-  memcpy(out->body, p, take);
-  out->body[take] = '\0';
-  out->len = take;
+  d->line_len = 0;
+  d->left = size;
+  /* the last chunk: its trailers aren't waited for */
+  d->state = size ? D_CDATA : D_DONE;
+  return 0;
+}
+
+/* n bytes of the body to on_body(): 1 if it stopped the reply */
+static int deliver(CTUI_WM_HTTP_DEC *d, const char *p, size_t n) {
+  if (n && d->on_body(d, p, n)) {
+    d->stopped = 1;
+  }
+  return d->stopped;
+}
+
+int ctui_wm_http_dec_feed(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n,
+                          char *err, size_t err_cap) {
+  const char *p = buf, *end = buf + n;
+  while (!d->stopped && d->state != D_DONE && p < end) {
+    size_t have = (size_t)(end - p), k;
+    switch (d->state) {
+    case D_HEAD:
+      if (head_byte(d, *p++, err, err_cap) != 0) {
+        return -1;
+      }
+      continue;
+    case D_LEN:
+    case D_CDATA:
+      k = have < d->left ? have : (size_t)d->left;
+      d->left -= k;
+      if (deliver(d, p, k)) {
+        return 1;
+      }
+      p += k;
+      if (d->left == 0) {
+        d->state = d->state == D_LEN ? D_DONE : D_CCR;
+      }
+      break;
+    case D_CLOSE:
+      p = end;
+      if (deliver(d, end - have, have)) {
+        return 1;
+      }
+      break;
+    case D_CSIZE:
+      if (*p == '\n') {
+        p++;
+        if (chunk_size(d, err, err_cap) != 0) {
+          return -1;
+        }
+      } else {
+        /* a long extension: only its start is kept, the size is in it */
+        if (d->line_len < sizeof d->line - 1) {
+          d->line[d->line_len++] = *p;
+        }
+        p++;
+      }
+      break;
+    case D_CCR:
+    case D_CLF:
+      if (*p == '\r' && d->state == D_CCR) {
+        d->state = D_CLF;
+      } else if (*p == '\n') {
+        d->state = D_CSIZE;
+      } else {
+        snprintf(err, err_cap, "a chunk without its line end");
+        return -1;
+      }
+      p++;
+      break;
+    }
+    d->fed += (size_t)(p - (end - have));
+  }
+  return d->stopped || d->state == D_DONE;
+}
+
+int ctui_wm_http_dec_end(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
+  switch (d->state) {
+  case D_CLOSE:
+  case D_DONE:
+    return 0;
+  case D_HEAD:
+    snprintf(err, err_cap,
+             d->fed == 0  ? "an empty reply"
+             : !d->status ? "not an HTTP reply"
+                          : "the reply ended inside its headers");
+    return -1;
+  default:
+    snprintf(err, err_cap, "the reply ended inside its body");
+    return -1;
+  }
+}
+
+static int parse_body(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n) {
+  OUT *o = d->ctx;
+  out_add(o, buf, n);
+  return o->oom;
+}
+
+int ctui_wm_http_parse(const char *buf, size_t n, CTUI_WM_HTTP_PARSED *out,
+                       char *err, size_t err_cap) {
+  memset(out, 0, sizeof *out);
+  OUT o = {0};
+  out_add(&o, "", 0);
+  CTUI_WM_HTTP_DEC d;
+  ctui_wm_http_dec_init(&d);
+  d.on_body = parse_body;
+  d.ctx = &o;
+  int r = ctui_wm_http_dec_feed(&d, buf, n, err, err_cap);
+  if (r == 0) {
+    r = ctui_wm_http_dec_end(&d, err, err_cap) == 0 ? 1 : -1;
+  }
+  if (r > 0 && o.oom) {
+    snprintf(err, err_cap, "out of memory");
+    r = -1;
+  }
+  if (r < 0) {
+    free(o.s);
+    ctui_wm_http_dec_free(&d);
+    return -1;
+  }
+  out->status = d.status;
+  /* the decoder's copy of the head is the same bytes as buf's */
+  out->headers = buf + d.head_at + (size_t)(d.headers - d.head);
+  out->headers_len = d.headers_len;
+  out->body = o.s;
+  out->len = o.len;
+  ctui_wm_http_dec_free(&d);
   return 0;
 }

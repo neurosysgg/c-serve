@@ -1,7 +1,9 @@
 /* plugins/net: URLs, the request, replies (Content-Length, chunked, to the
- * end, interim 1xx, cut off), then whole exchanges over plain HTTP with a
- * server forked on 127.0.0.1 -- a redirect, a chunked reply, a POST, a
- * server that never answers (the deadline), one too big. TLS itself runs
+ * end, interim 1xx, cut off; whole and a byte at a time), then whole
+ * exchanges over plain HTTP with a server forked on 127.0.0.1 -- a
+ * redirect, a chunked reply, a POST, a server that never answers (the
+ * deadline), one too big, the reply's headers -- and streamed ones (split
+ * chunks, an endless body, a cut one, one that stalls). TLS itself runs
  * live only (HISTORY.md, session 77: open-meteo, badssl.com's bad
  * certificates refused). */
 #define _POSIX_C_SOURCE 200809L
@@ -21,6 +23,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static char g_err[256];
@@ -181,6 +184,116 @@ static void test_replies(void) {
   }
 }
 
+/* --- the decoder fed in pieces --- */
+
+typedef struct {
+  char body[256];
+  size_t len;
+  int heads, stop_at_head;
+  size_t stop_after;
+} SINKED;
+
+static int dec_head(CTUI_WM_HTTP_DEC *d) {
+  SINKED *s = d->ctx;
+  s->heads++;
+  return s->stop_at_head;
+}
+
+static int dec_body(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n) {
+  SINKED *s = d->ctx;
+  if (s->len + n < sizeof s->body) {
+    memcpy(s->body + s->len, buf, n);
+  }
+  s->len += n;
+  s->body[s->len < sizeof s->body ? s->len : 0] = '\0';
+  return s->stop_after && s->len >= s->stop_after;
+}
+
+/* reply fed a byte at a time: 1 complete, -1 refused */
+static int dec_bytes(const char *reply, SINKED *s, CTUI_WM_HTTP_DEC *d) {
+  memset(s, 0, sizeof *s);
+  ctui_wm_http_dec_init(d);
+  d->on_head = dec_head;
+  d->on_body = dec_body;
+  d->ctx = s;
+  size_t n = strlen(reply);
+  for (size_t i = 0; i < n; i++) {
+    int r = ctui_wm_http_dec_feed(d, reply + i, 1, g_err, sizeof g_err);
+    if (r != 0) {
+      return r;
+    }
+  }
+  return ctui_wm_http_dec_end(d, g_err, sizeof g_err) == 0 ? 1 : -1;
+}
+
+static void test_decoder(void) {
+  const char *good[] = {
+      "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhelloEXTRA",
+      ("HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n"
+       "4;ext=1\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\n"
+       "chunks.\r\n0\r\nTrailer: x\r\n\r\n"),
+      "HTTP/1.0 200 OK\nServer: old\n\nto the end",
+      ("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 201 Created\r\n"
+       "Content-Length: 2\r\n\r\nok"),
+      "HTTP/1.1 204 No Content\r\nContent-Length: 9\r\n\r\n",
+  };
+  for (size_t i = 0; i < sizeof good / sizeof *good; i++) {
+    CTUI_WM_HTTP_PARSED p;
+    SINKED s;
+    CTUI_WM_HTTP_DEC d;
+    int whole = parse(good[i], &p);
+    int bytes = dec_bytes(good[i], &s, &d);
+    CTUI_TEST_ASSERT(whole == 0 && bytes == 1 && d.status == p.status &&
+                         s.heads == 1 && s.len == p.len &&
+                         !memcmp(s.body, p.body, p.len) &&
+                         d.headers_len == p.headers_len &&
+                         !memcmp(d.headers, p.headers, p.headers_len),
+                     "a byte at a time decodes as the whole reply (%zu)", i);
+    free(p.body);
+    ctui_wm_http_dec_free(&d);
+  }
+
+  const char *bad[] = {
+      "",
+      "SSH-2.0-OpenSSH\r\n",
+      "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX",
+  };
+  for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+    SINKED s;
+    CTUI_WM_HTTP_DEC d;
+    g_err[0] = '\0';
+    CTUI_TEST_ASSERT(dec_bytes(bad[i], &s, &d) < 0 && g_err[0],
+                     "a bad reply refused a byte at a time too (%zu)", i);
+    ctui_wm_http_dec_free(&d);
+  }
+
+  SINKED s = {.stop_after = 3};
+  CTUI_WM_HTTP_DEC d;
+  ctui_wm_http_dec_init(&d);
+  d.on_body = dec_body;
+  d.ctx = &s;
+  const char *r = "HTTP/1.1 200 OK\r\n\r\nabcdef";
+  CTUI_TEST_ASSERT(
+      ctui_wm_http_dec_feed(&d, r, strlen(r), g_err, sizeof g_err) == 1 &&
+          d.stopped && !strcmp(s.body, "abcdef"),
+      "on_body stops the reply (the piece it had is all given)");
+  ctui_wm_http_dec_free(&d);
+
+  memset(&s, 0, sizeof s);
+  s.stop_at_head = 1;
+  ctui_wm_http_dec_init(&d);
+  d.on_head = dec_head;
+  d.on_body = dec_body;
+  d.ctx = &s;
+  CTUI_TEST_ASSERT(
+      ctui_wm_http_dec_feed(&d, r, strlen(r), g_err, sizeof g_err) == 1 &&
+          d.stopped && s.heads == 1 && s.len == 0,
+      "on_head stops it before any of the body");
+  ctui_wm_http_dec_free(&d);
+}
+
 /* --- a server on 127.0.0.1, one reply per request by its path --- */
 
 static const char *reply_for(const char *req) {
@@ -203,6 +316,12 @@ static const char *reply_for(const char *req) {
   if (!strncmp(req, "GET /big ", 9)) {
     return "HTTP/1.1 200 OK\r\n\r\n"
            "0123456789012345678901234567890123456789";
+  }
+  if (!strncmp(req, "GET /cut ", 9)) {
+    return "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nonly this";
+  }
+  if (!strncmp(req, "GET /to-pieces ", 15)) {
+    return "HTTP/1.1 307 Temporary\r\nLocation: /pieces\r\n\r\n";
   }
   if (!strncmp(req, "GET /missing ", 13)) {
     return "HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nnope";
@@ -229,6 +348,36 @@ static void serve(int ls) {
         break;
       }
     }
+    if (!strncmp(req, "GET /pieces ", 12)) {
+      /* chunked, a chunk's size and data split across writes */
+      const char *part[] = {"HTTP/1.1 200 OK\r\nTransfer-Enc",
+                            "oding: chunked\r\n\r\n6\r", "\nhello \r\n5",
+                            "\r\nwor", "ld\r\n0\r\n\r\n"};
+      for (size_t i = 0; i < sizeof part / sizeof *part; i++) {
+        send(c, part[i], strlen(part[i]), MSG_NOSIGNAL);
+        nanosleep(&(struct timespec){0, 20000000}, NULL);
+      }
+      close(c);
+      continue;
+    }
+    if (!strncmp(req, "GET /endless ", 13)) {
+      const char *h = "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\n\r\n";
+      char blk[4096];
+      memset(blk, 'x', sizeof blk);
+      if (send(c, h, strlen(h), MSG_NOSIGNAL) > 0) {
+        while (send(c, blk, sizeof blk, MSG_NOSIGNAL) > 0) {
+        }
+      }
+      close(c);
+      continue;
+    }
+    if (!strncmp(req, "GET /stall ", 11)) {
+      const char *h = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nsome";
+      send(c, h, strlen(h), MSG_NOSIGNAL);
+      sleep(5);
+      close(c);
+      continue;
+    }
     const char *rep = reply_for(req);
     if (!rep) {
       sleep(5);
@@ -237,6 +386,76 @@ static void serve(int ls) {
     }
     close(c);
   }
+}
+
+typedef struct {
+  char buf[64];
+  size_t len;
+  int heads, status;
+  size_t stop_after;
+  char type[32];
+} STREAMED;
+
+static int st_head(void *ctx, const CTUI_WM_HTTP_REPLY *rep) {
+  STREAMED *s = ctx;
+  s->heads++;
+  s->status = rep->status;
+  ctui_wm_http_reply_header(rep, "Content-Type", s->type, sizeof s->type);
+  return 0;
+}
+
+static int st_body(void *ctx, const char *buf, size_t n) {
+  STREAMED *s = ctx;
+  size_t k = s->len < sizeof s->buf - 1 ? sizeof s->buf - 1 - s->len : 0;
+  memcpy(s->buf + s->len, buf, n < k ? n : k);
+  s->len += n;
+  s->buf[s->len < sizeof s->buf ? s->len : sizeof s->buf - 1] = '\0';
+  return s->stop_after && s->len >= s->stop_after;
+}
+
+static void test_streams(int port) {
+  char url[128];
+  CTUI_WM_HTTP_REPLY rep;
+  STREAMED s = {0};
+  CTUI_WM_HTTP_SINK sink = {.head = st_head, .body = st_body, .ctx = &s};
+  CTUI_WM_HTTP_REQ req = {.url = url, .timeout_ms = 3000};
+
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/to-pieces", port);
+  CTUI_TEST_ASSERT(
+      ctui_wm_net_http_stream(&req, &sink, &rep, g_err, sizeof g_err) == 0 &&
+          s.heads == 1 && s.status == 200 && rep.status == 200 &&
+          !strcmp(s.buf, "hello world") && rep.body && !rep.body[0] &&
+          rep.len == 0,
+      "streamed: a redirect, then chunks split across reads");
+  free(rep.body);
+
+  memset(&s, 0, sizeof s);
+  s.stop_after = 1 << 20;
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/endless", port);
+  CTUI_TEST_ASSERT(
+      ctui_wm_net_http_stream(&req, &sink, &rep, g_err, sizeof g_err) == 0 &&
+          s.len >= (size_t)1 << 20 && !strcmp(s.type, "audio/mpeg"),
+      "an endless body runs until the sink stops it");
+  free(rep.body);
+
+  memset(&s, 0, sizeof s);
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/cut", port);
+  g_err[0] = '\0';
+  CTUI_TEST_ASSERT(
+      ctui_wm_net_http_stream(&req, &sink, &rep, g_err, sizeof g_err) != 0 &&
+          strstr(g_err, "inside its body") && !strcmp(s.buf, "only this") &&
+          !rep.body,
+      "a body cut short: -1, what came was handed on");
+
+  memset(&s, 0, sizeof s);
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/stall", port);
+  CTUI_WM_HTTP_REQ stall = {.url = url, .timeout_ms = 300};
+  long t0 = ctui_wm_net_now();
+  CTUI_TEST_ASSERT(
+      ctui_wm_net_http_stream(&stall, &sink, &rep, g_err, sizeof g_err) != 0 &&
+          !strcmp(g_err, "timed out") && !strcmp(s.buf, "some") &&
+          ctui_wm_net_now() - t0 < 2000,
+      "a body that stops coming: timed out after the idle time");
 }
 
 static void test_exchanges(void) {
@@ -271,6 +490,12 @@ static void test_exchanges(void) {
   CTUI_TEST_ASSERT(ctui_wm_net_http(&req, &rep, g_err, sizeof g_err) == 0 &&
                        rep.status == 404 && !strcmp(rep.body, "nope"),
                    "a 404 is a reply: its status and body");
+  char v[32];
+  CTUI_TEST_ASSERT(
+      ctui_wm_http_reply_header(&rep, "content-length", v, sizeof v) &&
+          !strcmp(v, "4") && rep.headers == rep.body + 5 &&
+          !ctui_wm_http_reply_header(&rep, "Location", v, sizeof v),
+      "the reply's headers, after its body, looked up by name");
   free(rep.body);
 
   snprintf(url, sizeof url, "http://127.0.0.1:%d/echo", port);
@@ -297,6 +522,10 @@ static void test_exchanges(void) {
                        strstr(g_err, "over 16 bytes"),
                    "a reply over max refused");
 
+  /* before /silent and with /stall last: the server answers one at a
+   * time, and those two keep it for 5 s */
+  test_streams(port);
+
   snprintf(url, sizeof url, "http://127.0.0.1:%d/silent", port);
   CTUI_WM_HTTP_REQ slow = {.url = url, .timeout_ms = 300};
   long t0 = ctui_wm_net_now();
@@ -319,6 +548,7 @@ int main(void) {
   test_urls();
   test_format();
   test_replies();
+  test_decoder();
   test_exchanges();
   return ctui_test_summary();
 }

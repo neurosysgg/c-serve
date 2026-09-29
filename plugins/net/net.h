@@ -11,5 +11,10 @@
  * run it in a child of their own (the weather widget) or a thread. */
 int ctui_wm_net_http(const CTUI_WM_HTTP_REQ *req, CTUI_WM_HTTP_REPLY *rep,
                      char *err, size_t err_cap);
+/* the same, the body handed to sink as it arrives (the `net` slot's
+ * `http_stream`) */
+int ctui_wm_net_http_stream(const CTUI_WM_HTTP_REQ *req,
+                            const CTUI_WM_HTTP_SINK *sink,
+                            CTUI_WM_HTTP_REPLY *rep, char *err, size_t err_cap);
 
 #endif
