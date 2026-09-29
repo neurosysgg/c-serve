@@ -1,5 +1,10 @@
 /* The TLS seam's mbedtls 4 side (tls.h): PSA crypto underneath, so no
- * RNG to wire up; the CA bundle parsed once per process. */
+ * RNG to wire up; the CA bundle parsed once per process, whichever thread
+ * gets there first (ctui-mail checks its accounts in parallel). mbedtls
+ * as distributions build it has no MBEDTLS_THREADING_C, so PSA's key
+ * slots and RNG are unguarded: every mbedtls call runs under one lock,
+ * never held across the poll() waits, so connections still overlap on
+ * the network and only the crypto takes turns. */
 #define _POSIX_C_SOURCE 200809L
 #include "tls.h"
 
@@ -12,6 +17,8 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,8 +30,12 @@ struct CTUI_WM_TLS {
   mbedtls_ssl_context ssl;
 };
 
-/* process-wide: the config and the CAs it points at */
+/* process-wide: the config and the CAs it points at, set up once; a
+ * failed setup stays failed, its reason kept for every later caller */
+static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static int g_ready;
+static char g_err[200];
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static mbedtls_ssl_config g_conf;
 static mbedtls_x509_crt g_ca;
 
@@ -41,10 +52,7 @@ static void why(int ret, const char *what, char *err, size_t err_cap) {
   snprintf(err, err_cap, "TLS: %s: %s", what, msg);
 }
 
-static int setup(char *err, size_t err_cap) {
-  if (g_ready) {
-    return 0;
-  }
+static int setup_once(char *err, size_t err_cap) {
   if (psa_crypto_init() != PSA_SUCCESS) {
     snprintf(err, err_cap, "TLS: the crypto library didn't start");
     return -1;
@@ -77,7 +85,22 @@ static int setup(char *err, size_t err_cap) {
   }
   mbedtls_ssl_conf_authmode(&g_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
   mbedtls_ssl_conf_ca_chain(&g_conf, &g_ca, NULL);
-  g_ready = 1;
+  return 0;
+}
+
+static void lock(void) { pthread_mutex_lock(&g_lock); }
+static void unlock(void) { pthread_mutex_unlock(&g_lock); }
+
+static void setup_run(void) { g_ready = setup_once(g_err, sizeof g_err) == 0; }
+
+static int setup(char *err, size_t err_cap) {
+  lock();
+  pthread_once(&g_once, setup_run);
+  unlock();
+  if (!g_ready) {
+    snprintf(err, err_cap, "%s", g_err);
+    return -1;
+  }
   return 0;
 }
 
@@ -124,21 +147,29 @@ CTUI_WM_TLS *ctui_wm_tls_open(int fd, const char *host, long deadline,
     return NULL;
   }
   t->fd = fd;
+  lock();
   mbedtls_ssl_init(&t->ssl);
   int ret = mbedtls_ssl_setup(&t->ssl, &g_conf);
   if (ret == 0) {
     ret = mbedtls_ssl_set_hostname(&t->ssl, host);
   }
+  mbedtls_ssl_set_bio(&t->ssl, &t->fd, bio_send, bio_recv, NULL);
+  unlock();
   if (ret != 0) {
     why(ret, "setup", err, err_cap);
     goto fail;
   }
-  mbedtls_ssl_set_bio(&t->ssl, &t->fd, bio_send, bio_recv, NULL);
-  while ((ret = mbedtls_ssl_handshake(&t->ssl)) != 0) {
+  for (;;) {
+    lock();
+    ret = mbedtls_ssl_handshake(&t->ssl);
+    uint32_t verify = mbedtls_ssl_get_verify_result(&t->ssl);
+    unlock();
+    if (ret == 0) {
+      break;
+    }
     if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
       char info[256];
-      mbedtls_x509_crt_verify_info(info, sizeof info, "",
-                                   mbedtls_ssl_get_verify_result(&t->ssl));
+      mbedtls_x509_crt_verify_info(info, sizeof info, "", verify);
       info[strcspn(info, "\n")] = '\0';
       snprintf(err, err_cap, "TLS: %s's certificate: %s", host, info);
       goto fail;
@@ -149,7 +180,9 @@ CTUI_WM_TLS *ctui_wm_tls_open(int fd, const char *host, long deadline,
   }
   return t;
 fail:
+  lock();
   mbedtls_ssl_free(&t->ssl);
+  unlock();
   free(t);
   return NULL;
 }
@@ -157,7 +190,9 @@ fail:
 int ctui_wm_tls_write(CTUI_WM_TLS *t, const char *buf, size_t n, long deadline,
                       char *err, size_t err_cap) {
   while (n > 0) {
+    lock();
     int w = mbedtls_ssl_write(&t->ssl, (const unsigned char *)buf, n);
+    unlock();
     if (w > 0) {
       buf += w;
       n -= (size_t)w;
@@ -171,7 +206,9 @@ int ctui_wm_tls_write(CTUI_WM_TLS *t, const char *buf, size_t n, long deadline,
 ssize_t ctui_wm_tls_read(CTUI_WM_TLS *t, char *buf, size_t n, long deadline,
                          char *err, size_t err_cap) {
   for (;;) {
+    lock();
     int r = mbedtls_ssl_read(&t->ssl, (unsigned char *)buf, n);
+    unlock();
     if (r >= 0) {
       return r;
     }
@@ -192,14 +229,19 @@ ssize_t ctui_wm_tls_read(CTUI_WM_TLS *t, char *buf, size_t n, long deadline,
 }
 
 size_t ctui_wm_tls_pending(const CTUI_WM_TLS *t) {
-  return mbedtls_ssl_get_bytes_avail(&t->ssl);
+  lock();
+  size_t n = mbedtls_ssl_get_bytes_avail(&t->ssl);
+  unlock();
+  return n;
 }
 
 void ctui_wm_tls_close(CTUI_WM_TLS *t) {
   if (!t) {
     return;
   }
+  lock();
   mbedtls_ssl_close_notify(&t->ssl);
   mbedtls_ssl_free(&t->ssl);
+  unlock();
   free(t);
 }

@@ -5,18 +5,22 @@
  * deadline), one too big, the reply's headers -- and streamed ones (split
  * chunks, an endless body, a cut one, one that stalls). TLS itself runs
  * live only (HISTORY.md, session 77: open-meteo, badssl.com's bad
- * certificates refused). */
+ * certificates refused); here only its start from many threads at once
+ * (the CA bundle, ClientHello key shares: ctui-mail's parallel checks
+ * crashed there). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "conn.h"
 #include "http.h"
 #include "net.h"
+#include "tls.h"
 
 #include "ctui.h"
 #include "ctui_test.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -543,6 +547,52 @@ static void test_exchanges(void) {
                    "nothing listening: connecting fails, with why");
 }
 
+/* a ClientHello into a socketpair whose far end is gone: the CA bundle
+ * parsed, a key share made, the send refused -- no server needed */
+static void *tls_start(void *arg) {
+  int *failed = arg;
+  for (int round = 0; round < 4; round++) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) != 0) {
+      (*failed)++;
+      return NULL;
+    }
+    close(sv[1]);
+    char err[256];
+    CTUI_WM_TLS *t = ctui_wm_tls_open(
+        sv[0], "example.org", ctui_wm_net_now() + 2000, err, sizeof err);
+    if (t) {
+      ctui_wm_tls_close(t);
+      (*failed)++;
+    }
+    close(sv[0]);
+  }
+  return NULL;
+}
+
+static void test_tls_threads(void) {
+  if (access("/etc/ssl/certs/ca-certificates.crt", R_OK) != 0 &&
+      access("/etc/pki/tls/certs/ca-bundle.crt", R_OK) != 0 &&
+      access("/etc/ssl/cert.pem", R_OK) != 0) {
+    return; /* no CA bundle here: setup fails the same way in each */
+  }
+  enum { N = 8 };
+  pthread_t th[N];
+  int failed[N] = {0};
+  int started = 0;
+  for (int i = 0; i < N; i++) {
+    started += pthread_create(&th[i], NULL, tls_start, &failed[i]) == 0;
+  }
+  int bad = 0;
+  for (int i = 0; i < started; i++) {
+    pthread_join(th[i], NULL);
+    bad += failed[i];
+  }
+  CTUI_TEST_ASSERT(started == N && bad == 0,
+                   "TLS started from 8 threads at once: each refused, "
+                   "none crashed");
+}
+
 int main(void) {
   ctui_log_init(E_ERR);
   test_urls();
@@ -550,5 +600,6 @@ int main(void) {
   test_replies();
   test_decoder();
   test_exchanges();
+  test_tls_threads();
   return ctui_test_summary();
 }
