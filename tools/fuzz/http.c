@@ -3,10 +3,12 @@
  * URL with a redirect's Location against it, then the request made for
  * it. First byte: 0 = a reply (the rest raw, NULs and all), 1 = URL and
  * Location, NUL-separated, 2 = a reply fed to the decoder in pieces (the
- * next byte seeds their sizes), which must decode as it does whole. */
+ * next byte seeds their sizes), which must decode as it does whole; 3 =
+ * a request's head as the server side takes it (httpd.c). */
 #include "fuzz.h"
 
 #include "http.h"
+#include "httpd.h"
 
 static void reply(const uint8_t *data, size_t size) {
   /* its own allocation, so reading past it is caught */
@@ -107,6 +109,30 @@ static void url(const uint8_t *data, size_t size) {
   fuzz_free(part, 2);
 }
 
+static void request(const uint8_t *data, size_t size) {
+  char *buf = malloc(size + 1);
+  memcpy(buf, data, size);
+  buf[size] = '\0';
+  CTUI_WM_HTTPD_REQ r;
+  char err[128];
+  int st = ctui_wm_httpd_parse(buf, &r, err, sizeof err);
+  if (st == 0) {
+    FUZZ_CHECK(r.path[0] == '/' && r.method[0], "a request without path or "
+                                                "method");
+    FUZZ_CHECK(r.query >= r.target && r.query <= r.target + strlen(r.target),
+               "the query outside the target");
+    for (int i = 0; i < r.n; i++) {
+      FUZZ_CHECK(!strpbrk(r.h[i].name, " :\r\n") &&
+                     !strpbrk(r.h[i].value, "\r\n"),
+                 "a header with a line break or a colon in its name");
+    }
+    ctui_wm_httpd_header(&r, "Host");
+  } else {
+    FUZZ_CHECK(st >= 400 && st <= 505 && err[0], "refused with %d", st);
+  }
+  free(buf);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size == 0) {
     return 0;
@@ -115,8 +141,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     reply(data + 1, size - 1);
   } else if (data[0] == 1) {
     url(data + 1, size - 1);
-  } else {
+  } else if (data[0] == 2) {
     pieces(data + 1, size - 1);
+  } else {
+    request(data + 1, size - 1);
   }
   return 0;
 }

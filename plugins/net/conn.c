@@ -218,6 +218,35 @@ int ctui_wm_conn_starttls(CTUI_WM_CONN *c, const char *host, char *err,
   return c->tls ? 0 : -1;
 }
 
+CTUI_WM_CONN *ctui_wm_conn_adopt(int fd, long deadline) {
+  CTUI_WM_CONN *c = calloc(1, sizeof *c);
+  if (!c) {
+    close(fd);
+    return NULL;
+  }
+  c->fd = fd;
+  c->deadline = deadline;
+  return c;
+}
+
+int ctui_wm_conn_accept_tls(CTUI_WM_CONN *c, CTUI_WM_TLS_SERVER *srv, char *err,
+                            size_t err_cap) {
+  if (c->tls) {
+    snprintf(err, err_cap, "TLS already");
+    return -1;
+  }
+  /* commands pipelined behind STARTTLS would be plaintext taken as if
+   * they came over TLS (the client-side check's mirror) */
+  if (c->off < c->len) {
+    snprintf(err, err_cap, "the client sent more before TLS started");
+    return -1;
+  }
+  c->tls = ctui_wm_tls_accept(c->fd, srv, c->deadline, err, err_cap);
+  return c->tls ? 0 : -1;
+}
+
+int ctui_wm_conn_tls(const CTUI_WM_CONN *c) { return c->tls != NULL; }
+
 int ctui_wm_conn_fd(const CTUI_WM_CONN *c) { return c->fd; }
 
 int ctui_wm_conn_pending(const CTUI_WM_CONN *c) {

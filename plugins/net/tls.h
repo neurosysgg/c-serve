@@ -27,4 +27,20 @@ size_t ctui_wm_tls_pending(const CTUI_WM_TLS *t);
 /* a close_notify when it can go at once, then freed (not the fd) */
 void ctui_wm_tls_close(CTUI_WM_TLS *t);
 
+/* The server side (listen.h's servers): a certificate chain and its key
+ * (PEM files), and optionally the CA a client must present a certificate
+ * from (NULL: none asked for). One per listener, shared by its
+ * connections. */
+typedef struct CTUI_WM_TLS_SERVER CTUI_WM_TLS_SERVER;
+
+/* the server's config, or NULL with why in err */
+CTUI_WM_TLS_SERVER *ctui_wm_tls_server_new(const char *cert, const char *key,
+                                           const char *client_ca, char *err,
+                                           size_t err_cap);
+void ctui_wm_tls_server_free(CTUI_WM_TLS_SERVER *s);
+/* the handshake done as the server on an accepted fd, or NULL with why in
+ * err */
+CTUI_WM_TLS *ctui_wm_tls_accept(int fd, CTUI_WM_TLS_SERVER *s, long deadline,
+                                char *err, size_t err_cap);
+
 #endif

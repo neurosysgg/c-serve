@@ -2,6 +2,7 @@
 #define CTUI_WM_NET_CONN_H
 
 #include "http.h"
+#include "tls.h"
 
 #include <stddef.h>
 #include <sys/types.h>
@@ -51,6 +52,16 @@ int ctui_wm_conn_starttls(CTUI_WM_CONN *c, const char *host, char *err,
 int ctui_wm_conn_fd(const CTUI_WM_CONN *c);
 /* whether a read returns at once (bytes buffered here or in TLS) */
 int ctui_wm_conn_pending(const CTUI_WM_CONN *c);
+
+/* The server side: a connection a listener accepted (listen.h), with
+ * deadline, or NULL (out of memory; fd closed then). A server speaking TLS
+ * from the first byte, or after its protocol's STARTTLS, accepts it with
+ * accept_tls(): 0, or -1 with why in err. */
+CTUI_WM_CONN *ctui_wm_conn_adopt(int fd, long deadline);
+int ctui_wm_conn_accept_tls(CTUI_WM_CONN *c, CTUI_WM_TLS_SERVER *srv, char *err,
+                            size_t err_cap);
+/* whether TLS is on */
+int ctui_wm_conn_tls(const CTUI_WM_CONN *c);
 
 /* the next line (up to LF; its CRLF or LF not in it), at most max bytes:
  * its length with *line pointing at it (valid until the next read,

@@ -7,11 +7,16 @@
  * live only (HISTORY.md, session 77: open-meteo, badssl.com's bad
  * certificates refused); here only its start from many threads at once
  * (the CA bundle, ClientHello key shares: ctui-mail's parallel checks
- * crashed there). */
+ * crashed there). The server side: request heads parsed and refused,
+ * then listen.c + httpd.c answering our own client, plain and over TLS
+ * (tests/data/pki: a test CA, a localhost certificate to 2126; the
+ * client trusts that CA through SSL_CERT_FILE, set before any TLS). */
 #define _POSIX_C_SOURCE 200809L
 
 #include "conn.h"
 #include "http.h"
+#include "httpd.h"
+#include "listen.h"
 #include "net.h"
 #include "tls.h"
 
@@ -593,13 +598,236 @@ static void test_tls_threads(void) {
                    "none crashed");
 }
 
+/* --- the server side --- */
+
+static int head(const char *text, CTUI_WM_HTTPD_REQ *r) {
+  static char buf[CTUI_WM_HTTPD_HEAD_MAX];
+  snprintf(buf, sizeof buf, "%s", text);
+  return ctui_wm_httpd_parse(buf, r, g_err, sizeof g_err);
+}
+
+static void test_httpd_parse(void) {
+  CTUI_WM_HTTPD_REQ r;
+  CTUI_TEST_ASSERT(
+      head("GET /a%20b/c?x=1&y HTTP/1.1\r\nHost: h\r\n"
+           "X-Thing:  spaced  \r\ncontent-length: 5\r\n",
+           &r) == 0 &&
+          !strcmp(r.method, "GET") && !strcmp(r.path, "/a b/c") &&
+          !strcmp(r.query, "x=1&y") && r.minor == 1 && r.length == 5 &&
+          r.keep_alive &&
+          !strcmp(ctui_wm_httpd_header(&r, "x-thing"), "spaced") &&
+          !ctui_wm_httpd_header(&r, "Cookie"),
+      "a request head: path decoded, query, headers trimmed, length");
+  CTUI_TEST_ASSERT(
+      head("GET / HTTP/1.1\nHost: h\nConnection: x, Close\n", &r) == 0 &&
+          !r.keep_alive && r.length == -1,
+      "bare LFs; Connection: close ends keep-alive");
+  CTUI_TEST_ASSERT(head("GET / HTTP/1.0\n", &r) == 0 && !r.keep_alive &&
+                       head("GET / HTTP/1.0\nConnection: keep-alive\n", &r) ==
+                           0 &&
+                       r.keep_alive,
+                   "HTTP/1.0: no Host needed, kept alive only when asked");
+  static const struct {
+    const char *head;
+    int status;
+  } BAD[] = {
+      {"GET / HTTP/1.1\n", 400},                  /* no Host */
+      {"GET /%zz HTTP/1.1\nHost: h\n", 400},      /* escape */
+      {"GET /a%0 HTTP/1.1\nHost: h\n", 400},      /* cut escape */
+      {"GET /%00 HTTP/1.1\nHost: h\n", 400},      /* a NUL */
+      {"GET http://h/ HTTP/1.1\nHost: h\n", 400}, /* absolute */
+      {"GET / HTTP/2.0\nHost: h\n", 505},
+      {"GET /  HTTP/1.1\nHost: h\n", 400}, /* two spaces */
+      {"G(T / HTTP/1.1\nHost: h\n", 400},
+      {"GET / HTTP/1.1\nHost: h\n folded\n", 400},
+      {"GET / HTTP/1.1\nHost : h\n", 400},
+      {"GET / HTTP/1.1\nHost: h\nContent-Length: 1x\n", 400},
+      {"GET / HTTP/1.1\nHost: h\nContent-Length: 1\nContent-Length: 2\n", 400},
+      {"POST / HTTP/1.1\nHost: h\nTransfer-Encoding: chunked\n", 411},
+      {"POST / HTTP/1.1\nHost: h\nTransfer-Encoding: chunked\n"
+       "Content-Length: 3\n",
+       400},
+      {"GET / HTTP/1.1\nHost: a\x01b\n", 400},
+  };
+  int ok = 0;
+  for (size_t i = 0; i < sizeof BAD / sizeof *BAD; i++) {
+    int st = head(BAD[i].head, &r);
+    ok += st == BAD[i].status;
+    if (st != BAD[i].status) {
+      printf("  bad head %zu: %d, not %d (%s)\n", i, st, BAD[i].status, g_err);
+    }
+  }
+  CTUI_TEST_ASSERT(ok == (int)(sizeof BAD / sizeof *BAD),
+                   "bad heads refused with their status (%d of %zu)", ok,
+                   sizeof BAD / sizeof *BAD);
+  char many[CTUI_WM_HTTPD_HEAD_MAX];
+  int n = snprintf(many, sizeof many, "GET / HTTP/1.1\n");
+  for (int i = 0; i <= CTUI_WM_HTTPD_HEADERS; i++) {
+    n += snprintf(many + n, sizeof many - (size_t)n, "H%d: v\n", i);
+  }
+  CTUI_TEST_ASSERT(head(many, &r) == 431, "too many header lines: 431");
+  CTUI_WM_BUF b = {0};
+  ctui_wm_httpd_escape(&b, "<a href=\"x\">R&D's</a>");
+  CTUI_TEST_ASSERT(b.s &&
+                       !strcmp(b.s, "&lt;a href=&quot;x&quot;&gt;R&amp;D&#39;"
+                                    "s&lt;/a&gt;"),
+                   "HTML escaped");
+  free(b.s);
+}
+
+typedef struct {
+  CTUI_WM_TLS_SERVER *tls;
+} SRV;
+
+static void on_page(const CTUI_WM_HTTPD_REQ *r, const char *body,
+                    CTUI_WM_HTTPD_REPLY *rep, void *ud) {
+  (void)ud;
+  if (!strcmp(r->path, "/echo")) {
+    ctui_wm_httpd_text(rep, 200, "text/plain", body ? body : "",
+                       body ? (size_t)r->length : 0);
+  } else if (!strcmp(r->path, "/go")) {
+    rep->status = 302;
+    snprintf(rep->headers, sizeof rep->headers, "Location: /hi\r\n");
+  } else if (!strcmp(r->path, "/hi")) {
+    ctui_wm_httpd_text(rep, 200, "text/plain", "hi there", 8);
+  } else {
+    ctui_wm_httpd_text(rep, 404, "text/plain", "none", 4);
+  }
+}
+
+static void on_conn(CTUI_WM_CONN *c, const char *peer, void *ud) {
+  SRV *s = ud;
+  char err[256];
+  if (s->tls && ctui_wm_conn_accept_tls(c, s->tls, err, sizeof err) != 0) {
+    ctui_wm_conn_close(c);
+    return;
+  }
+  CTUI_WM_HTTPD h = {.handler = on_page, .server = "test", .idle_ms = 500};
+  ctui_wm_httpd_serve(&h, c, peer);
+}
+
+typedef struct {
+  CTUI_WM_LISTEN *ls[2];
+  int stop;
+} SERVE;
+
+static void *serve_run(void *arg) {
+  SERVE *s = arg;
+  char err[128];
+  ctui_wm_listen_serve(s->ls, 2, s->stop, err, sizeof err);
+  return NULL;
+}
+
+static void test_server(void) {
+  char err[256];
+  SRV plain = {0}, tls = {0};
+  tls.tls = ctui_wm_tls_server_new("tests/data/pki/server.crt",
+                                   "tests/data/pki/server.key", NULL, err,
+                                   sizeof err);
+  CTUI_TEST_ASSERT(tls.tls != NULL, "a TLS server's config (%s)",
+                   tls.tls ? "" : err);
+  CTUI_TEST_ASSERT(!ctui_wm_tls_server_new("tests/data/pki/server.crt",
+                                           "tests/data/pki/nope.key", NULL, err,
+                                           sizeof err) &&
+                       strstr(err, "nope.key"),
+                   "a missing key refused, named (%s)", err);
+  SERVE sv = {0};
+  sv.ls[0] =
+      ctui_wm_listen_new("127.0.0.1", 0, on_conn, &plain, err, sizeof err);
+  sv.ls[1] = ctui_wm_listen_new("127.0.0.1", 0, on_conn, &tls, err, sizeof err);
+  int pfd[2];
+  if (!tls.tls || !sv.ls[0] || !sv.ls[1] || pipe(pfd) != 0) {
+    CTUI_TEST_ASSERT(0, "listeners on port 0 (%s)", err);
+    return;
+  }
+  sv.stop = pfd[0];
+  pthread_t th;
+  pthread_create(&th, NULL, serve_run, &sv);
+  char url[128];
+  CTUI_WM_HTTP_REPLY rep;
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/go", sv.ls[0]->port);
+  CTUI_WM_HTTP_REQ req = {.url = url, .timeout_ms = 3000};
+  CTUI_TEST_ASSERT(ctui_wm_net_http(&req, &rep, err, sizeof err) == 0 &&
+                       rep.status == 200 && !strcmp(rep.body, "hi there"),
+                   "our client against our server: a redirect, then a page "
+                   "(%s)",
+                   err);
+  free(rep.body);
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/echo", sv.ls[0]->port);
+  req = (CTUI_WM_HTTP_REQ){.url = url,
+                           .timeout_ms = 3000,
+                           .method = "POST",
+                           .body = "posted body",
+                           .body_len = 11};
+  CTUI_TEST_ASSERT(ctui_wm_net_http(&req, &rep, err, sizeof err) == 0 &&
+                       rep.status == 200 && !strcmp(rep.body, "posted body"),
+                   "a POST's body read by Content-Length (%s)", err);
+  free(rep.body);
+  snprintf(url, sizeof url, "https://localhost:%d/hi", sv.ls[1]->port);
+  req = (CTUI_WM_HTTP_REQ){.url = url, .timeout_ms = 3000};
+  CTUI_TEST_ASSERT(ctui_wm_net_http(&req, &rep, err, sizeof err) == 0 &&
+                       rep.status == 200 && !strcmp(rep.body, "hi there"),
+                   "over TLS: the test CA's localhost certificate (%s)", err);
+  free(rep.body);
+  /* the TLS port reached plainly, TLS started with a name its
+   * certificate doesn't carry */
+  CTUI_WM_URL u;
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/", sv.ls[1]->port);
+  ctui_wm_url_parse(url, &u, err, sizeof err);
+  CTUI_WM_CONN *c =
+      ctui_wm_conn_open(&u, ctui_wm_net_now() + 3000, err, sizeof err);
+  int bad = c ? ctui_wm_conn_starttls(c, "wrong.example", err, sizeof err) : 0;
+  ctui_wm_conn_close(c);
+  CTUI_TEST_ASSERT(bad != 0 && strstr(err, "certificate"),
+                   "a name the certificate doesn't carry refused (%s)", err);
+  /* two requests on one connection, the second asking to close */
+  snprintf(u.port, sizeof u.port, "%d", sv.ls[0]->port);
+  c = ctui_wm_conn_open(&u, ctui_wm_net_now() + 3000, err, sizeof err);
+  const char *two = "GET /hi HTTP/1.1\r\nHost: x\r\n\r\n"
+                    "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close"
+                    "\r\n\r\n";
+  char got[1024];
+  size_t len = 0;
+  if (c && ctui_wm_conn_write(c, two, strlen(two), err, sizeof err) == 0) {
+    ssize_t r;
+    while ((r = ctui_wm_conn_read(c, got + len, sizeof got - 1 - len, err,
+                                  sizeof err)) > 0) {
+      len += (size_t)r;
+    }
+  }
+  got[len] = '\0';
+  ctui_wm_conn_close(c);
+  CTUI_TEST_ASSERT(strstr(got, "200 OK") && strstr(got, "hi there") &&
+                       strstr(got, "404 Not Found") &&
+                       strstr(got, "Connection: close") &&
+                       strstr(got, "Server: test"),
+                   "keep-alive: two answers on one connection, then closed");
+  ssize_t w = write(pfd[1], "x", 1);
+  (void)w;
+  pthread_join(th, NULL);
+  for (int i = 0; i < 50 && ctui_wm_listen_active() > 0; i++) {
+    nanosleep(&(struct timespec){0, 20000000}, NULL);
+  }
+  CTUI_TEST_ASSERT(ctui_wm_listen_active() == 0,
+                   "every connection's thread done");
+  ctui_wm_listen_free(sv.ls[0]);
+  ctui_wm_listen_free(sv.ls[1]);
+  ctui_wm_tls_server_free(tls.tls);
+  close(pfd[0]);
+  close(pfd[1]);
+}
+
 int main(void) {
   ctui_log_init(E_ERR);
+  /* before anything starts TLS: the client reads it once per process */
+  setenv("SSL_CERT_FILE", "tests/data/pki/ca.crt", 1);
   test_urls();
   test_format();
   test_replies();
   test_decoder();
   test_exchanges();
   test_tls_threads();
+  test_httpd_parse();
+  test_server();
   return ctui_test_summary();
 }
