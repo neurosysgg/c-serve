@@ -434,7 +434,7 @@ static void test_streams(int port) {
       ctui_wm_net_http_stream(&req, &sink, &rep, g_err, sizeof g_err) == 0 &&
           s.heads == 1 && s.status == 200 && rep.status == 200 &&
           !strcmp(s.buf, "hello world") && rep.body && !rep.body[0] &&
-          rep.len == 0,
+          rep.len == 0 && rep.url && strstr(rep.url, "127.0.0.1"),
       "streamed: a redirect, then chunks split across reads");
   free(rep.body);
 
@@ -493,11 +493,16 @@ static void test_exchanges(void) {
   CTUI_TEST_ASSERT(ctui_wm_net_http(&req, &rep, g_err, sizeof g_err) == 0 &&
                        rep.status == 200 && !strcmp(rep.body, "hello world"),
                    "a redirect followed to a chunked reply");
+  char where[160];
+  snprintf(where, sizeof where, "http://127.0.0.1:%d/chunked", port);
+  CTUI_TEST_ASSERT(rep.url && !strcmp(rep.url, where),
+                   "the reply says where the redirect led");
   free(rep.body);
 
   snprintf(url, sizeof url, "http://127.0.0.1:%d/missing", port);
   CTUI_TEST_ASSERT(ctui_wm_net_http(&req, &rep, g_err, sizeof g_err) == 0 &&
-                       rep.status == 404 && !strcmp(rep.body, "nope"),
+                       rep.status == 404 && !strcmp(rep.body, "nope") &&
+                       !rep.url,
                    "a 404 is a reply: its status and body");
   char v[32];
   CTUI_TEST_ASSERT(

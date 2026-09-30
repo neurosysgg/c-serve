@@ -135,6 +135,15 @@ int ctui_wm_url_resolve(const CTUI_WM_URL *base, const char *loc,
   return ctui_wm_url_parse(url, u, err, err_cap);
 }
 
+int ctui_wm_url_format(const CTUI_WM_URL *u, char *out, size_t cap) {
+  int v6 = strchr(u->host, ':') != NULL;
+  int own = !strcmp(u->port, u->tls ? "443" : "80");
+  int n = snprintf(out, cap, "%s://%s%s%s%s%s%s", u->tls ? "https" : "http",
+                   v6 ? "[" : "", u->host, v6 ? "]" : "", own ? "" : ":",
+                   own ? "" : u->port, u->path);
+  return n > 0 && (size_t)n < cap ? 0 : -1;
+}
+
 /* --- the request --- */
 
 typedef struct {

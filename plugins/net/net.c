@@ -22,7 +22,8 @@ typedef struct {
   char *body;                    /* gathered: malloc'd */
   size_t len, cap, max;
   int over, oom;
-  char *hdr; /* the head's header lines (malloc'd), for rep */
+  char *hdr;       /* the head's header lines (malloc'd), for rep */
+  const char *url; /* where a redirect led, NULL: the first URL */
   int redirect;
   char loc[4096 + 256 + 16];
 } EX;
@@ -50,8 +51,9 @@ static int ex_head(CTUI_WM_HTTP_DEC *d) {
   if (!ex->sink) {
     return 0;
   }
-  /* the sink's rep: body "" with the headers after it */
-  char *b = malloc(d->headers_len + 2);
+  /* the sink's rep: body "" with the headers (and the URL) after it */
+  size_t ul = ex->url ? strlen(ex->url) + 1 : 0;
+  char *b = malloc(d->headers_len + 2 + ul);
   if (!b) {
     ex->oom = 1;
     return 1;
@@ -62,6 +64,10 @@ static int ex_head(CTUI_WM_HTTP_DEC *d) {
   ex->rep->body = b;
   ex->rep->headers = b + 1;
   ex->rep->headers_len = d->headers_len;
+  if (ex->url) {
+    memcpy(b + d->headers_len + 2, ex->url, ul);
+    ex->rep->url = b + d->headers_len + 2;
+  }
   return ex->sink->head && ex->sink->head(ex->sink->ctx, ex->rep);
 }
 
@@ -154,7 +160,12 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
   if (ctui_wm_url_parse(req->url, &u, err, err_cap) != 0) {
     return -1;
   }
+  char url[sizeof u.path + sizeof u.host + 32];
   for (int hop = 0;; hop++) {
+    if (hop > 0 && ctui_wm_url_format(&u, url, sizeof url) != 0) {
+      snprintf(err, err_cap, "the redirect is too long");
+      return -1;
+    }
     char *out = NULL;
     size_t out_len = 0;
     if (ctui_wm_http_format(req, &u, &out, &out_len) != 0) {
@@ -164,7 +175,8 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
     EX ex = {.req = req,
              .sink = sink,
              .rep = rep,
-             .max = req->max ? req->max : NET_MAX};
+             .max = req->max ? req->max : NET_MAX,
+             .url = hop > 0 ? url : NULL};
     ctui_wm_http_dec_init(&ex.d);
     ex.d.on_head = ex_head;
     ex.d.on_body = ex_body;
@@ -179,9 +191,11 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
     }
     if (!ex.redirect) {
       if (!sink) {
-        /* body, its NUL, then the headers: one allocation */
+        /* body, its NUL, the headers, then where it came from: one
+         * allocation */
         size_t hl = ex.d.headers_len;
-        char *b = realloc(ex.body, ex.len + hl + 2);
+        size_t ul = hop > 0 ? strlen(url) + 1 : 0;
+        char *b = realloc(ex.body, ex.len + hl + 2 + ul);
         if (!b) {
           ex_free(&ex);
           snprintf(err, err_cap, "out of memory");
@@ -194,6 +208,10 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
         rep->len = ex.len;
         rep->headers = b + ex.len + 1;
         rep->headers_len = hl;
+        if (ul) {
+          memcpy(b + ex.len + hl + 2, url, ul);
+          rep->url = b + ex.len + hl + 2;
+        }
         ex.body = NULL;
       }
       ex_free(&ex);

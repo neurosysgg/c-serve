@@ -30,6 +30,10 @@ int ctui_wm_url_parse(const char *url, CTUI_WM_URL *u, char *err,
 int ctui_wm_url_resolve(const CTUI_WM_URL *base, const char *loc,
                         CTUI_WM_URL *u, char *err, size_t err_cap);
 
+/* u as a URL again ("https://host/path", the port only when it isn't
+ * the scheme's own): 0, or -1 if it doesn't fit */
+int ctui_wm_url_format(const CTUI_WM_URL *u, char *out, size_t cap);
+
 /* the request for req to u, malloc'd into *out (its length in *len): 0,
  * or -1 (out of memory, or a header value with CR/LF in it) */
 int ctui_wm_http_format(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_URL *u,
