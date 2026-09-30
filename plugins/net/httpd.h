@@ -65,11 +65,11 @@ typedef void (*CTUI_WM_HTTPD_FN)(const CTUI_WM_HTTPD_REQ *r, const char *body,
 typedef struct {
   CTUI_WM_HTTPD_FN handler;
   void *ud;
-  const char *server;   /* the Server header ("" or NULL: none) */
-  long long body_max;   /* a request body's limit (413 past it; 1 MiB) */
-  int idle_ms;          /* waiting for the next request (10 s) */
-  int timeout_ms;       /* reading one, writing its reply (30 s) */
-  int max_requests;     /* on one connection (100) */
+  const char *server; /* the Server header ("" or NULL: none) */
+  long long body_max; /* a request body's limit (413 past it; 1 MiB) */
+  int idle_ms;        /* waiting for the next request (10 s) */
+  int timeout_ms;     /* reading one, writing its reply (30 s) */
+  int max_requests;   /* on one connection (100) */
 } CTUI_WM_HTTPD;
 
 /* c served until the client closes, a request asks to, a limit is hit or

@@ -346,8 +346,9 @@ static long read_head(CTUI_WM_CONN *c, char *buf, size_t cap, int *status,
 }
 
 static int send_reply(CTUI_WM_CONN *c, const CTUI_WM_HTTPD *h,
-                      const CTUI_WM_HTTPD_REQ *r, const CTUI_WM_HTTPD_REPLY *rep,
-                      int keep, char *err, size_t err_cap) {
+                      const CTUI_WM_HTTPD_REQ *r,
+                      const CTUI_WM_HTTPD_REPLY *rep, int keep, char *err,
+                      size_t err_cap) {
   char head[2048];
   int body = rep->status >= 200 && rep->status != 204 && rep->status != 304;
   int n = snprintf(head, sizeof head,
@@ -359,8 +360,8 @@ static int send_reply(CTUI_WM_CONN *c, const CTUI_WM_HTTPD *h,
                    h->server && *h->server ? "\r\n" : "", body ? rep->len : 0,
                    rep->type && body ? "Content-Type: " : "",
                    rep->type && body ? rep->type : "",
-                   rep->type && body ? "\r\n" : "", keep ? "keep-alive" : "close",
-                   rep->headers);
+                   rep->type && body ? "\r\n" : "",
+                   keep ? "keep-alive" : "close", rep->headers);
   if (n < 0 || (size_t)n >= sizeof head) {
     snprintf(err, err_cap, "the reply's head is too long");
     return -1;
@@ -401,8 +402,8 @@ void ctui_wm_httpd_serve(const CTUI_WM_HTTPD *h, CTUI_WM_CONN *c,
   for (int k = 0; head && r && k < max_req; k++) {
     ctui_wm_conn_deadline(c, ctui_wm_net_now() + (k ? idle : timeout));
     int status = 0;
-    long hl = read_head(c, head, CTUI_WM_HTTPD_HEAD_MAX, &status, err,
-                        sizeof err);
+    long hl =
+        read_head(c, head, CTUI_WM_HTTPD_HEAD_MAX, &status, err, sizeof err);
     if (hl == 0) {
       break;
     }
@@ -432,8 +433,8 @@ void ctui_wm_httpd_serve(const CTUI_WM_HTTPD *h, CTUI_WM_CONN *c,
       if (rep.owned) {
         free(rep.body);
       }
-      ctui_wm_httpd_text(&rep, 500, "text/plain; charset=utf-8",
-                         "no answer\n", 10);
+      ctui_wm_httpd_text(&rep, 500, "text/plain; charset=utf-8", "no answer\n",
+                         10);
     }
     int keep = r->keep_alive && k + 1 < max_req;
     int sent = send_reply(c, h, r, &rep, keep, err, sizeof err);

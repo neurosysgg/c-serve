@@ -74,10 +74,11 @@ CTUI_WM_LISTEN *ctui_wm_listen_new(const char *host, int port,
   if (getsockname(fd, (struct sockaddr *)&sa, &len) != 0) {
     sa.ss_family = AF_UNSPEC;
   }
-  l->pub.port = sa.ss_family == AF_UNSPEC ? port
-                : ntohs(sa.ss_family == AF_INET6
-                          ? ((struct sockaddr_in6 *)&sa)->sin6_port
-                          : ((struct sockaddr_in *)&sa)->sin_port);
+  l->pub.port = sa.ss_family == AF_UNSPEC
+                    ? port
+                    : ntohs(sa.ss_family == AF_INET6
+                                ? ((struct sockaddr_in6 *)&sa)->sin6_port
+                                : ((struct sockaddr_in *)&sa)->sin_port);
   l->pub.fd = fd;
   l->pub.handler = handler;
   l->pub.ud = ud;
