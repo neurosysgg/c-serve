@@ -21,6 +21,7 @@ typedef struct {
   CTUI_WM_HTTP_REPLY *rep;       /* the sink's, filled at the head */
   char *body;                    /* gathered: malloc'd */
   size_t len, cap, max;
+  size_t total; /* the Content-Length, for req->progress; 0: not said */
   int over, oom;
   char *hdr;       /* the head's header lines (malloc'd), for rep */
   const char *url; /* where a redirect led, NULL: the first URL */
@@ -49,6 +50,11 @@ static int ex_head(CTUI_WM_HTTP_DEC *d) {
   memcpy(ex->hdr, d->headers, d->headers_len);
   ex->hdr[d->headers_len] = '\0';
   if (!ex->sink) {
+    char v[32];
+    if (ex->req->progress &&
+        ctui_wm_http_header(&p, "Content-Length", v, sizeof v)) {
+      ex->total = (size_t)strtoull(v, NULL, 10);
+    }
     return 0;
   }
   /* the sink's rep: body "" with the headers (and the URL) after it */
@@ -95,6 +101,9 @@ static int ex_body(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n) {
   }
   memcpy(ex->body + ex->len, buf, n);
   ex->len += n;
+  if (ex->req->progress) {
+    ex->req->progress(ex->req->progress_ctx, ex->len, ex->total);
+  }
   return 0;
 }
 
