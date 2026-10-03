@@ -3,7 +3,7 @@
 
 #include "conn.h"
 
-#include "base/json.h"
+#include "base/buf.h"
 
 #include <stddef.h>
 
