@@ -7,8 +7,9 @@
 
 /* The net plugin's HTTP client (the `net` slot's `http`, plugin.h says
  * what it does): http.h's request and reply over conn.h's connection,
- * redirects followed, one deadline for all of it. Blocking: its callers
- * run it in a child of their own (the weather widget) or a thread. */
+ * redirects followed, one deadline for all of it; a gathered body asked
+ * for gzip'd or deflated and handed back decoded (coding.h). Blocking: its
+ * callers run it in a child of their own (the weather widget) or a thread. */
 int ctui_wm_net_http(const CTUI_WM_HTTP_REQ *req, CTUI_WM_HTTP_REPLY *rep,
                      char *err, size_t err_cap);
 /* the same, the body handed to sink as it arrives (the `net` slot's
@@ -16,5 +17,11 @@ int ctui_wm_net_http(const CTUI_WM_HTTP_REQ *req, CTUI_WM_HTTP_REPLY *rep,
 int ctui_wm_net_http_stream(const CTUI_WM_HTTP_REQ *req,
                             const CTUI_WM_HTTP_SINK *sink,
                             CTUI_WM_HTTP_REPLY *rep, char *err, size_t err_cap);
+
+/* Connections are kept open between requests (keep-alive, at most a few
+ * per process, briefly): a GET to the same host goes on one. These close
+ * them all, and count them (the tests) */
+void ctui_wm_net_idle_close(void);
+int ctui_wm_net_idle_count(void);
 
 #endif

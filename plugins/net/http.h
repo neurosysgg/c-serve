@@ -35,9 +35,15 @@ int ctui_wm_url_resolve(const CTUI_WM_URL *base, const char *loc,
 int ctui_wm_url_format(const CTUI_WM_URL *u, char *out, size_t cap);
 
 /* the request for req to u, malloc'd into *out (its length in *len): 0,
- * or -1 (out of memory, or a header value with CR/LF in it) */
+ * or -1 (out of memory, or a header value with CR/LF in it). coded: the
+ * reply may come gzip'd or deflated (coding.h undoes it), else as it is;
+ * an Accept-Encoding in req's own headers is left to say it. The
+ * connection is asked to stay open (HTTP/1.1's default). */
 int ctui_wm_http_format(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_URL *u,
-                        char **out, size_t *len);
+                        int coded, char **out, size_t *len);
+
+/* whether req's own headers have name (case-insensitive) */
+int ctui_wm_http_req_has(const CTUI_WM_HTTP_REQ *req, const char *name);
 
 typedef struct {
   int status;
@@ -65,15 +71,19 @@ int ctui_wm_http_reply_header(const CTUI_WM_HTTP_REPLY *rep, const char *name,
 /* A reply decoded as it arrives, fed in pieces of any size: the status
  * line and headers gathered (interim 1xx replies skipped), then on_head()
  * called, then the body handed to on_body() decoded (Content-Length, chunked,
- * or up to the end). ctui_wm_http_parse() is this, fed once. */
+ * or up to the end); a chunked one's trailers are read and dropped.
+ * ctui_wm_http_parse() is this, fed once. */
 typedef struct CTUI_WM_HTTP_DEC CTUI_WM_HTTP_DEC;
 struct CTUI_WM_HTTP_DEC {
   /* non-zero from either stops the reply there (fed() then returns 1) */
   int (*on_head)(CTUI_WM_HTTP_DEC *d); /* optional */
   int (*on_body)(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n);
   void *ctx;
+  int no_body; /* set before feeding: a HEAD's reply, no body whatever
+                * its headers say */
   /* once on_head() is called: */
   int status;
+  int keep; /* the server keeps the connection open after this reply */
   const char *headers; /* the header lines, as in CTUI_WM_HTTP_PARSED */
   size_t headers_len;
   size_t head_at; /* where the reply (after interim ones) started in what
@@ -98,5 +108,9 @@ int ctui_wm_http_dec_feed(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n,
  * or -1 with why in err (it ended inside its headers or body) */
 int ctui_wm_http_dec_end(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap);
 void ctui_wm_http_dec_free(CTUI_WM_HTTP_DEC *d);
+/* the reply came whole, by its own length, and the server keeps the
+ * connection: the next request can go on it (the caller checks that
+ * nothing came after the reply: everything fed was d->fed) */
+int ctui_wm_http_dec_reusable(const CTUI_WM_HTTP_DEC *d);
 
 #endif

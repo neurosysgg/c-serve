@@ -178,8 +178,18 @@ static void out_str(OUT *o, const char *s) { out_add(o, s, strlen(s)); }
 
 static int has_crlf(const char *s) { return s && strpbrk(s, "\r\n"); }
 
+int ctui_wm_http_req_has(const CTUI_WM_HTTP_REQ *req, const char *name) {
+  size_t n = strlen(name);
+  for (const char *const *h = req->headers; h && *h; h++) {
+    if (!strncasecmp(*h, name, n) && (*h)[n] == ':') {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int ctui_wm_http_format(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_URL *u,
-                        char **out, size_t *len) {
+                        int coded, char **out, size_t *len) {
   const char *method = req->method ? req->method : "GET";
   if (has_crlf(method) || strchr(method, ' ') || has_crlf(req->content_type)) {
     return -1;
@@ -202,8 +212,11 @@ int ctui_wm_http_format(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_URL *u,
     out_str(&o, ":");
     out_str(&o, u->port);
   }
-  out_str(&o, "\r\nUser-Agent: ctui-wm\r\nAccept: */*\r\n"
-              "Accept-Encoding: identity\r\nConnection: close\r\n");
+  out_str(&o, "\r\nUser-Agent: ctui-wm\r\nAccept: */*\r\n");
+  if (!ctui_wm_http_req_has(req, "Accept-Encoding")) {
+    out_str(&o, coded ? "Accept-Encoding: gzip, deflate\r\n"
+                      : "Accept-Encoding: identity\r\n");
+  }
   for (const char *const *h = req->headers; h && *h; h++) {
     out_str(&o, *h);
     out_str(&o, "\r\n");
@@ -289,7 +302,17 @@ int ctui_wm_http_reply_header(const CTUI_WM_HTTP_REPLY *rep, const char *name,
 
 #define HEAD_MAX 65536
 
-enum { D_HEAD, D_LEN, D_CLOSE, D_CSIZE, D_CDATA, D_CCR, D_CLF, D_DONE };
+enum {
+  D_HEAD,
+  D_LEN,
+  D_CLOSE,
+  D_CSIZE,
+  D_CDATA,
+  D_CCR,
+  D_CLF,
+  D_TRAIL,
+  D_DONE
+};
 
 void ctui_wm_http_dec_init(CTUI_WM_HTTP_DEC *d) {
   memset(d, 0, sizeof *d);
@@ -299,6 +322,20 @@ void ctui_wm_http_dec_init(CTUI_WM_HTTP_DEC *d) {
 void ctui_wm_http_dec_free(CTUI_WM_HTTP_DEC *d) {
   free(d->head);
   d->head = NULL;
+}
+
+/* whether the comma-separated list v holds token (case-insensitive) */
+static int has_token(const char *v, const char *token) {
+  size_t n = strlen(token);
+  for (const char *p = v; *p;) {
+    p += strspn(p, " \t,");
+    size_t k = strcspn(p, " \t,");
+    if (k == n && !strncasecmp(p, token, n)) {
+      return 1;
+    }
+    p += k;
+  }
+  return 0;
 }
 
 /* HTTP/1.x NNN[ reason] */
@@ -324,7 +361,17 @@ static int head_done(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
   d->headers = nl + 1;
   d->headers_len = (size_t)(d->head + d->head_len - d->headers);
   char v[64];
-  if (d->status < 200 || d->status == 204 || d->status == 304) {
+  /* the connection stays open for the next request: HTTP/1.1's default,
+   * HTTP/1.0's only when it says so */
+  d->keep = d->head[7] != '0';
+  if (header_in(d->headers, d->headers_len, "Connection", v, sizeof v)) {
+    if (has_token(v, "close")) {
+      d->keep = 0;
+    } else if (has_token(v, "keep-alive")) {
+      d->keep = 1;
+    }
+  }
+  if (d->no_body || d->status < 200 || d->status == 204 || d->status == 304) {
     d->state = D_DONE;
   } else if (header_in(d->headers, d->headers_len, "Transfer-Encoding", v,
                        sizeof v)) {
@@ -420,8 +467,8 @@ static int chunk_size(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
   }
   d->line_len = 0;
   d->left = size;
-  /* the last chunk: its trailers aren't waited for */
-  d->state = size ? D_CDATA : D_DONE;
+  /* the last chunk: then its trailers, up to a blank line */
+  d->state = size ? D_CDATA : D_TRAIL;
   return 0;
 }
 
@@ -476,6 +523,19 @@ int ctui_wm_http_dec_feed(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n,
         p++;
       }
       break;
+    case D_TRAIL:
+      /* trailer lines (dropped), up to the blank one: line_len counts
+       * what a line has besides its CR */
+      if (*p == '\n') {
+        if (d->line_len == 0) {
+          d->state = D_DONE;
+        }
+        d->line_len = 0;
+      } else if (*p != '\r') {
+        d->line_len = 1;
+      }
+      p++;
+      break;
     case D_CCR:
     case D_CLF:
       if (*p == '\r' && d->state == D_CCR) {
@@ -497,6 +557,7 @@ int ctui_wm_http_dec_feed(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n,
 int ctui_wm_http_dec_end(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
   switch (d->state) {
   case D_CLOSE:
+  case D_TRAIL: /* the last chunk came: its trailers cut short */
   case D_DONE:
     return 0;
   case D_HEAD:
@@ -509,6 +570,10 @@ int ctui_wm_http_dec_end(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
     snprintf(err, err_cap, "the reply ended inside its body");
     return -1;
   }
+}
+
+int ctui_wm_http_dec_reusable(const CTUI_WM_HTTP_DEC *d) {
+  return d->state == D_DONE && !d->stopped && d->keep;
 }
 
 static int parse_body(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n) {

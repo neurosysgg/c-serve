@@ -50,6 +50,9 @@ int ctui_wm_conn_starttls(CTUI_WM_CONN *c, const char *host, char *err,
 /* its socket, for a caller polling it with fds of its own; a read may
  * have data without the socket being readable: see pending() */
 int ctui_wm_conn_fd(const CTUI_WM_CONN *c);
+/* an idle connection kept for a later request still looks open: nothing
+ * buffered, no hangup or error, nothing unasked come in plainly */
+int ctui_wm_conn_idle_ok(const CTUI_WM_CONN *c);
 /* whether a read returns at once (bytes buffered here or in TLS) */
 int ctui_wm_conn_pending(const CTUI_WM_CONN *c);
 

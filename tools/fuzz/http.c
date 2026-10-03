@@ -4,9 +4,13 @@
  * it. First byte: 0 = a reply (the rest raw, NULs and all), 1 = URL and
  * Location, NUL-separated, 2 = a reply fed to the decoder in pieces (the
  * next byte seeds their sizes), which must decode as it does whole; 3 =
- * a request's head as the server side takes it (httpd.c). */
+ * a request's head as the server side takes it (httpd.c); 4 = a body
+ * under a Content-Encoding (the next byte: its low bit gzip or deflate,
+ * the rest seeds the pieces' sizes), which must decode in pieces as it
+ * does whole (coding.c). */
 #include "fuzz.h"
 
+#include "coding.h"
 #include "http.h"
 #include "httpd.h"
 
@@ -96,7 +100,7 @@ static void url(const uint8_t *data, size_t size) {
     char *out;
     size_t len;
     CTUI_WM_HTTP_REQ req = {.url = part[0]};
-    if (ctui_wm_http_format(&req, &u, &out, &len) == 0) {
+    if (ctui_wm_http_format(&req, &u, part[1][0] & 1, &out, &len) == 0) {
       FUZZ_CHECK(strstr(out, "\r\n\r\n") == out + len - 4,
                  "the request's headers end before its end");
       free(out);
@@ -133,6 +137,71 @@ static void request(const uint8_t *data, size_t size) {
   free(buf);
 }
 
+typedef struct {
+  char *buf;
+  size_t len, cap;
+} UNZ;
+
+static int unz_out(void *ctx, const char *buf, size_t n) {
+  UNZ *u = ctx;
+  /* a bomb stops at 1 MB, the same place both ways */
+  size_t room = u->cap - u->len, k = n < room ? n : room;
+  memcpy(u->buf + u->len, buf, k);
+  u->len += k;
+  return u->len == u->cap;
+}
+
+/* data under coding, fed in pieces of step(seed) bytes: the result */
+static int unz(const char *coding, const char *data, size_t n, unsigned seed,
+               UNZ *u) {
+  CTUI_WM_HTTP_CODING *c;
+  char err[128];
+  if (ctui_wm_http_coding_open(coding, &c, err, sizeof err) != 1) {
+    return -2;
+  }
+  int r = 0;
+  for (size_t at = 0; at < n && r == 0;) {
+    size_t k = n - at;
+    if (seed) {
+      seed = seed * 1103515245u + 12345u;
+      k = 1 + (seed >> 16) % 61;
+      k = k < n - at ? k : n - at;
+    }
+    r = ctui_wm_http_coding_feed(c, data + at, k, unz_out, u, err, sizeof err);
+    FUZZ_CHECK(r >= 0 || err[0], "a refused body without why");
+    at += k;
+  }
+  if (r == 0) {
+    r = ctui_wm_http_coding_end(c, err, sizeof err);
+  }
+  ctui_wm_http_coding_free(c);
+  return r;
+}
+
+static void coded(const uint8_t *data, size_t size) {
+  if (size == 0) {
+    return;
+  }
+  const char *coding = data[0] & 1 ? "gzip" : "deflate";
+  unsigned seed = data[0] | 1u;
+  char *buf = malloc(size);
+  memcpy(buf, data + 1, size - 1);
+  UNZ whole = {malloc(1 << 20), 0, 1 << 20};
+  UNZ parts = {malloc(1 << 20), 0, 1 << 20};
+  int a = unz(coding, buf, size - 1, 0, &whole);
+  int b = unz(coding, buf, size - 1, seed, &parts);
+  FUZZ_CHECK(a == b, "whole %d, in pieces %d", a, b);
+  /* a refused one may have handed on different amounts before it broke */
+  if (a >= 0) {
+    FUZZ_CHECK(
+        whole.len == parts.len && !memcmp(whole.buf, parts.buf, whole.len),
+        "in pieces, a different body (%zu vs %zu)", whole.len, parts.len);
+  }
+  free(whole.buf);
+  free(parts.buf);
+  free(buf);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size == 0) {
     return 0;
@@ -143,6 +212,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     url(data + 1, size - 1);
   } else if (data[0] == 2) {
     pieces(data + 1, size - 1);
+  } else if (data[0] == 4) {
+    coded(data + 1, size - 1);
   } else {
     request(data + 1, size - 1);
   }

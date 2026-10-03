@@ -249,6 +249,20 @@ int ctui_wm_conn_tls(const CTUI_WM_CONN *c) { return c->tls != NULL; }
 
 int ctui_wm_conn_fd(const CTUI_WM_CONN *c) { return c->fd; }
 
+int ctui_wm_conn_idle_ok(const CTUI_WM_CONN *c) {
+  if (c->off < c->len) {
+    return 0;
+  }
+  struct pollfd pfd = {.fd = c->fd, .events = POLLIN};
+  if (poll(&pfd, 1, 0) < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+    return 0;
+  }
+  /* plainly nothing comes unasked: that's the server's close (or junk).
+   * Over TLS it may be a session ticket; a closed one shows when the
+   * request finds nothing */
+  return !(pfd.revents & POLLIN) || c->tls != NULL;
+}
+
 int ctui_wm_conn_pending(const CTUI_WM_CONN *c) {
   return c->off < c->len || (c->tls && ctui_wm_tls_pending(c->tls) > 0);
 }

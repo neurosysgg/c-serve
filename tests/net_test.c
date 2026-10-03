@@ -3,7 +3,8 @@
  * exchanges over plain HTTP with a server forked on 127.0.0.1 -- a
  * redirect, a chunked reply, a POST, a server that never answers (the
  * deadline), one too big, the reply's headers -- and streamed ones (split
- * chunks, an endless body, a cut one, one that stalls). TLS itself runs
+ * chunks, an endless body, a cut one, one that stalls); gzip'd and
+ * deflated bodies undone, connections kept between requests. TLS itself runs
  * live only (HISTORY.md, session 77: open-meteo, badssl.com's bad
  * certificates refused); here only its start from many threads at once
  * (the CA bundle, ClientHello key shares: ctui-mail's parallel checks
@@ -13,6 +14,7 @@
  * client trusts that CA through SSL_CERT_FILE, set before any TLS). */
 #define _POSIX_C_SOURCE 200809L
 
+#include "coding.h"
 #include "conn.h"
 #include "http.h"
 #include "httpd.h"
@@ -27,6 +29,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,8 +37,37 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 
 static char g_err[256];
+
+/* s[0..n) compressed: wbits 31 gzip, 15 zlib, -15 raw deflate (malloc'd,
+ * its length in *len) */
+static char *squeeze(const char *s, size_t n, int wbits, size_t *len) {
+  z_stream z = {0};
+  deflateInit2(&z, 9, Z_DEFLATED, wbits, 8, Z_DEFAULT_STRATEGY);
+  uLong cap = deflateBound(&z, (uLong)n);
+  char *out = malloc(cap);
+  z.next_in = (Bytef *)(uintptr_t)s;
+  z.avail_in = (uInt)n;
+  z.next_out = (Bytef *)out;
+  z.avail_out = (uInt)cap;
+  deflate(&z, Z_FINISH);
+  *len = z.total_out;
+  deflateEnd(&z);
+  return out;
+}
+
+/* 1000 bytes that compress well */
+static const char *text(void) {
+  static char t[1001];
+  if (!t[0]) {
+    for (int i = 0; i < 50; i++) {
+      memcpy(t + i * 20, "the quick brown fox ", 20);
+    }
+  }
+  return t;
+}
 
 static int parse(const char *s, CTUI_WM_HTTP_PARSED *p) {
   return ctui_wm_http_parse(s, strlen(s), p, g_err, sizeof g_err);
@@ -99,12 +131,13 @@ static void test_format(void) {
   ctui_wm_url_parse("https://h.example/p?q", &u, g_err, sizeof g_err);
   CTUI_WM_HTTP_REQ get = {.url = "unused"};
   CTUI_TEST_ASSERT(
-      ctui_wm_http_format(&get, &u, &out, &len) == 0 &&
+      ctui_wm_http_format(&get, &u, 1, &out, &len) == 0 &&
           !strncmp(out, "GET /p?q HTTP/1.1\r\nHost: h.example\r\n", 36) &&
-          strstr(out, "Connection: close\r\n") &&
-          !strstr(out, "Content-Length") && len > 4 &&
-          !strcmp(out + len - 4, "\r\n\r\n"),
-      "a GET: Host without the default port, no body");
+          strstr(out, "Accept-Encoding: gzip, deflate\r\n") &&
+          !strstr(out, "Connection:") && !strstr(out, "Content-Length") &&
+          len > 4 && !strcmp(out + len - 4, "\r\n\r\n"),
+      "a GET: Host without the default port, gzip offered, kept alive, no "
+      "body");
   free(out);
 
   ctui_wm_url_parse("http://h:8080/t", &u, g_err, sizeof g_err);
@@ -115,18 +148,27 @@ static void test_format(void) {
                            .body_len = 7,
                            .headers = hdrs};
   CTUI_TEST_ASSERT(
-      ctui_wm_http_format(&post, &u, &out, &len) == 0 &&
+      ctui_wm_http_format(&post, &u, 0, &out, &len) == 0 &&
           strstr(out, "Host: h:8080\r\n") &&
           strstr(out, "Authorization: Bearer x\r\n") &&
           strstr(out, "Content-Type: application/x-www-form-urlencoded\r\n") &&
           strstr(out, "Content-Length: 7\r\n") &&
+          strstr(out, "Accept-Encoding: identity\r\n") &&
           !strcmp(out + len - 11, "\r\n\r\na=1&b=2"),
       "a POST: the port in Host, extra headers, its type, length and body");
   free(out);
 
+  const char *own[] = {"accept-encoding: br", NULL};
+  CTUI_WM_HTTP_REQ mine = {.headers = own};
+  CTUI_TEST_ASSERT(ctui_wm_http_format(&mine, &u, 1, &out, &len) == 0 &&
+                       strstr(out, "accept-encoding: br\r\n") &&
+                       !strstr(out, "Accept-Encoding"),
+                   "the caller's own Accept-Encoding says it alone");
+  free(out);
+
   const char *evil[] = {"X: a\r\nY: b", NULL};
   CTUI_WM_HTTP_REQ inj = {.headers = evil};
-  CTUI_TEST_ASSERT(ctui_wm_http_format(&inj, &u, &out, &len) != 0,
+  CTUI_TEST_ASSERT(ctui_wm_http_format(&inj, &u, 0, &out, &len) != 0,
                    "a header with a line break in it refused");
 }
 
@@ -303,7 +345,238 @@ static void test_decoder(void) {
   ctui_wm_http_dec_free(&d);
 }
 
+/* --- Content-Encoding undone --- */
+
+typedef struct {
+  char *buf;
+  size_t len;
+  size_t stop_after;
+} UNZ;
+
+static int unz_out(void *ctx, const char *buf, size_t n) {
+  UNZ *u = ctx;
+  char *b = realloc(u->buf, u->len + n + 1);
+  if (!b) {
+    return 1;
+  }
+  u->buf = b;
+  memcpy(u->buf + u->len, buf, n);
+  u->len += n;
+  u->buf[u->len] = '\0';
+  return u->stop_after && u->len >= u->stop_after;
+}
+
+/* data[0..n) under coding fed step bytes at a time: 0 decoded into u, 1
+ * stopped, -1 refused (g_err says why) */
+static int unz(const char *coding, const char *data, size_t n, size_t step,
+               UNZ *u) {
+  CTUI_WM_HTTP_CODING *c;
+  if (ctui_wm_http_coding_open(coding, &c, g_err, sizeof g_err) != 1) {
+    return -1;
+  }
+  int r = 0;
+  for (size_t at = 0; at < n && r == 0; at += step) {
+    size_t k = n - at < step ? n - at : step;
+    r = ctui_wm_http_coding_feed(c, data + at, k, unz_out, u, g_err,
+                                 sizeof g_err);
+  }
+  if (r == 0) {
+    r = ctui_wm_http_coding_end(c, g_err, sizeof g_err);
+  }
+  ctui_wm_http_coding_free(c);
+  return r;
+}
+
+static void test_coding(void) {
+  const char *t = text();
+  size_t tl = strlen(t);
+  struct {
+    const char *coding;
+    int wbits;
+  } kinds[] = {{"gzip", 31},
+               {" X-GZIP ", 31},
+               {"deflate", 15},
+               {"Deflate", -15},
+               {"gzip", 15}};
+  for (size_t i = 0; i < sizeof kinds / sizeof *kinds; i++) {
+    size_t zl;
+    char *z = squeeze(t, tl, kinds[i].wbits, &zl);
+    UNZ whole = {0}, bytes = {0};
+    int a = unz(kinds[i].coding, z, zl, zl, &whole);
+    int b = unz(kinds[i].coding, z, zl, 1, &bytes);
+    CTUI_TEST_ASSERT(a == 0 && b == 0 && zl < tl / 4 && whole.len == tl &&
+                         !strcmp(whole.buf, t) && bytes.len == tl &&
+                         !strcmp(bytes.buf, t),
+                     "%s (%d) undone, whole and a byte at a time (%s)",
+                     kinds[i].coding, kinds[i].wbits, a || b ? g_err : "");
+    free(whole.buf);
+    free(bytes.buf);
+    free(z);
+  }
+
+  CTUI_WM_HTTP_CODING *c = NULL;
+  CTUI_TEST_ASSERT(
+      ctui_wm_http_coding_open("identity", &c, g_err, sizeof g_err) == 0 &&
+          !c && ctui_wm_http_coding_open("", &c, g_err, sizeof g_err) == 0,
+      "identity (or nothing) needs nothing undone");
+  g_err[0] = '\0';
+  CTUI_TEST_ASSERT(
+      ctui_wm_http_coding_open("br", &c, g_err, sizeof g_err) < 0 &&
+          strstr(g_err, "br") &&
+          ctui_wm_http_coding_open("gzip, gzip", &c, g_err, sizeof g_err) < 0 &&
+          !c,
+      "a coding we don't read refused, named; two of them too");
+
+  size_t zl;
+  char *z = squeeze(t, tl, 31, &zl);
+  UNZ u = {0};
+  CTUI_TEST_ASSERT(unz("gzip", z, zl - 3, 7, &u) < 0 &&
+                       strstr(g_err, "ended early"),
+                   "a gzip stream cut short: refused at the end");
+  free(u.buf);
+  memset(&u, 0, sizeof u);
+  char *more = malloc(zl + 9);
+  memcpy(more, z, zl);
+  memcpy(more + zl, "trailing!", 9);
+  CTUI_TEST_ASSERT(unz("gzip", more, zl + 9, 5, &u) == 0 && u.len == tl,
+                   "what follows the stream's end dropped");
+  free(u.buf);
+  free(more);
+  memset(&u, 0, sizeof u);
+  u.stop_after = 100;
+  CTUI_TEST_ASSERT(unz("gzip", z, zl, zl, &u) == 1 && u.len >= 100,
+                   "the output's taker stops it");
+  free(u.buf);
+  free(z);
+  memset(&u, 0, sizeof u);
+  g_err[0] = '\0';
+  CTUI_TEST_ASSERT(unz("gzip", "not gzip at all", 15, 4, &u) < 0 &&
+                       strstr(g_err, "broken") && !u.len,
+                   "not gzip: refused as broken");
+  CTUI_TEST_ASSERT(unz("deflate", "", 0, 1, &u) == 0 && !u.len,
+                   "an empty body labelled compressed is empty");
+  free(u.buf);
+}
+
+/* --- whether the connection can take the next request --- */
+
+static void test_reuse(void) {
+  struct {
+    const char *reply;
+    int reusable;
+    const char *what;
+  } cases[] = {
+      {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 1,
+       "HTTP/1.1 by its length"},
+      {"HTTP/1.1 200 OK\r\nConnection: Upgrade, close\r\n"
+       "Content-Length: 2\r\n\r\nok",
+       0, "Connection: close"},
+      {"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok", 0,
+       "HTTP/1.0 without keep-alive"},
+      {"HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\n"
+       "Content-Length: 2\r\n\r\nok",
+       1, "HTTP/1.0 with keep-alive"},
+      {"HTTP/1.1 200 OK\r\n\r\nto the end", 0, "a body to the end"},
+      {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+       "2\r\nok\r\n0\r\nA: 1\r\nB: 2\r\n\r\n",
+       1, "chunked, its trailers read"},
+      {"HTTP/1.1 304 Not Modified\r\nContent-Length: 50\r\n\r\n", 1,
+       "a 304, no body whatever its length"},
+  };
+  for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+    SINKED s;
+    CTUI_WM_HTTP_DEC d;
+    int r = dec_bytes(cases[i].reply, &s, &d);
+    CTUI_TEST_ASSERT(r == 1 &&
+                         ctui_wm_http_dec_reusable(&d) == cases[i].reusable &&
+                         d.fed == strlen(cases[i].reply),
+                     "kept for the next request or not: %s", cases[i].what);
+    ctui_wm_http_dec_free(&d);
+  }
+
+  SINKED s = {0};
+  CTUI_WM_HTTP_DEC d;
+  ctui_wm_http_dec_init(&d);
+  d.on_body = dec_body;
+  d.ctx = &s;
+  d.no_body = 1;
+  const char *h = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+  CTUI_TEST_ASSERT(
+      ctui_wm_http_dec_feed(&d, h, strlen(h), g_err, sizeof g_err) == 1 &&
+          ctui_wm_http_dec_reusable(&d) && s.len == 0,
+      "a HEAD's reply ends with its headers");
+  ctui_wm_http_dec_free(&d);
+
+  memset(&s, 0, sizeof s);
+  ctui_wm_http_dec_init(&d);
+  d.on_body = dec_body;
+  d.ctx = &s;
+  const char *t = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                  "2\r\nok\r\n0\r\n";
+  CTUI_TEST_ASSERT(
+      ctui_wm_http_dec_feed(&d, t, strlen(t), g_err, sizeof g_err) == 0 &&
+          ctui_wm_http_dec_end(&d, g_err, sizeof g_err) == 0 &&
+          !ctui_wm_http_dec_reusable(&d) && !strcmp(s.body, "ok"),
+      "the last chunk, then the server closed: whole, not kept");
+  ctui_wm_http_dec_free(&d);
+}
+
 /* --- a server on 127.0.0.1, one reply per request by its path --- */
+
+/* the /gz... replies: compressed if gzip was offered, else "not offered" */
+static void gz_reply(int c, const char *req) {
+  const char *t = text();
+  if (!strstr(req, "Accept-Encoding: gzip")) {
+    const char *r = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n"
+                    "not offered";
+    send(c, r, strlen(r), MSG_NOSIGNAL);
+    return;
+  }
+  char head[256];
+  size_t zl = 0;
+  char *z = NULL;
+  const char *coding = "gzip";
+  int chunked = 0;
+  if (!strncmp(req, "GET /gz-raw ", 12)) {
+    z = squeeze(t, strlen(t), -15, &zl);
+    coding = "deflate";
+  } else if (!strncmp(req, "GET /gz-bomb ", 13)) {
+    char *zeros = calloc(1, 1 << 20);
+    z = squeeze(zeros, 1 << 20, 31, &zl);
+    free(zeros);
+  } else if (!strncmp(req, "GET /gz-bad ", 12)) {
+    z = strdup("not gzip at all");
+    zl = strlen(z);
+  } else if (!strncmp(req, "GET /gz-br ", 11)) {
+    z = strdup("whatever");
+    zl = strlen(z);
+    coding = "br";
+  } else {
+    chunked = !strncmp(req, "GET /gz-chunked ", 16);
+    z = squeeze(t, strlen(t), 31, &zl);
+  }
+  if (chunked) {
+    size_t half = zl / 2;
+    snprintf(head, sizeof head,
+             "HTTP/1.1 200 OK\r\nContent-Encoding: %s\r\n"
+             "Transfer-Encoding: chunked\r\n\r\n%zx\r\n",
+             coding, half);
+    send(c, head, strlen(head), MSG_NOSIGNAL);
+    send(c, z, half, MSG_NOSIGNAL);
+    snprintf(head, sizeof head, "\r\n%zx\r\n", zl - half);
+    send(c, head, strlen(head), MSG_NOSIGNAL);
+    send(c, z + half, zl - half, MSG_NOSIGNAL);
+    send(c, "\r\n0\r\n\r\n", 7, MSG_NOSIGNAL);
+  } else {
+    snprintf(head, sizeof head,
+             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+             "Content-Encoding: %s\r\nContent-Length: %zu\r\n\r\n",
+             coding, zl);
+    send(c, head, strlen(head), MSG_NOSIGNAL);
+    send(c, z, zl, MSG_NOSIGNAL);
+  }
+  free(z);
+}
 
 static const char *reply_for(const char *req) {
   if (!strncmp(req, "GET /redirect ", 14)) {
@@ -356,6 +629,11 @@ static void serve(int ls) {
       if (hend && (strncmp(req, "POST", 4) || strlen(hend) >= 4 + 3)) {
         break;
       }
+    }
+    if (!strncmp(req, "GET /gz", 7)) {
+      gz_reply(c, req);
+      close(c);
+      continue;
     }
     if (!strncmp(req, "GET /pieces ", 12)) {
       /* chunked, a chunk's size and data split across writes */
@@ -448,6 +726,14 @@ static void test_streams(int port) {
   free(rep.body);
 
   memset(&s, 0, sizeof s);
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/gzip", port);
+  CTUI_TEST_ASSERT(
+      ctui_wm_net_http_stream(&req, &sink, &rep, g_err, sizeof g_err) == 0 &&
+          !strcmp(s.buf, "not offered"),
+      "a stream doesn't offer gzip (it comes as it is: Range, progress)");
+  free(rep.body);
+
+  memset(&s, 0, sizeof s);
   snprintf(url, sizeof url, "http://127.0.0.1:%d/cut", port);
   g_err[0] = '\0';
   CTUI_TEST_ASSERT(
@@ -465,6 +751,56 @@ static void test_streams(int port) {
           !strcmp(g_err, "timed out") && !strcmp(s.buf, "some") &&
           ctui_wm_net_now() - t0 < 2000,
       "a body that stops coming: timed out after the idle time");
+}
+
+static void test_gzipped(int port) {
+  char url[128], v[64];
+  CTUI_WM_HTTP_REPLY rep;
+  CTUI_WM_HTTP_REQ req = {.url = url, .timeout_ms = 3000};
+  const char *paths[] = {"/gzip", "/gz-chunked", "/gz-raw"};
+  for (size_t i = 0; i < sizeof paths / sizeof *paths; i++) {
+    snprintf(url, sizeof url, "http://127.0.0.1:%d%s", port, paths[i]);
+    int r = ctui_wm_net_http(&req, &rep, g_err, sizeof g_err);
+    CTUI_TEST_ASSERT(
+        r == 0 && rep.status == 200 && rep.len == strlen(text()) &&
+            !strcmp(rep.body, text()) &&
+            !ctui_wm_http_reply_header(&rep, "Content-Encoding", v, sizeof v) &&
+            !ctui_wm_http_reply_header(&rep, "Content-Length", v, sizeof v) &&
+            ctui_wm_http_reply_header(&rep, "Content-Type", v, sizeof v) ==
+                (i != 1),
+        "%s: the body decoded, its coding and length gone from the headers "
+        "(%s)",
+        paths[i], r ? g_err : "");
+    free(r == 0 ? rep.body : NULL);
+  }
+
+  const char *own[] = {"Accept-Encoding: gzip", NULL};
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/gzip", port);
+  CTUI_WM_HTTP_REQ mine = {.url = url, .timeout_ms = 3000, .headers = own};
+  CTUI_TEST_ASSERT(
+      ctui_wm_net_http(&mine, &rep, g_err, sizeof g_err) == 0 && rep.len > 2 &&
+          (unsigned char)rep.body[0] == 0x1f &&
+          (unsigned char)rep.body[1] == 0x8b &&
+          ctui_wm_http_reply_header(&rep, "Content-Encoding", v, sizeof v),
+      "asked for by the caller: handed over as it came");
+  free(rep.body);
+
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/gz-bomb", port);
+  CTUI_WM_HTTP_REQ bomb = {.url = url, .timeout_ms = 3000, .max = 65536};
+  g_err[0] = '\0';
+  CTUI_TEST_ASSERT(ctui_wm_net_http(&bomb, &rep, g_err, sizeof g_err) != 0 &&
+                       strstr(g_err, "over 65536 bytes"),
+                   "max counts the decoded bytes (1 MB of zeros in ~1 KB)");
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/gz-bad", port);
+  g_err[0] = '\0';
+  CTUI_TEST_ASSERT(ctui_wm_net_http(&req, &rep, g_err, sizeof g_err) != 0 &&
+                       strstr(g_err, "broken"),
+                   "a body that isn't what its coding says: refused");
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/gz-br", port);
+  g_err[0] = '\0';
+  CTUI_TEST_ASSERT(ctui_wm_net_http(&req, &rep, g_err, sizeof g_err) != 0 &&
+                       strstr(g_err, "don't read: br"),
+                   "a coding not offered: refused, named");
 }
 
 static void test_exchanges(void) {
@@ -511,6 +847,8 @@ static void test_exchanges(void) {
           !ctui_wm_http_reply_header(&rep, "Location", v, sizeof v),
       "the reply's headers, after its body, looked up by name");
   free(rep.body);
+
+  test_gzipped(port);
 
   snprintf(url, sizeof url, "http://127.0.0.1:%d/echo", port);
   CTUI_WM_HTTP_REQ post = {.method = "POST",
@@ -682,6 +1020,7 @@ static void test_httpd_parse(void) {
 
 typedef struct {
   CTUI_WM_TLS_SERVER *tls;
+  int conns; /* accepted so far */
 } SRV;
 
 static void on_page(const CTUI_WM_HTTPD_REQ *r, const char *body,
@@ -703,6 +1042,7 @@ static void on_page(const CTUI_WM_HTTPD_REQ *r, const char *body,
 static void on_conn(CTUI_WM_CONN *c, const char *peer, void *ud) {
   SRV *s = ud;
   char err[256];
+  __atomic_fetch_add(&s->conns, 1, __ATOMIC_SEQ_CST);
   if (s->tls && ctui_wm_conn_accept_tls(c, s->tls, err, sizeof err) != 0) {
     ctui_wm_conn_close(c);
     return;
@@ -721,6 +1061,72 @@ static void *serve_run(void *arg) {
   char err[128];
   ctui_wm_listen_serve(s->ls, 2, s->stop, err, sizeof err);
   return NULL;
+}
+
+static int conns(SRV *s) {
+  return __atomic_load_n(&s->conns, __ATOMIC_SEQ_CST);
+}
+
+/* GETs to one host on one connection; a POST on a new one; one the server
+ * closed while idle (its idle_ms is 500) found out and sent again */
+static void test_kept(SRV *plain, int port, SRV *tls, int tls_port) {
+  char url[128], err[256];
+  CTUI_WM_HTTP_REPLY rep;
+  ctui_wm_net_idle_close();
+  int c0 = conns(plain), ok = 1;
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/hi", port);
+  CTUI_WM_HTTP_REQ req = {.url = url, .timeout_ms = 3000};
+  for (int i = 0; i < 3; i++) {
+    ok = ok && ctui_wm_net_http(&req, &rep, err, sizeof err) == 0 &&
+         !strcmp(rep.body, "hi there");
+    free(ok ? rep.body : NULL);
+  }
+  CTUI_TEST_ASSERT(
+      ok && conns(plain) == c0 + 1 && ctui_wm_net_idle_count() == 1,
+      "three GETs on one connection, kept after (%d)", conns(plain) - c0);
+
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/echo", port);
+  CTUI_WM_HTTP_REQ post = {.url = url,
+                           .timeout_ms = 3000,
+                           .method = "POST",
+                           .body = "x",
+                           .body_len = 1};
+  CTUI_TEST_ASSERT(ctui_wm_net_http(&post, &rep, err, sizeof err) == 0 &&
+                       !strcmp(rep.body, "x") && conns(plain) == c0 + 2,
+                   "a POST never goes on a kept connection (it isn't sent "
+                   "twice)");
+  free(rep.body);
+
+  snprintf(url, sizeof url, "https://localhost:%d/hi", tls_port);
+  int t0 = conns(tls);
+  ok = 1;
+  for (int i = 0; i < 2; i++) {
+    ok = ok && ctui_wm_net_http(&req, &rep, err, sizeof err) == 0 &&
+         !strcmp(rep.body, "hi there");
+    free(ok ? rep.body : NULL);
+  }
+  CTUI_TEST_ASSERT(ok && conns(tls) == t0 + 1,
+                   "over TLS: two GETs, one handshake (%s)", ok ? "" : err);
+
+  /* past the server's idle time: it has closed both */
+  nanosleep(&(struct timespec){0, 800000000}, NULL);
+  ok = ctui_wm_net_http(&req, &rep, err, sizeof err) == 0 &&
+       !strcmp(rep.body, "hi there");
+  free(ok ? rep.body : NULL);
+  CTUI_TEST_ASSERT(ok && conns(tls) == t0 + 2,
+                   "over TLS: one the server closed meanwhile, sent again on "
+                   "a new one (%s)",
+                   ok ? "" : err);
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/hi", port);
+  int c1 = conns(plain);
+  ok = ctui_wm_net_http(&req, &rep, err, sizeof err) == 0 &&
+       !strcmp(rep.body, "hi there");
+  free(ok ? rep.body : NULL);
+  CTUI_TEST_ASSERT(ok && conns(plain) == c1 + 1,
+                   "plainly: the same, found closed before sending (%s)",
+                   ok ? "" : err);
+  ctui_wm_net_idle_close();
+  CTUI_TEST_ASSERT(ctui_wm_net_idle_count() == 0, "kept ones closed on asking");
 }
 
 static void test_server(void) {
@@ -774,6 +1180,7 @@ static void test_server(void) {
                        rep.status == 200 && !strcmp(rep.body, "hi there"),
                    "over TLS: the test CA's localhost certificate (%s)", err);
   free(rep.body);
+  test_kept(&plain, sv.ls[0]->port, &tls, sv.ls[1]->port);
   /* the TLS port reached plainly, TLS started with a name its
    * certificate doesn't carry */
   CTUI_WM_URL u;
@@ -830,6 +1237,8 @@ int main(void) {
   test_format();
   test_replies();
   test_decoder();
+  test_coding();
+  test_reuse();
   test_exchanges();
   test_tls_threads();
   test_httpd_parse();
