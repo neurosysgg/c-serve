@@ -595,6 +595,16 @@ static const char *reply_for(const char *req) {
                ? "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ngot!"
                : "HTTP/1.1 400 Bad\r\nContent-Length: 0\r\n\r\n";
   }
+  if (!strncmp(req, "POST /login ", 12)) {
+    return "HTTP/1.1 303 See Other\r\nSet-Cookie: s=1; Path=/\r\n"
+           "Location: /home\r\nContent-Length: 0\r\n\r\n";
+  }
+  if (!strncmp(req, "GET /home ", 10)) {
+    /* signed in: the cookie came, the form's body didn't */
+    return strstr(req, "\r\nCookie: s=1\r\n") && !strstr(req, "u=me")
+               ? "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nin"
+               : "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nout";
+  }
   if (!strncmp(req, "GET /big ", 9)) {
     return "HTTP/1.1 200 OK\r\n\r\n"
            "0123456789012345678901234567890123456789";
@@ -803,6 +813,58 @@ static void test_gzipped(int port) {
                    "a coding not offered: refused, named");
 }
 
+/* a jar of one cookie, for the hooks */
+typedef struct {
+  char cookie[64];
+  int replies;
+  char last[160];
+} JAR;
+
+static size_t jar_cookie(void *ctx, const char *url, char *out, size_t cap) {
+  (void)url;
+  JAR *j = ctx;
+  return (size_t)snprintf(out, cap, "%s", j->cookie);
+}
+
+static void jar_replied(void *ctx, const char *url, const char *h, size_t n) {
+  JAR *j = ctx;
+  j->replies++;
+  snprintf(j->last, sizeof j->last, "%s", url);
+  char hs[512];
+  snprintf(hs, sizeof hs, "%.*s", (int)n, h);
+  const char *sc = strstr(hs, "Set-Cookie: ");
+  if (sc) {
+    snprintf(j->cookie, sizeof j->cookie, "%.*s", (int)strcspn(sc + 12, ";\r"),
+             sc + 12);
+  }
+}
+
+/* a sign-in: a POST answered 303 with a cookie, the page it names asked
+ * for by GET, the cookie with it */
+static void test_signin(int port) {
+  char url[128], home[128];
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/login", port);
+  snprintf(home, sizeof home, "http://127.0.0.1:%d/home", port);
+  JAR jar = {0};
+  CTUI_WM_HTTP_REQ req = {.method = "POST",
+                          .url = url,
+                          .content_type = "application/x-www-form-urlencoded",
+                          .body = "u=me",
+                          .body_len = 4,
+                          .timeout_ms = 3000,
+                          .cookie = jar_cookie,
+                          .replied = jar_replied,
+                          .cookie_ctx = &jar};
+  CTUI_WM_HTTP_REPLY rep;
+  CTUI_TEST_ASSERT(ctui_wm_net_http(&req, &rep, g_err, sizeof g_err) == 0 &&
+                       rep.status == 200 && !strcmp(rep.body, "in"),
+                   "a POST's 303 followed by GET, its cookie sent");
+  CTUI_TEST_ASSERT(jar.replies == 2 && !strcmp(jar.last, home) && rep.url &&
+                       !strcmp(rep.url, home),
+                   "both replies' headers handed over, each with its URL");
+  free(rep.body);
+}
+
 static void test_exchanges(void) {
   int ls = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in a = {.sin_family = AF_INET,
@@ -861,6 +923,8 @@ static void test_exchanges(void) {
                        rep.status == 200 && !strcmp(rep.body, "got!"),
                    "a POST with its body");
   free(rep.body);
+
+  test_signin(port);
 
   snprintf(url, sizeof url, "http://127.0.0.1:%d/loop", port);
   g_err[0] = '\0';

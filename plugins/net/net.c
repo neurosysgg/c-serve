@@ -17,6 +17,8 @@
 #define NET_MAX (8u << 20)
 /* what a redirect's body may be before it's given up on (it's dropped) */
 #define NET_REDIRECT_BODY 65536
+/* the most a Cookie header's value may be */
+#define NET_COOKIE_MAX 16384
 
 /* --- connections kept open between requests (keep-alive) --- */
 
@@ -171,9 +173,17 @@ static int ex_head(CTUI_WM_HTTP_DEC *d) {
   CTUI_WM_HTTP_PARSED p = {.status = d->status,
                            .headers = d->headers,
                            .headers_len = d->headers_len};
-  if (!strcasecmp(method, "GET") &&
-      (p.status == 301 || p.status == 302 || p.status == 303 ||
-       p.status == 307 || p.status == 308) &&
+  if (ex->req->replied) {
+    ex->req->replied(ex->req->cookie_ctx, ex->url ? ex->url : ex->req->url,
+                     d->headers, d->headers_len);
+  }
+  /* a POST's 301 / 302 / 303 goes on as a GET (what browsers do: the
+   * page after a sign-in); a 307 / 308 would send it again, it comes back */
+  int get = !strcasecmp(method, "GET"),
+      post = !strcasecmp(method, "POST") &&
+             (p.status == 301 || p.status == 302 || p.status == 303);
+  if ((post || (get && (p.status == 301 || p.status == 302 || p.status == 303 ||
+                        p.status == 307 || p.status == 308))) &&
       ctui_wm_http_header(&p, "Location", ex->loc, sizeof ex->loc)) {
     /* its body read and dropped, so the connection can go on */
     ex->redirect = 1;
@@ -358,11 +368,51 @@ static void ex_free(EX *ex) {
   free(ex->hdr);
 }
 
+/* h's headers: req's, with a Cookie line when req->cookie gives one for
+ * url (malloc'd: cookies_free() gives back what to free). 0, or -1 */
+static int cookies(CTUI_WM_HTTP_REQ *h, const CTUI_WM_HTTP_REQ *req,
+                   const char *url) {
+  h->headers = req->headers;
+  if (!req->cookie) {
+    return 0;
+  }
+  char v[NET_COOKIE_MAX];
+  size_t vl = req->cookie(req->cookie_ctx, url, v, sizeof v);
+  if (!vl) {
+    return 0;
+  }
+  size_t n = 0;
+  while (req->headers && req->headers[n]) {
+    n++;
+  }
+  /* the lines, then the Cookie line's text after them: one allocation */
+  char **hs = malloc((n + 2) * sizeof *hs + vl + 9);
+  if (!hs) {
+    return -1;
+  }
+  char *line = (char *)(hs + n + 2);
+  memcpy(line, "Cookie: ", 8);
+  memcpy(line + 8, v, vl + 1);
+  for (size_t i = 0; i < n; i++) {
+    hs[i] = (char *)req->headers[i];
+  }
+  hs[n] = line;
+  hs[n + 1] = NULL;
+  h->headers = (const char *const *)hs;
+  return 0;
+}
+
+/* what cookies() allocated for h, if anything (h's headers back to req's) */
+static void *cookies_free(CTUI_WM_HTTP_REQ *h, const CTUI_WM_HTTP_REQ *req) {
+  void *p = h->headers != req->headers ? (void *)h->headers : NULL;
+  h->headers = req->headers;
+  return p;
+}
+
 /* req, redirects followed: the body gathered into rep, or handed to sink */
 static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
                    CTUI_WM_HTTP_REPLY *rep, char *err, size_t err_cap) {
   memset(rep, 0, sizeof *rep);
-  const char *method = req->method ? req->method : "GET";
   int timeout = req->timeout_ms > 0 ? req->timeout_ms : NET_TIMEOUT_MS;
   long deadline = ctui_wm_net_now() + timeout;
   CTUI_WM_URL u;
@@ -370,6 +420,9 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
     return -1;
   }
   char url[sizeof u.path + sizeof u.host + 32];
+  /* this hop's request: req, a GET of it after a POST's redirect, with
+   * its cookies */
+  CTUI_WM_HTTP_REQ hreq = *req;
   for (int hop = 0;; hop++) {
     if (hop > 0 && ctui_wm_url_format(&u, url, sizeof url) != 0) {
       snprintf(err, err_cap, "the redirect is too long");
@@ -381,11 +434,14 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
     int coded = !sink && !ctui_wm_http_req_has(req, "Accept-Encoding");
     char *out = NULL;
     size_t out_len = 0;
-    if (ctui_wm_http_format(req, &u, coded, &out, &out_len) != 0) {
+    if (cookies(&hreq, req, hop > 0 ? url : req->url) != 0 ||
+        ctui_wm_http_format(&hreq, &u, coded, &out, &out_len) != 0) {
+      free(cookies_free(&hreq, req));
       snprintf(err, err_cap, "a header with a line break, or out of memory");
       return -1;
     }
-    EX ex = {.req = req,
+    free(cookies_free(&hreq, req));
+    EX ex = {.req = &hreq,
              .sink = sink,
              .rep = rep,
              .max = req->max ? req->max : NET_MAX,
@@ -395,10 +451,11 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
     ex.d.on_head = ex_head;
     ex.d.on_body = ex_body;
     ex.d.ctx = &ex;
-    ex.d.no_body = !strcasecmp(method, "HEAD");
+    const char *m = hreq.method ? hreq.method : "GET";
+    ex.d.no_body = !strcasecmp(m, "HEAD");
     /* a request that changes something isn't sent twice: never on a kept
      * connection that may turn out closed */
-    int reuse = ex.d.no_body || !strcasecmp(method, "GET");
+    int reuse = ex.d.no_body || !strcasecmp(m, "GET");
     int rc =
         exchange(&ex, &u, reuse, out, out_len, deadline, timeout, err, err_cap);
     free(out);
@@ -448,6 +505,13 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
       return -1;
     }
     u = next;
+    if (strcasecmp(m, "GET") && strcasecmp(m, "HEAD")) {
+      /* a POST redirected: what follows is a GET */
+      hreq.method = "GET";
+      hreq.body = NULL;
+      hreq.body_len = 0;
+      hreq.content_type = NULL;
+    }
   }
 }
 
