@@ -595,6 +595,14 @@ static const char *reply_for(const char *req) {
                ? "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ngot!"
                : "HTTP/1.1 400 Bad\r\nContent-Length: 0\r\n\r\n";
   }
+  if (!strncmp(req, "POST /moved7 ", 13)) {
+    return "HTTP/1.1 307 Temporary\r\nLocation: /echo\r\n"
+           "Content-Length: 0\r\n\r\n";
+  }
+  if (!strncmp(req, "POST /moved8 ", 13)) {
+    return "HTTP/1.1 308 Permanent\r\nLocation: /echo\r\n"
+           "Content-Length: 0\r\n\r\n";
+  }
   if (!strncmp(req, "POST /login ", 12)) {
     return "HTTP/1.1 303 See Other\r\nSet-Cookie: s=1; Path=/\r\n"
            "Location: /home\r\nContent-Length: 0\r\n\r\n";
@@ -863,6 +871,23 @@ static void test_signin(int port) {
                        !strcmp(rep.url, home),
                    "both replies' headers handed over, each with its URL");
   free(rep.body);
+  /* a 307 / 308: the same POST again, its body and type with it (the
+   * echo answers 400 without them) */
+  const char *codes[] = {"moved7", "moved8"};
+  for (int i = 0; i < 2; i++) {
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/%s", port, codes[i]);
+    CTUI_WM_HTTP_REQ again = {.method = "POST",
+                              .url = url,
+                              .content_type = "text/plain",
+                              .body = "k=v",
+                              .body_len = 3,
+                              .timeout_ms = 3000};
+    CTUI_TEST_ASSERT(ctui_wm_net_http(&again, &rep, g_err, sizeof g_err) == 0 &&
+                         rep.status == 200 && !strcmp(rep.body, "got!"),
+                     "a POST's %s: sent again as a POST, with its body (%d %s)",
+                     i ? "308" : "307", rep.status, g_err);
+    free(rep.body);
+  }
 }
 
 static void test_exchanges(void) {

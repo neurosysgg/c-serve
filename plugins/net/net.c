@@ -146,6 +146,7 @@ typedef struct {
   char *hdr;                   /* the head's header lines (malloc'd), for rep */
   const char *url;             /* where a redirect led, NULL: the first URL */
   int redirect;
+  int again; /* the redirect a POST's 307 / 308: sent again as it was */
   char loc[4096 + 256 + 16];
 } EX;
 
@@ -178,13 +179,13 @@ static int ex_head(CTUI_WM_HTTP_DEC *d) {
                      d->headers, d->headers_len);
   }
   /* a POST's 301 / 302 / 303 goes on as a GET (what browsers do: the
-   * page after a sign-in); a 307 / 308 would send it again, it comes back */
-  int get = !strcasecmp(method, "GET"),
-      post = !strcasecmp(method, "POST") &&
-             (p.status == 301 || p.status == 302 || p.status == 303);
-  if ((post || (get && (p.status == 301 || p.status == 302 || p.status == 303 ||
-                        p.status == 307 || p.status == 308))) &&
+   * page after a sign-in), its 307 / 308 as the same POST again */
+  int get = !strcasecmp(method, "GET"), post = !strcasecmp(method, "POST"),
+      moved = p.status == 301 || p.status == 302 || p.status == 303,
+      again = p.status == 307 || p.status == 308;
+  if ((get || post) && (moved || again) &&
       ctui_wm_http_header(&p, "Location", ex->loc, sizeof ex->loc)) {
+    ex->again = post && again;
     /* its body read and dropped, so the connection can go on */
     ex->redirect = 1;
     return 0;
@@ -495,6 +496,7 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
     }
     char loc[sizeof ex.loc];
     memcpy(loc, ex.loc, sizeof loc);
+    int ex_again = ex.again;
     ex_free(&ex);
     if (hop == NET_REDIRECTS) {
       snprintf(err, err_cap, "more than %d redirects", NET_REDIRECTS);
@@ -504,8 +506,13 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
     if (ctui_wm_url_resolve(&u, loc, &next, err, err_cap) != 0) {
       return -1;
     }
+    if (ex_again && u.tls && !next.tls) {
+      /* the form's body won't go on in the clear */
+      snprintf(err, err_cap, "a form sent on to an http:// page: not sent");
+      return -1;
+    }
     u = next;
-    if (strcasecmp(m, "GET") && strcasecmp(m, "HEAD")) {
+    if (!ex_again && strcasecmp(m, "GET") && strcasecmp(m, "HEAD")) {
       /* a POST redirected: what follows is a GET */
       hreq.method = "GET";
       hreq.body = NULL;
