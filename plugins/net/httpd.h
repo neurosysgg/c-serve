@@ -3,7 +3,7 @@
 
 #include "conn.h"
 
-#include "base/buf.h"
+#include "json/buf.h"
 
 #include <stddef.h>
 
@@ -79,9 +79,9 @@ void ctui_wm_httpd_serve(const CTUI_WM_HTTPD *h, CTUI_WM_CONN *c,
 
 /* s appended to b with &<>"' as entities (HTML text or an attribute
  * value) */
-void ctui_wm_httpd_escape(CTUI_WM_BUF *b, const char *s);
+void ctui_wm_httpd_escape(CTUI_BUF *b, const char *s);
 /* b's text as the reply's body (b's memory handed over, b emptied) */
 void ctui_wm_httpd_take(CTUI_WM_HTTPD_REPLY *rep, int status, const char *type,
-                        CTUI_WM_BUF *b);
+                        CTUI_BUF *b);
 
 #endif

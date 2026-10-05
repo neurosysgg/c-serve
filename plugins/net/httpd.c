@@ -264,38 +264,38 @@ void ctui_wm_httpd_text(CTUI_WM_HTTPD_REPLY *rep, int status, const char *type,
 }
 
 void ctui_wm_httpd_take(CTUI_WM_HTTPD_REPLY *rep, int status, const char *type,
-                        CTUI_WM_BUF *b) {
+                        CTUI_BUF *b) {
   rep->status = status;
   rep->type = type;
   rep->body = b->s ? b->s : (char *)"";
   rep->len = b->len;
   rep->owned = b->s != NULL;
-  *b = (CTUI_WM_BUF){0};
+  *b = (CTUI_BUF){0};
 }
 
-void ctui_wm_httpd_escape(CTUI_WM_BUF *b, const char *s) {
+void ctui_wm_httpd_escape(CTUI_BUF *b, const char *s) {
   for (const char *p = s; *p;) {
     size_t k = strcspn(p, "&<>\"'");
-    ctui_wm_buf_add(b, p, k);
+    ctui_buf_add(b, p, k);
     p += k;
     if (!*p) {
       break;
     }
     switch (*p++) {
     case '&':
-      ctui_wm_buf_add(b, "&amp;", 5);
+      ctui_buf_add(b, "&amp;", 5);
       break;
     case '<':
-      ctui_wm_buf_add(b, "&lt;", 4);
+      ctui_buf_add(b, "&lt;", 4);
       break;
     case '>':
-      ctui_wm_buf_add(b, "&gt;", 4);
+      ctui_buf_add(b, "&gt;", 4);
       break;
     case '"':
-      ctui_wm_buf_add(b, "&quot;", 6);
+      ctui_buf_add(b, "&quot;", 6);
       break;
     default:
-      ctui_wm_buf_add(b, "&#39;", 5);
+      ctui_buf_add(b, "&#39;", 5);
       break;
     }
   }

@@ -1098,7 +1098,7 @@ static void test_httpd_parse(void) {
     n += snprintf(many + n, sizeof many - (size_t)n, "H%d: v\n", i);
   }
   CTUI_TEST_ASSERT(head(many, &r) == 431, "too many header lines: 431");
-  CTUI_WM_BUF b = {0};
+  CTUI_BUF b = {0};
   ctui_wm_httpd_escape(&b, "<a href=\"x\">R&D's</a>");
   CTUI_TEST_ASSERT(b.s &&
                        !strcmp(b.s, "&lt;a href=&quot;x&quot;&gt;R&amp;D&#39;"
