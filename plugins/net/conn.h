@@ -65,6 +65,10 @@ int ctui_wm_conn_accept_tls(CTUI_WM_CONN *c, CTUI_WM_TLS_SERVER *srv, char *err,
                             size_t err_cap);
 /* whether TLS is on */
 int ctui_wm_conn_tls(const CTUI_WM_CONN *c);
+/* the other side's certificate (tls.h's ctui_wm_tls_peer()): 0, or -1
+ * plainly or without one */
+int ctui_wm_conn_peer_cert(const CTUI_WM_CONN *c, char *cn, size_t cn_cap,
+                           char fpr[65]);
 
 /* the next line (up to LF; its CRLF or LF not in it), at most max bytes:
  * its length with *line pointing at it (valid until the next read,

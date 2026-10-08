@@ -28,6 +28,10 @@ typedef struct {
   } h[CTUI_WM_HTTPD_HEADERS];
   long long length; /* Content-Length, -1 none */
   int keep_alive;   /* the client wants the connection kept */
+  /* set by serve() (parse() leaves them NULL): the peer's address as
+   * text, the connection (its TLS peer: ctui_wm_conn_peer_cert()) */
+  const char *peer;
+  CTUI_WM_CONN *conn;
 } CTUI_WM_HTTPD_REQ;
 
 /* the head (buf: its lines up to and without the blank line, NUL-
@@ -41,16 +45,29 @@ const char *ctui_wm_httpd_header(const CTUI_WM_HTTPD_REQ *r, const char *name);
 /* status's reason phrase ("Not Found"; "" for one it doesn't know) */
 const char *ctui_wm_httpd_reason(int status);
 
+/* a streamed body's writer (stream() below): n bytes of it out at once,
+ * as one chunk: 0, or -1 once the client is gone (later calls do
+ * nothing) */
+typedef struct CTUI_WM_HTTPD_OUT CTUI_WM_HTTPD_OUT;
+int ctui_wm_httpd_out(CTUI_WM_HTTPD_OUT *o, const char *buf, size_t n);
+
 /* what a handler answers: status, the body (len bytes; free it if
  * owned), its Content-Type, extra header lines (each ending in CRLF; may
- * be NULL) */
+ * be NULL). Or, with stream set, a body of unknown length: called once
+ * after the head is sent (always, also when it wasn't, or the reply has
+ * no body: its writes fail or are dropped then; it frees stream_ud), it
+ * writes the body through o and returns 0 when all of it went, -1 if it
+ * failed part-way; out chunked (HTTP/1.1, the connection kept) or until
+ * the connection closes (HTTP/1.0). */
 typedef struct {
   int status;
   const char *type;
   char *body;
   size_t len;
   int owned; /* body is malloc'd: freed after it's sent */
-  char headers[1024];
+  char headers[4096];
+  int (*stream)(CTUI_WM_HTTPD_OUT *o, void *stream_ud);
+  void *stream_ud;
 } CTUI_WM_HTTPD_REPLY;
 
 /* the reply's text as body: a copy (owned), or a 500 */

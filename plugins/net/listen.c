@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -137,6 +138,12 @@ static void accept_all(LISTENER *l) {
     if (atomic_load(&l->running) >= l->pub.max) {
       close(fd);
       continue;
+    }
+    if (sa.ss_family == AF_INET || sa.ss_family == AF_INET6) {
+      /* a reply's head and body are separate writes: with Nagle the body
+       * waits for the head's ACK, which the peer delays (~40 ms a reply) */
+      int on = 1;
+      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
     }
     JOB *j = malloc(sizeof *j);
     if (!j) {

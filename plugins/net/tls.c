@@ -197,72 +197,115 @@ CTUI_WM_TLS *ctui_wm_tls_open(int fd, const char *host, long deadline,
   return handshake(fd, &g_conf, host, deadline, err, err_cap);
 }
 
-struct CTUI_WM_TLS_SERVER {
+/* one side's own config: its certificate chain and key (a server's, or
+ * a client's that presents one), the CA it checks the other side
+ * against */
+typedef struct {
   mbedtls_ssl_config conf;
   mbedtls_x509_crt chain, ca;
   mbedtls_pk_context key;
+} SIDE;
+
+struct CTUI_WM_TLS_SERVER {
+  SIDE side;
+};
+struct CTUI_WM_TLS_CLIENT {
+  SIDE side;
 };
 
-CTUI_WM_TLS_SERVER *ctui_wm_tls_server_new(const char *cert, const char *key,
-                                           const char *client_ca, char *err,
-                                           size_t err_cap) {
-  /* the client's setup starts PSA crypto; its CA bundle isn't needed
-   * here, so a failure of that part alone doesn't count */
+static void side_free(SIDE *s) {
   lock();
-  int psa = psa_crypto_init();
+  mbedtls_ssl_config_free(&s->conf);
+  mbedtls_x509_crt_free(&s->chain);
+  mbedtls_x509_crt_free(&s->ca);
+  mbedtls_pk_free(&s->key);
   unlock();
-  if (psa != PSA_SUCCESS) {
-    snprintf(err, err_cap, "TLS: the crypto library didn't start");
-    return NULL;
+}
+
+/* s set up as endpoint (MBEDTLS_SSL_IS_SERVER/CLIENT) from the PEM files
+ * (cert and key: both or neither; ca: NULL = the other side isn't
+ * checked; on a client the system's bundle instead): 0, or -1 with why
+ * in err (s freed then) */
+static int side_init(SIDE *s, int endpoint, const char *cert, const char *key,
+                     const char *ca, char *err, size_t err_cap) {
+  /* the client's setup starts PSA crypto; its CA bundle is only needed
+   * by a client without a CA of its own */
+  if (endpoint == MBEDTLS_SSL_IS_CLIENT && !ca) {
+    if (setup(err, err_cap) != 0) {
+      return -1;
+    }
+  } else {
+    lock();
+    int psa = psa_crypto_init();
+    unlock();
+    if (psa != PSA_SUCCESS) {
+      snprintf(err, err_cap, "TLS: the crypto library didn't start");
+      return -1;
+    }
   }
   /* mbedtls says a missing file only as a number */
-  const char *files[] = {cert, key, client_ca};
+  const char *files[] = {cert, key, ca};
   for (int i = 0; i < 3; i++) {
     if (files[i] && access(files[i], R_OK) != 0) {
       snprintf(err, err_cap, "TLS: %s: %s", files[i], strerror(errno));
-      return NULL;
+      return -1;
     }
-  }
-  CTUI_WM_TLS_SERVER *s = calloc(1, sizeof *s);
-  if (!s) {
-    snprintf(err, err_cap, "out of memory");
-    return NULL;
   }
   lock();
   mbedtls_ssl_config_init(&s->conf);
   mbedtls_x509_crt_init(&s->chain);
   mbedtls_x509_crt_init(&s->ca);
   mbedtls_pk_init(&s->key);
-  int ret = mbedtls_x509_crt_parse_file(&s->chain, cert);
+  int ret = 0;
   const char *what = cert;
-  if (ret == 0) {
+  if (cert) {
+    ret = mbedtls_x509_crt_parse_file(&s->chain, cert);
+  }
+  if (ret == 0 && key) {
     what = key;
     ret = mbedtls_pk_parse_keyfile(&s->key, key, NULL);
   }
-  if (ret == 0 && client_ca) {
-    what = client_ca;
-    ret = mbedtls_x509_crt_parse_file(&s->ca, client_ca);
+  if (ret == 0 && ca) {
+    what = ca;
+    ret = mbedtls_x509_crt_parse_file(&s->ca, ca);
   }
   if (ret == 0) {
     what = "config";
-    ret = mbedtls_ssl_config_defaults(&s->conf, MBEDTLS_SSL_IS_SERVER,
+    ret = mbedtls_ssl_config_defaults(&s->conf, endpoint,
                                       MBEDTLS_SSL_TRANSPORT_STREAM,
                                       MBEDTLS_SSL_PRESET_DEFAULT);
   }
-  if (ret == 0) {
+  if (ret == 0 && cert && key) {
     ret = mbedtls_ssl_conf_own_cert(&s->conf, &s->chain, &s->key);
   }
   if (ret == 0) {
-    mbedtls_ssl_conf_authmode(&s->conf, client_ca ? MBEDTLS_SSL_VERIFY_REQUIRED
-                                                  : MBEDTLS_SSL_VERIFY_NONE);
-    if (client_ca) {
-      mbedtls_ssl_conf_ca_chain(&s->conf, &s->ca, NULL);
+    int checked = ca || endpoint == MBEDTLS_SSL_IS_CLIENT;
+    mbedtls_ssl_conf_authmode(&s->conf, checked ? MBEDTLS_SSL_VERIFY_REQUIRED
+                                                : MBEDTLS_SSL_VERIFY_NONE);
+    if (checked) {
+      mbedtls_ssl_conf_ca_chain(&s->conf, ca ? &s->ca : &g_ca, NULL);
     }
   }
   unlock();
   if (ret != 0) {
     why(ret, what, err, err_cap);
-    ctui_wm_tls_server_free(s);
+    side_free(s);
+    return -1;
+  }
+  return 0;
+}
+
+CTUI_WM_TLS_SERVER *ctui_wm_tls_server_new(const char *cert, const char *key,
+                                           const char *client_ca, char *err,
+                                           size_t err_cap) {
+  CTUI_WM_TLS_SERVER *s = calloc(1, sizeof *s);
+  if (!s) {
+    snprintf(err, err_cap, "out of memory");
+    return NULL;
+  }
+  if (side_init(&s->side, MBEDTLS_SSL_IS_SERVER, cert, key, client_ca, err,
+                err_cap) != 0) {
+    free(s);
     return NULL;
   }
   return s;
@@ -272,18 +315,84 @@ void ctui_wm_tls_server_free(CTUI_WM_TLS_SERVER *s) {
   if (!s) {
     return;
   }
-  lock();
-  mbedtls_ssl_config_free(&s->conf);
-  mbedtls_x509_crt_free(&s->chain);
-  mbedtls_x509_crt_free(&s->ca);
-  mbedtls_pk_free(&s->key);
-  unlock();
+  side_free(&s->side);
   free(s);
+}
+
+CTUI_WM_TLS_CLIENT *ctui_wm_tls_client_new(const char *ca, const char *cert,
+                                           const char *key, char *err,
+                                           size_t err_cap) {
+  if (!cert != !key) {
+    snprintf(err, err_cap, "TLS: a client certificate needs its key");
+    return NULL;
+  }
+  CTUI_WM_TLS_CLIENT *c = calloc(1, sizeof *c);
+  if (!c) {
+    snprintf(err, err_cap, "out of memory");
+    return NULL;
+  }
+  if (side_init(&c->side, MBEDTLS_SSL_IS_CLIENT, cert, key, ca, err, err_cap) !=
+      0) {
+    free(c);
+    return NULL;
+  }
+  return c;
+}
+
+void ctui_wm_tls_client_free(CTUI_WM_TLS_CLIENT *c) {
+  if (!c) {
+    return;
+  }
+  side_free(&c->side);
+  free(c);
+}
+
+CTUI_WM_TLS *ctui_wm_tls_connect(int fd, const char *host,
+                                 CTUI_WM_TLS_CLIENT *c, long deadline,
+                                 char *err, size_t err_cap) {
+  return handshake(fd, &c->side.conf, host, deadline, err, err_cap);
+}
+
+int ctui_wm_tls_peer(CTUI_WM_TLS *t, char *cn, size_t cn_cap, char fpr[65]) {
+  if (cn_cap) {
+    cn[0] = '\0';
+  }
+  fpr[0] = '\0';
+  lock();
+  const mbedtls_x509_crt *crt = mbedtls_ssl_get_peer_cert(&t->ssl);
+  unsigned char hash[32];
+  size_t hl = 0;
+  int ok = crt && crt->raw.len &&
+           psa_hash_compute(PSA_ALG_SHA_256, crt->raw.p, crt->raw.len, hash,
+                            sizeof hash, &hl) == PSA_SUCCESS &&
+           hl == sizeof hash;
+  /* the subject's (last) common name, printable bytes only: it ends up in
+   * a CGI's environment */
+  static const unsigned char OID_CN[] = {0x55, 0x04, 0x03};
+  for (const mbedtls_x509_name *n = ok ? &crt->subject : NULL; n; n = n->next) {
+    if (n->oid.len == sizeof OID_CN && n->oid.p &&
+        memcmp(n->oid.p, OID_CN, sizeof OID_CN) == 0 && cn_cap) {
+      size_t k = 0;
+      for (size_t i = 0; i < n->val.len && k + 1 < cn_cap; i++) {
+        unsigned char ch = n->val.p[i];
+        cn[k++] = ch < 0x20 || ch == 0x7f ? '?' : (char)ch;
+      }
+      cn[k] = '\0';
+    }
+  }
+  unlock();
+  if (!ok) {
+    return -1;
+  }
+  for (size_t i = 0; i < sizeof hash; i++) {
+    snprintf(fpr + 2 * i, 3, "%02x", hash[i]);
+  }
+  return 0;
 }
 
 CTUI_WM_TLS *ctui_wm_tls_accept(int fd, CTUI_WM_TLS_SERVER *s, long deadline,
                                 char *err, size_t err_cap) {
-  return handshake(fd, &s->conf, NULL, deadline, err, err_cap);
+  return handshake(fd, &s->side.conf, NULL, deadline, err, err_cap);
 }
 
 int ctui_wm_tls_write(CTUI_WM_TLS *t, const char *buf, size_t n, long deadline,

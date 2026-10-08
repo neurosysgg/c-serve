@@ -247,6 +247,18 @@ int ctui_wm_conn_accept_tls(CTUI_WM_CONN *c, CTUI_WM_TLS_SERVER *srv, char *err,
 
 int ctui_wm_conn_tls(const CTUI_WM_CONN *c) { return c->tls != NULL; }
 
+int ctui_wm_conn_peer_cert(const CTUI_WM_CONN *c, char *cn, size_t cn_cap,
+                           char fpr[65]) {
+  if (!c->tls) {
+    if (cn_cap) {
+      cn[0] = '\0';
+    }
+    fpr[0] = '\0';
+    return -1;
+  }
+  return ctui_wm_tls_peer(c->tls, cn, cn_cap, fpr);
+}
+
 int ctui_wm_conn_fd(const CTUI_WM_CONN *c) { return c->fd; }
 
 int ctui_wm_conn_idle_ok(const CTUI_WM_CONN *c) {

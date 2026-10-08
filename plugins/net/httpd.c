@@ -345,34 +345,85 @@ static long read_head(CTUI_WM_CONN *c, char *buf, size_t cap, int *status,
   }
 }
 
+struct CTUI_WM_HTTPD_OUT {
+  CTUI_WM_CONN *c;
+  int chunked;
+  int drop; /* no body to send (HEAD, 204, 304): writes do nothing */
+  int failed;
+};
+
+int ctui_wm_httpd_out(CTUI_WM_HTTPD_OUT *o, const char *buf, size_t n) {
+  if (o->failed) {
+    return -1;
+  }
+  if (o->drop || n == 0) {
+    return 0;
+  }
+  char err[200], size[24];
+  int k = o->chunked ? snprintf(size, sizeof size, "%zx\r\n", n) : 0;
+  if ((k > 0 && ctui_wm_conn_write(o->c, size, (size_t)k, err, sizeof err)) ||
+      ctui_wm_conn_write(o->c, buf, n, err, sizeof err) ||
+      (o->chunked && ctui_wm_conn_write(o->c, "\r\n", 2, err, sizeof err))) {
+    o->failed = 1;
+    return -1;
+  }
+  return 0;
+}
+
+/* the reply's head, then its body: 0, or -1 with why in err. A streamed
+ * one's stream() runs here, whatever happens to the head. */
 static int send_reply(CTUI_WM_CONN *c, const CTUI_WM_HTTPD *h,
                       const CTUI_WM_HTTPD_REQ *r,
                       const CTUI_WM_HTTPD_REPLY *rep, int keep, char *err,
                       size_t err_cap) {
-  char head[2048];
+  char head[5120], length[48];
   int body = rep->status >= 200 && rep->status != 204 && rep->status != 304;
+  int head_only = r && strcmp(r->method, "HEAD") == 0;
+  int chunked = rep->stream && r && r->minor >= 1;
+  if (!rep->stream) {
+    snprintf(length, sizeof length, "Content-Length: %zu\r\n",
+             body ? rep->len : 0);
+  } else {
+    snprintf(length, sizeof length, "%s",
+             chunked && body ? "Transfer-Encoding: chunked\r\n" : "");
+  }
   int n = snprintf(head, sizeof head,
                    "HTTP/1.1 %d %s\r\n%s%s%s"
-                   "Content-Length: %zu\r\n%s%s%sConnection: %s\r\n%s\r\n",
+                   "%s%s%s%sConnection: %s\r\n%s\r\n",
                    rep->status, ctui_wm_httpd_reason(rep->status),
                    h->server && *h->server ? "Server: " : "",
                    h->server && *h->server ? h->server : "",
-                   h->server && *h->server ? "\r\n" : "", body ? rep->len : 0,
+                   h->server && *h->server ? "\r\n" : "", length,
                    rep->type && body ? "Content-Type: " : "",
                    rep->type && body ? rep->type : "",
                    rep->type && body ? "\r\n" : "",
                    keep ? "keep-alive" : "close", rep->headers);
+  int ret = 0;
   if (n < 0 || (size_t)n >= sizeof head) {
     snprintf(err, err_cap, "the reply's head is too long");
-    return -1;
+    ret = -1;
+  } else if (ctui_wm_conn_write(c, head, (size_t)n, err, err_cap) != 0) {
+    ret = -1;
   }
-  if (ctui_wm_conn_write(c, head, (size_t)n, err, err_cap) != 0) {
-    return -1;
+  if (rep->stream) {
+    CTUI_WM_HTTPD_OUT o = {.c = c,
+                           .chunked = chunked,
+                           .drop = !body || head_only,
+                           .failed = ret != 0};
+    int done = rep->stream(&o, rep->stream_ud);
+    if (ret == 0 && (done != 0 || o.failed)) {
+      snprintf(err, err_cap, "the streamed body was cut short");
+      ret = -1;
+    }
+    if (ret == 0 && chunked && body && !head_only) {
+      ret = ctui_wm_conn_write(c, "0\r\n\r\n", 5, err, err_cap);
+    }
+    return ret;
   }
-  if (body && rep->len && !(r && strcmp(r->method, "HEAD") == 0)) {
+  if (ret == 0 && body && rep->len && !head_only) {
     return ctui_wm_conn_write(c, rep->body, rep->len, err, err_cap);
   }
-  return 0;
+  return ret;
 }
 
 static void refuse_reply(CTUI_WM_CONN *c, const CTUI_WM_HTTPD *h, int status,
@@ -391,7 +442,6 @@ static void refuse_reply(CTUI_WM_CONN *c, const CTUI_WM_HTTPD *h, int status,
 
 void ctui_wm_httpd_serve(const CTUI_WM_HTTPD *h, CTUI_WM_CONN *c,
                          const char *peer) {
-  (void)peer;
   int idle = h->idle_ms > 0 ? h->idle_ms : 10000;
   int timeout = h->timeout_ms > 0 ? h->timeout_ms : 30000;
   long long body_max = h->body_max > 0 ? h->body_max : 1 << 20;
@@ -412,6 +462,8 @@ void ctui_wm_httpd_serve(const CTUI_WM_HTTPD *h, CTUI_WM_CONN *c,
       refuse_reply(c, h, status, err);
       break;
     }
+    r->peer = peer;
+    r->conn = c;
     char *body = NULL;
     if (r->length > body_max) {
       refuse_reply(c, h, 413, "the body is too large");
@@ -433,10 +485,17 @@ void ctui_wm_httpd_serve(const CTUI_WM_HTTPD *h, CTUI_WM_CONN *c,
       if (rep.owned) {
         free(rep.body);
       }
+      if (rep.stream) {
+        CTUI_WM_HTTPD_OUT gone = {.c = c, .failed = 1};
+        rep.stream(&gone, rep.stream_ud);
+        rep.stream = NULL;
+      }
       ctui_wm_httpd_text(&rep, 500, "text/plain; charset=utf-8", "no answer\n",
                          10);
     }
-    int keep = r->keep_alive && k + 1 < max_req;
+    /* HTTP/1.0 has no chunks: a streamed body ends with the connection */
+    int keep =
+        r->keep_alive && k + 1 < max_req && !(rep.stream && r->minor < 1);
     int sent = send_reply(c, h, r, &rep, keep, err, sizeof err);
     if (rep.owned) {
       free(rep.body);

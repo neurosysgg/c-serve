@@ -26,6 +26,7 @@
 #include "ctui_test.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -1112,6 +1113,15 @@ typedef struct {
   int conns; /* accepted so far */
 } SRV;
 
+/* a body in three writes, the last empty (skipped, not the end) */
+static int streamed(CTUI_WM_HTTPD_OUT *o, void *ud) {
+  free(ud);
+  return ctui_wm_httpd_out(o, "one ", 4) || ctui_wm_httpd_out(o, "two", 3) ||
+                 ctui_wm_httpd_out(o, "", 0)
+             ? -1
+             : 0;
+}
+
 static void on_page(const CTUI_WM_HTTPD_REQ *r, const char *body,
                     CTUI_WM_HTTPD_REPLY *rep, void *ud) {
   (void)ud;
@@ -1123,6 +1133,17 @@ static void on_page(const CTUI_WM_HTTPD_REQ *r, const char *body,
     snprintf(rep->headers, sizeof rep->headers, "Location: /hi\r\n");
   } else if (!strcmp(r->path, "/hi")) {
     ctui_wm_httpd_text(rep, 200, "text/plain", "hi there", 8);
+  } else if (!strcmp(r->path, "/stream")) {
+    rep->status = 200;
+    rep->type = "text/plain";
+    rep->stream = streamed;
+    rep->stream_ud = calloc(1, 1); /* freed by streamed(): ASan checks */
+  } else if (!strcmp(r->path, "/whoami")) {
+    char cn[64], fpr[65], text[200];
+    int has = ctui_wm_conn_peer_cert(r->conn, cn, sizeof cn, fpr) == 0;
+    int n = snprintf(text, sizeof text, "%s %s %s", has ? cn : "-",
+                     has ? fpr : "-", r->peer ? "peer" : "nopeer");
+    ctui_wm_httpd_text(rep, 200, "text/plain", text, (size_t)n);
   } else {
     ctui_wm_httpd_text(rep, 404, "text/plain", "none", 4);
   }
@@ -1149,6 +1170,13 @@ static void *serve_run(void *arg) {
   SERVE *s = arg;
   char err[128];
   ctui_wm_listen_serve(s->ls, 2, s->stop, err, sizeof err);
+  return NULL;
+}
+
+static void *serve_one(void *arg) {
+  SERVE *s = arg;
+  char err[128];
+  ctui_wm_listen_serve(s->ls, 1, s->stop, err, sizeof err);
   return NULL;
 }
 
@@ -1218,6 +1246,157 @@ static void test_kept(SRV *plain, int port, SRV *tls, int tls_port) {
   CTUI_TEST_ASSERT(ctui_wm_net_idle_count() == 0, "kept ones closed on asking");
 }
 
+/* req sent on a new plain connection to port, everything back until the
+ * server closes into got */
+static void raw_exchange(int port, const char *req, char *got, size_t cap) {
+  char url[64], err[256];
+  CTUI_WM_URL u;
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
+  ctui_wm_url_parse(url, &u, err, sizeof err);
+  CTUI_WM_CONN *c =
+      ctui_wm_conn_open(&u, ctui_wm_net_now() + 3000, err, sizeof err);
+  size_t len = 0;
+  if (c && ctui_wm_conn_write(c, req, strlen(req), err, sizeof err) == 0) {
+    ssize_t r;
+    while ((r = ctui_wm_conn_read(c, got + len, cap - 1 - len, err,
+                                  sizeof err)) > 0) {
+      len += (size_t)r;
+    }
+  }
+  got[len] = '\0';
+  ctui_wm_conn_close(c);
+}
+
+/* a body of unknown length: chunked to HTTP/1.1 (our client joins it,
+ * the connection kept), until the close to HTTP/1.0, none for HEAD */
+static void test_streamed(int port) {
+  char url[128], err[256], got[2048];
+  CTUI_WM_HTTP_REPLY rep;
+  snprintf(url, sizeof url, "http://127.0.0.1:%d/stream", port);
+  CTUI_WM_HTTP_REQ req = {.url = url, .timeout_ms = 3000};
+  CTUI_TEST_ASSERT(ctui_wm_net_http(&req, &rep, err, sizeof err) == 0 &&
+                       rep.status == 200 && !strcmp(rep.body, "one two"),
+                   "a streamed body, chunked, read whole (%s)", err);
+  free(rep.body);
+  raw_exchange(port,
+               "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+               "\r\n",
+               got, sizeof got);
+  CTUI_TEST_ASSERT(strstr(got, "Transfer-Encoding: chunked\r\n") &&
+                       !strstr(got, "Content-Length") &&
+                       strstr(got, "\r\n\r\n4\r\none \r\n3\r\ntwo\r\n0\r\n"
+                                   "\r\n"),
+                   "HTTP/1.1: a chunk per write, the empty one skipped, then "
+                   "the last chunk");
+  raw_exchange(port, "GET /stream HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+               got, sizeof got);
+  CTUI_TEST_ASSERT(!strstr(got, "Transfer-Encoding") &&
+                       strstr(got, "Connection: close\r\n") &&
+                       strstr(got, "\r\n\r\none two") &&
+                       !strstr(got, "two\r\n"),
+                   "HTTP/1.0: the body as is, the connection closed after it "
+                   "(kept-alive asked for)");
+  raw_exchange(port,
+               "HEAD /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+               got, sizeof got);
+  char *end = strstr(got, "\r\n\r\n");
+  CTUI_TEST_ASSERT(end && end[4] == '\0' && strstr(got, "200 OK"),
+                   "HEAD: the head only");
+}
+
+/* the server asking for a client certificate from its CA: the phone's
+ * passes and its name and fingerprint reach the handler; a stranger's
+ * (another CA) and none at all end at the handshake */
+static void test_mutual(void) {
+  char err[256];
+  SRV srv = {0};
+  srv.tls = ctui_wm_tls_server_new(
+      "tests/data/pki/server.crt", "tests/data/pki/server.key",
+      "tests/data/pki/client-ca.crt", err, sizeof err);
+  CTUI_TEST_ASSERT(srv.tls != NULL, "a mutual-TLS server's config (%s)",
+                   srv.tls ? "" : err);
+  CTUI_TEST_ASSERT(!ctui_wm_tls_client_new("tests/data/pki/ca.crt",
+                                           "tests/data/pki/phone.crt", NULL,
+                                           err, sizeof err),
+                   "a client certificate without its key refused");
+  SERVE sv = {0};
+  sv.ls[0] = ctui_wm_listen_new("127.0.0.1", 0, on_conn, &srv, err, sizeof err);
+  int pfd[2];
+  if (!srv.tls || !sv.ls[0] || pipe(pfd) != 0) {
+    CTUI_TEST_ASSERT(0, "a listener on port 0 (%s)", err);
+    ctui_wm_tls_server_free(srv.tls);
+    return;
+  }
+  sv.stop = pfd[0];
+  pthread_t th;
+  pthread_create(&th, NULL, serve_one, &sv);
+  struct {
+    const char *cert, *key, *want;
+  } T[] = {{"tests/data/pki/phone.crt", "tests/data/pki/phone.key",
+            "phone 966a2e84f718869bc9e7aa391fd56ee27c40c8c171f6051253214d90a"
+            "ff67ce9 peer"},
+           {"tests/data/pki/stranger.crt", "tests/data/pki/stranger.key", NULL},
+           {NULL, NULL, NULL}};
+  for (size_t i = 0; i < sizeof T / sizeof *T; i++) {
+    CTUI_WM_TLS_CLIENT *cl = ctui_wm_tls_client_new(
+        "tests/data/pki/ca.crt", T[i].cert, T[i].key, err, sizeof err);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET,
+                            .sin_port = htons((uint16_t)sv.ls[0]->port),
+                            .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    CTUI_WM_TLS *t = NULL;
+    char got[512] = "";
+    if (cl && fd >= 0 && connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
+      fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+      long dl = ctui_wm_net_now() + 3000;
+      t = ctui_wm_tls_connect(fd, "localhost", cl, dl, err, sizeof err);
+      const char *q =
+          "GET /whoami HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+      size_t len = 0;
+      ssize_t r = 0;
+      if (t && ctui_wm_tls_write(t, q, strlen(q), dl, err, sizeof err) == 0) {
+        while ((r = ctui_wm_tls_read(t, got + len, sizeof got - 1 - len, dl,
+                                     err, sizeof err)) > 0) {
+          len += (size_t)r;
+        }
+      }
+      got[len] = '\0';
+      /* TLS 1.3: the client's handshake is done before the server has
+       * checked its certificate; a refusal shows on the first read */
+      if (r < 0 || len == 0) {
+        ctui_wm_tls_close(t);
+        t = NULL;
+      }
+    }
+    if (T[i].want) {
+      char *body = strstr(got, "\r\n\r\n");
+      CTUI_TEST_ASSERT(t && body && !strcmp(body + 4, T[i].want),
+                       "the phone's certificate taken, its name and "
+                       "fingerprint at the handler (%s)",
+                       t ? got : err);
+    } else {
+      CTUI_TEST_ASSERT(
+          !t, "%s refused at the handshake (%s)",
+          T[i].cert ? "a stranger's certificate" : "no certificate", err);
+    }
+    ctui_wm_tls_close(t);
+    if (fd >= 0) {
+      close(fd);
+    }
+    ctui_wm_tls_client_free(cl);
+  }
+  ssize_t w = write(pfd[1], "x", 1);
+  (void)w;
+  pthread_join(th, NULL);
+  for (int i = 0; i < 50 && ctui_wm_listen_active() > 0; i++) {
+    nanosleep(&(struct timespec){0, 20000000}, NULL);
+  }
+  ctui_wm_listen_free(sv.ls[0]);
+  ctui_wm_tls_server_free(srv.tls);
+  close(pfd[0]);
+  close(pfd[1]);
+}
+
 static void test_server(void) {
   char err[256];
   SRV plain = {0}, tls = {0};
@@ -1270,6 +1449,7 @@ static void test_server(void) {
                    "over TLS: the test CA's localhost certificate (%s)", err);
   free(rep.body);
   test_kept(&plain, sv.ls[0]->port, &tls, sv.ls[1]->port);
+  test_streamed(sv.ls[0]->port);
   /* the TLS port reached plainly, TLS started with a name its
    * certificate doesn't carry */
   CTUI_WM_URL u;
@@ -1332,5 +1512,6 @@ int main(void) {
   test_tls_threads();
   test_httpd_parse();
   test_server();
+  test_mutual();
   return ctui_test_summary();
 }

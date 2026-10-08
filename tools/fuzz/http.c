@@ -7,12 +7,14 @@
  * a request's head as the server side takes it (httpd.c); 4 = a body
  * under a Content-Encoding (the next byte: its low bit gzip or deflate,
  * the rest seeds the pieces' sizes), which must decode in pieces as it
- * does whole (coding.c). */
+ * does whole (coding.c); 5 = a CGI's reply head as ctui-remote takes it
+ * (apps/remote/remote_cgi.c), whole and fed a byte more at a time. */
 #include "fuzz.h"
 
 #include "coding.h"
 #include "http.h"
 #include "httpd.h"
+#include "remote/remote_server.h"
 
 static void reply(const uint8_t *data, size_t size) {
   /* its own allocation, so reading past it is caught */
@@ -202,6 +204,44 @@ static void coded(const uint8_t *data, size_t size) {
   free(buf);
 }
 
+static void cgi_head(const uint8_t *data, size_t size) {
+  char *buf = malloc(size ? size : 1);
+  memcpy(buf, data, size);
+  CTUI_WM_HTTPD_REPLY rep;
+  char type[256], err[160];
+  memset(&rep, 0, sizeof rep);
+  long whole = ctui_wm_remote_cgi_head(buf, size, &rep, type, sizeof type, err,
+                                       sizeof err);
+  if (whole > 0) {
+    FUZZ_CHECK((size_t)whole <= size, "the body starts past the end (%ld)",
+               whole);
+    FUZZ_CHECK(rep.status >= 200 && rep.status <= 599, "status %d", rep.status);
+    FUZZ_CHECK(!strpbrk(type, "\r\n") &&
+                   strlen(rep.headers) < sizeof rep.headers,
+               "a line break in the type, or headers overrun");
+    /* every header line well formed: no bare CR or LF inside */
+    for (const char *p = rep.headers; *p;) {
+      const char *e = strstr(p, "\r\n");
+      FUZZ_CHECK(e && !memchr(p, '\n', (size_t)(e - p)) &&
+                     !memchr(p, '\r', (size_t)(e - p)),
+                 "a header line that isn't one");
+      if (!e) {
+        break;
+      }
+      p = e + 2;
+    }
+  } else if (whole < 0) {
+    FUZZ_CHECK(err[0], "a refused head without why");
+  }
+  /* as it comes in: not whole until the length it's whole at */
+  for (size_t n = 0; whole > 0 && n < (size_t)whole && n < 512; n++) {
+    long r = ctui_wm_remote_cgi_head(buf, n, &rep, type, sizeof type, err,
+                                     sizeof err);
+    FUZZ_CHECK(r <= 0, "whole at %zu of %ld", n, whole);
+  }
+  free(buf);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size == 0) {
     return 0;
@@ -214,6 +254,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     pieces(data + 1, size - 1);
   } else if (data[0] == 4) {
     coded(data + 1, size - 1);
+  } else if (data[0] == 5) {
+    cgi_head(data + 1, size - 1);
   } else {
     request(data + 1, size - 1);
   }
