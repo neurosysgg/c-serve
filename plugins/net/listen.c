@@ -26,6 +26,8 @@ typedef struct {
   char peer[64];
 } JOB;
 
+/* connections running over every listener, those freed too (a
+ * connection outlives its listener's free: ctui_wm_listen_active()) */
 static atomic_int g_active;
 
 CTUI_WM_LISTEN *ctui_wm_listen_new(const char *host, int port,
@@ -89,8 +91,17 @@ CTUI_WM_LISTEN *ctui_wm_listen_new(const char *host, int port,
 }
 
 void ctui_wm_listen_free(CTUI_WM_LISTEN *l) {
-  if (l) {
-    close(l->fd);
+  if (!l) {
+    return;
+  }
+  close(l->fd);
+  /* its connections' threads count themselves out of it when done: a
+   * moment for them, else it's left to them (a few bytes) */
+  LISTENER *ln = (LISTENER *)l;
+  for (int i = 0; i < 100 && atomic_load(&ln->running) > 0; i++) {
+    usleep(10000);
+  }
+  if (atomic_load(&ln->running) == 0) {
     free(l);
   }
 }
