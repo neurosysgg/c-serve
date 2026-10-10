@@ -140,6 +140,7 @@ static void test_format(void) {
       "a GET: Host without the default port, gzip offered, kept alive, no "
       "body");
   free(out);
+  out = NULL;
 
   ctui_wm_url_parse("http://h:8080/t", &u, g_err, sizeof g_err);
   const char *hdrs[] = {"Authorization: Bearer x", NULL};
@@ -158,6 +159,7 @@ static void test_format(void) {
           !strcmp(out + len - 11, "\r\n\r\na=1&b=2"),
       "a POST: the port in Host, extra headers, its type, length and body");
   free(out);
+  out = NULL;
 
   const char *own[] = {"accept-encoding: br", NULL};
   CTUI_WM_HTTP_REQ mine = {.headers = own};
@@ -166,6 +168,7 @@ static void test_format(void) {
                        !strstr(out, "Accept-Encoding"),
                    "the caller's own Accept-Encoding says it alone");
   free(out);
+  out = NULL;
 
   const char *evil[] = {"X: a\r\nY: b", NULL};
   CTUI_WM_HTTP_REQ inj = {.headers = evil};
