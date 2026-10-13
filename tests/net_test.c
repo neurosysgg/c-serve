@@ -135,10 +135,11 @@ static void test_format(void) {
       ctui_wm_http_format(&get, &u, 1, &out, &len) == 0 &&
           !strncmp(out, "GET /p?q HTTP/1.1\r\nHost: h.example\r\n", 36) &&
           strstr(out, "Accept-Encoding: gzip, deflate\r\n") &&
+          strstr(out, "User-Agent: ctui-wm\r\n") &&
           !strstr(out, "Connection:") && !strstr(out, "Content-Length") &&
           len > 4 && !strcmp(out + len - 4, "\r\n\r\n"),
-      "a GET: Host without the default port, gzip offered, kept alive, no "
-      "body");
+      "a GET: Host without the default port, gzip offered, our own agent, "
+      "kept alive, no body");
   free(out);
   out = NULL;
 
@@ -169,6 +170,26 @@ static void test_format(void) {
                    "the caller's own Accept-Encoding says it alone");
   free(out);
   out = NULL;
+  const char *acc[] = {"Accept: text/css", NULL};
+  CTUI_WM_HTTP_REQ mine_acc = {.headers = acc};
+  CTUI_TEST_ASSERT(ctui_wm_http_format(&mine_acc, &u, 1, &out, &len) == 0 &&
+                       strstr(out, "Accept: text/css\r\n") &&
+                       !strstr(out, "Accept: */*"),
+                   "the caller's own Accept says it alone");
+  free(out);
+  out = NULL;
+
+  CTUI_WM_HTTP_REQ as = {.agent = CTUI_WM_HTTP_BROWSER};
+  CTUI_TEST_ASSERT(ctui_wm_http_format(&as, &u, 0, &out, &len) == 0 &&
+                       strstr(out, "\r\nUser-Agent: Mozilla/5.0 (X11; Linux "
+                                   "x86_64; rv:") &&
+                       !strstr(out, "ctui-wm"),
+                   "a browser's agent said instead of ours");
+  free(out);
+  out = NULL;
+  CTUI_WM_HTTP_REQ bad_as = {.agent = "x\r\nY: b"};
+  CTUI_TEST_ASSERT(ctui_wm_http_format(&bad_as, &u, 0, &out, &len) != 0,
+                   "an agent with a line break in it refused");
 
   const char *evil[] = {"X: a\r\nY: b", NULL};
   CTUI_WM_HTTP_REQ inj = {.headers = evil};
@@ -775,6 +796,19 @@ static void test_streams(int port) {
       "a body that stops coming: timed out after the idle time");
 }
 
+/* a hop judge: with a buffer, refuses (the address into it); without,
+ * sends /chunked on to /missing */
+static int hop_judge(void *ctx, const char *url, char *out, size_t cap,
+                     char *why, size_t why_cap) {
+  if (ctx) {
+    snprintf(ctx, 160, "%s", url);
+    snprintf(why, why_cap, "no: %s", strrchr(url, '/'));
+    return -1;
+  }
+  snprintf(out, cap, "%.*s/missing", (int)(strrchr(url, '/') - url), url);
+  return 0;
+}
+
 static void test_gzipped(int port) {
   char url[128], v[64];
   CTUI_WM_HTTP_REPLY rep;
@@ -924,6 +958,21 @@ static void test_exchanges(void) {
   snprintf(where, sizeof where, "http://127.0.0.1:%d/chunked", port);
   CTUI_TEST_ASSERT(rep.url && !strcmp(rep.url, where),
                    "the reply says where the redirect led");
+  free(rep.body);
+
+  /* each hop asked of the caller first: refused, or sent elsewhere */
+  CTUI_WM_HTTP_REQ judged = req;
+  judged.hop = hop_judge;
+  char seen[160] = "";
+  judged.hop_ctx = seen;
+  CTUI_TEST_ASSERT(ctui_wm_net_http(&judged, &rep, g_err, sizeof g_err) != 0 &&
+                       !strcmp(seen, where) && !strcmp(g_err, "no: /chunked"),
+                   "a hop refused: the request fails with the caller's why");
+  judged.hop_ctx = NULL;
+  snprintf(where, sizeof where, "http://127.0.0.1:%d/missing", port);
+  CTUI_TEST_ASSERT(ctui_wm_net_http(&judged, &rep, g_err, sizeof g_err) == 0 &&
+                       rep.status == 404 && rep.url && !strcmp(rep.url, where),
+                   "a hop rewritten: asked as the caller said");
   free(rep.body);
 
   snprintf(url, sizeof url, "http://127.0.0.1:%d/missing", port);

@@ -511,6 +511,18 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
       snprintf(err, err_cap, "a form sent on to an http:// page: not sent");
       return -1;
     }
+    if (req->hop) {
+      char said[sizeof url];
+      if (ctui_wm_url_format(&next, url, sizeof url) != 0) {
+        snprintf(err, err_cap, "the redirect is too long");
+        return -1;
+      }
+      said[0] = '\0';
+      if (req->hop(req->hop_ctx, url, said, sizeof said, err, err_cap) != 0 ||
+          (said[0] && ctui_wm_url_parse(said, &next, err, err_cap) != 0)) {
+        return -1;
+      }
+    }
     u = next;
     if (!ex_again && strcasecmp(m, "GET") && strcasecmp(m, "HEAD")) {
       /* a POST redirected: what follows is a GET */

@@ -191,7 +191,8 @@ int ctui_wm_http_req_has(const CTUI_WM_HTTP_REQ *req, const char *name) {
 int ctui_wm_http_format(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_URL *u,
                         int coded, char **out, size_t *len) {
   const char *method = req->method ? req->method : "GET";
-  if (has_crlf(method) || strchr(method, ' ') || has_crlf(req->content_type)) {
+  if (has_crlf(method) || strchr(method, ' ') || has_crlf(req->content_type) ||
+      has_crlf(req->agent)) {
     return -1;
   }
   for (const char *const *h = req->headers; h && *h; h++) {
@@ -212,7 +213,12 @@ int ctui_wm_http_format(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_URL *u,
     out_str(&o, ":");
     out_str(&o, u->port);
   }
-  out_str(&o, "\r\nUser-Agent: ctui-wm\r\nAccept: */*\r\n");
+  out_str(&o, "\r\nUser-Agent: ");
+  out_str(&o, req->agent ? req->agent : "ctui-wm");
+  out_str(&o, "\r\n");
+  if (!ctui_wm_http_req_has(req, "Accept")) {
+    out_str(&o, "Accept: */*\r\n");
+  }
   if (!ctui_wm_http_req_has(req, "Accept-Encoding")) {
     out_str(&o, coded ? "Accept-Encoding: gzip, deflate\r\n"
                       : "Accept-Encoding: identity\r\n");
