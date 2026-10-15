@@ -25,6 +25,9 @@
 #include "ctui.h"
 #include "ctui_test.h"
 
+#include <mbedtls/x509_crt.h>
+#include <psa/crypto.h>
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -1550,10 +1553,125 @@ static void test_server(void) {
   close(pfd[1]);
 }
 
+/* path read the way tls.c reads the CA bundle (ctui_wm_tls_pem_next(),
+ * then mbedtls's DER parser): the same certificates, byte for byte, as
+ * mbedtls_x509_crt_parse_file() gets. 1: the same */
+static int pem_same_as_mbedtls(const char *path, int *count) {
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return 0;
+  }
+  static char buf[1 << 20];
+  size_t len = fread(buf, 1, sizeof buf, f);
+  fclose(f);
+  unsigned char *der = malloc(len);
+  mbedtls_x509_crt ours, ref;
+  mbedtls_x509_crt_init(&ours);
+  mbedtls_x509_crt_init(&ref);
+  size_t pos = 0;
+  long n;
+  while (der && (n = ctui_wm_tls_pem_next(buf, len, &pos, der)) != 0) {
+    if (n > 0) {
+      mbedtls_x509_crt_parse_der(&ours, der, (size_t)n);
+    }
+  }
+  int same = der && mbedtls_x509_crt_parse_file(&ref, path) >= 0;
+  *count = 0;
+  const mbedtls_x509_crt *a = &ours, *b = &ref;
+  for (; same && a && b && a->raw.len && b->raw.len;
+       a = a->next, b = b->next, (*count)++) {
+    same = a->raw.len == b->raw.len && !memcmp(a->raw.p, b->raw.p, a->raw.len);
+  }
+  same &= !(a && a->raw.len) && !(b && b->raw.len);
+  mbedtls_x509_crt_free(&ours);
+  mbedtls_x509_crt_free(&ref);
+  free(der);
+  return same;
+}
+
+static void test_pem(void) {
+  int n = 0, m = 0;
+  psa_crypto_init(); /* mbedtls 4 parses keys through PSA */
+  CTUI_TEST_ASSERT(pem_same_as_mbedtls("tests/data/pki/ca.crt", &n) && n == 1 &&
+                       pem_same_as_mbedtls("tests/data/pki/server.crt", &m) &&
+                       m >= 1,
+                   "the test CA and the server's chain read as mbedtls reads "
+                   "them (%d, %d certificates)",
+                   n, m);
+  const char *bundle = "/etc/ssl/certs/ca-certificates.crt";
+  if (access(bundle, R_OK) == 0) {
+    CTUI_TEST_ASSERT(pem_same_as_mbedtls(bundle, &n) && n > 50,
+                     "the system's CA bundle: the same %d certificates as "
+                     "mbedtls's own PEM reader",
+                     n);
+  }
+
+  /* "AQID" is 01 02 03; "AQI=" 01 02; "AQ==" 01 */
+  static const struct {
+    const char *in;
+    long want;
+    const char *what;
+  } cases[] = {
+      {"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----", 3,
+       "plain"},
+      {"x\r\n-----BEGIN CERTIFICATE-----\r\nAQ  \r\nI=  \n-----END "
+       "CERTIFICATE-----\r\n",
+       2, "line breaks, spaces before them, one pad"},
+      {"-----BEGIN CERTIFICATE-----\nAQ I=\n-----END CERTIFICATE-----", -1,
+       "a space inside a line"},
+      {"-----BEGIN CERTIFICATE-----\nAQ\rI=\n-----END CERTIFICATE-----", -1,
+       "a lone CR"},
+      {"-----BEGIN CERTIFICATE-----\nAQ\tI=\n-----END CERTIFICATE-----", -1,
+       "a tab"},
+      {"-----BEGIN CERTIFICATE-----\nAQ==\n-----END CERTIFICATE-----", 1,
+       "two pads"},
+      {"-----BEGIN CERTIFICATE-----\nAQ=D\n-----END CERTIFICATE-----", -1,
+       "a symbol after a pad"},
+      {"-----BEGIN CERTIFICATE-----\nAQ===\n-----END CERTIFICATE-----", -1,
+       "three pads"},
+      {"-----BEGIN CERTIFICATE-----\nAQI\n-----END CERTIFICATE-----", -1,
+       "not a multiple of four"},
+      {"-----BEGIN CERTIFICATE-----\nAQ.D\n-----END CERTIFICATE-----", -1,
+       "a stray character"},
+      {"-----BEGIN CERTIFICATE-----\n\n-----END CERTIFICATE-----", -1, "empty"},
+      {"-----BEGIN CERTIFICATE-----\nAQID\n", 0, "no END"},
+      {"-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----", 0,
+       "not a certificate"},
+  };
+  int bad = 0;
+  for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+    unsigned char der[64];
+    size_t pos = 0;
+    long got =
+        ctui_wm_tls_pem_next(cases[i].in, strlen(cases[i].in), &pos, der);
+    if (got != cases[i].want) {
+      fprintf(stderr, "  %s: %ld, wanted %ld\n", cases[i].what, got,
+              cases[i].want);
+      bad++;
+    }
+  }
+  CTUI_TEST_ASSERT(bad == 0, "PEM blocks by mbedtls's base64 rules: line "
+                             "breaks, spaces before them, padding only at the "
+                             "end, anything else refused");
+
+  const char two[] = "-----BEGIN CERTIFICATE-----\nA!ID\n-----END "
+                     "CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nAQID\n"
+                     "-----END CERTIFICATE-----";
+  unsigned char der[64];
+  size_t pos = 0;
+  long a = ctui_wm_tls_pem_next(two, sizeof two - 1, &pos, der);
+  long b = ctui_wm_tls_pem_next(two, sizeof two - 1, &pos, der);
+  long c = ctui_wm_tls_pem_next(two, sizeof two - 1, &pos, der);
+  CTUI_TEST_ASSERT(a == -1 && b == 3 && der[0] == 1 && der[2] == 3 && c == 0,
+                   "a broken block is skipped, the one after it still read, "
+                   "then none left");
+}
+
 int main(void) {
   ctui_log_init(E_ERR);
   /* before anything starts TLS: the client reads it once per process */
   setenv("SSL_CERT_FILE", "tests/data/pki/ca.crt", 1);
+  test_pem();
   test_urls();
   test_format();
   test_replies();

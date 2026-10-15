@@ -8,13 +8,18 @@
  * under a Content-Encoding (the next byte: its low bit gzip or deflate,
  * the rest seeds the pieces' sizes), which must decode in pieces as it
  * does whole (coding.c); 5 = a CGI's reply head as ctui-remote takes it
- * (apps/remote/remote_cgi.c), whole and fed a byte more at a time. */
+ * (apps/remote/remote_cgi.c), whole and fed a byte more at a time; 6 =
+ * a CA bundle's PEM (plugins/net/tls.c): every block it takes must be
+ * what mbedtls's own base64 decoder makes of it. */
 #include "fuzz.h"
 
 #include "coding.h"
 #include "http.h"
 #include "httpd.h"
 #include "remote/remote_server.h"
+#include "tls.h"
+
+#include <mbedtls/base64.h>
 
 static void reply(const uint8_t *data, size_t size) {
   /* its own allocation, so reading past it is caught */
@@ -242,6 +247,39 @@ static void cgi_head(const uint8_t *data, size_t size) {
   free(buf);
 }
 
+static void pem(const uint8_t *data, size_t size) {
+  char *buf = malloc(size ? size : 1);
+  unsigned char *der = malloc(size ? size : 1);
+  unsigned char *ref = malloc(size ? size : 1);
+  memcpy(buf, data, size);
+  size_t pos = 0, last = 0;
+  long n;
+  while ((n = ctui_wm_tls_pem_next(buf, size, &pos, der)) != 0) {
+    FUZZ_CHECK(pos > last && pos <= size, "no progress (%zu after %zu)", pos,
+               last);
+    if (n > 0) {
+      FUZZ_CHECK((size_t)n <= size, "%ld bytes out of %zu", n, size);
+      /* the block's body (after the first BEGIN past the last block), as
+       * mbedtls decodes it */
+      static const char BEGIN[] = "-----BEGIN CERTIFICATE-----";
+      const char *b = memmem(buf + last, pos - last, BEGIN, sizeof BEGIN - 1);
+      const char *e = buf + pos - (sizeof "-----END CERTIFICATE-----" - 1);
+      FUZZ_CHECK(b != NULL, "a block without its BEGIN");
+      b += sizeof BEGIN - 1;
+      size_t olen = 0;
+      int ret = mbedtls_base64_decode(
+          ref, size, &olen, (const unsigned char *)b, (size_t)(e - b));
+      FUZZ_CHECK(ret == 0 && olen == (size_t)n && !memcmp(ref, der, olen),
+                 "a block mbedtls decodes otherwise (%d, %zu vs %ld bytes)",
+                 ret, olen, n);
+    }
+    last = pos;
+  }
+  free(buf);
+  free(der);
+  free(ref);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size == 0) {
     return 0;
@@ -256,6 +294,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     coded(data + 1, size - 1);
   } else if (data[0] == 5) {
     cgi_head(data + 1, size - 1);
+  } else if (data[0] == 6) {
+    pem(data + 1, size - 1);
   } else {
     request(data + 1, size - 1);
   }

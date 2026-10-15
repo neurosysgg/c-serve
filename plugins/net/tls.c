@@ -5,7 +5,7 @@
  * slots and RNG are unguarded: every mbedtls call runs under one lock,
  * never held across the poll() waits, so connections still overlap on
  * the network and only the crypto takes turns. */
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE /* memmem */
 #include "tls.h"
 
 #include "conn.h"
@@ -17,6 +17,7 @@
 #include <psa/crypto.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -53,6 +54,141 @@ static void why(int ret, const char *what, char *err, size_t err_cap) {
   snprintf(err, err_cap, "TLS: %s: %s", what, msg);
 }
 
+/* base64's value of each byte, or what else it is to a PEM body */
+enum { B64_BAD = -1, B64_SPACE = -2, B64_LF = -3, B64_CR = -4, B64_PAD = -5 };
+/* clang-format off */
+static const signed char B64[256] = {
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -3, -1, -1, -4, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 62, -1, -1, -1, 63,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -5, -1, -1,
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, -1,
+    -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+};
+/* clang-format on */
+
+long ctui_wm_tls_pem_next(const char *buf, size_t len, size_t *pos,
+                          unsigned char *der) {
+  static const char BEGIN[] = "-----BEGIN CERTIFICATE-----";
+  static const char END[] = "-----END CERTIFICATE-----";
+  if (*pos > len) {
+    return 0;
+  }
+  const char *b = memmem(buf + *pos, len - *pos, BEGIN, sizeof BEGIN - 1);
+  if (!b) {
+    *pos = len;
+    return 0;
+  }
+  b += sizeof BEGIN - 1;
+  const char *e = memmem(b, (size_t)(buf + len - b), END, sizeof END - 1);
+  if (!e) {
+    *pos = len;
+    return 0;
+  }
+  *pos = (size_t)(e - buf) + sizeof END - 1;
+  /* base64 between them, by mbedtls_base64_decode()'s rules: line breaks
+   * (\n, \r\n), spaces only before one or at the end, '=' only at the
+   * end (at most two, the symbols a multiple of 4 with them) */
+  size_t n = 0, syms = 0, pad = 0;
+  unsigned acc = 0;
+  int bits = 0;
+  int spaces = 0;
+  for (const char *c = b; c < e; c++) {
+    int v = B64[(unsigned char)*c];
+    if (v >= 0 && !spaces && !pad) {
+      syms++;
+      acc = acc << 6 | (unsigned)v;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        der[n++] = (unsigned char)(acc >> bits);
+      }
+      continue;
+    }
+    if (v == B64_SPACE) {
+      spaces = 1;
+    } else if (v == B64_LF || (v == B64_CR && c + 1 < e && c[1] == '\n')) {
+      c += v == B64_CR;
+      spaces = 0;
+    } else if (v == B64_PAD && !spaces && pad < 2) {
+      pad++;
+      syms++;
+    } else {
+      return -1; /* a space inside a line, a symbol after '=', ... */
+    }
+  }
+  return syms % 4 == 0 && n > 0 ? (long)n : -1;
+}
+
+/* path's certificates into ca: >= 0 when any parsed (as
+ * mbedtls_x509_crt_parse_file() counts: how many didn't), else < 0. PEM
+ * decoded here and handed over as DER: mbedtls's own base64 is constant
+ * time (for secret keys), ~7x slower on the system bundle (121
+ * certificates 4-8 ms -> 0.6 ms; ctui-wm's notes/self-improving.md,
+ * session 219) -- certificates are public. A file without PEM blocks (one
+ * DER certificate) goes to mbedtls whole. */
+static int parse_bundle(mbedtls_x509_crt *ca, const char *path) {
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return -1;
+  }
+  char *buf = NULL;
+  size_t len = 0, cap = 0;
+  int bad = 0;
+  for (;;) {
+    if (len == cap) {
+      cap = cap ? cap * 2 : 256 * 1024;
+      char *p = realloc(buf, cap);
+      if (!p) {
+        bad = 1;
+        break;
+      }
+      buf = p;
+    }
+    ssize_t got = read(fd, buf + len, cap - len);
+    if (got < 0 && errno == EINTR) {
+      continue;
+    }
+    if (got <= 0) {
+      bad = got < 0;
+      break;
+    }
+    len += (size_t)got;
+  }
+  close(fd);
+  unsigned char *der = bad ? NULL : malloc(len ? len : 1);
+  int ok = 0, failed = 0, blocks = 0;
+  size_t pos = 0;
+  long n;
+  while (der && (n = ctui_wm_tls_pem_next(buf, len, &pos, der)) != 0) {
+    blocks++;
+    if (n > 0 && mbedtls_x509_crt_parse_der(ca, der, (size_t)n) == 0) {
+      ok++;
+    } else {
+      failed++;
+    }
+  }
+  free(der);
+  free(buf);
+  if (bad) {
+    return -1;
+  }
+  if (blocks == 0) {
+    return mbedtls_x509_crt_parse_file(ca, path);
+  }
+  return ok ? failed : -1;
+}
+
 static int setup_once(char *err, size_t err_cap) {
   if (psa_crypto_init() != PSA_SUCCESS) {
     snprintf(err, err_cap, "TLS: the crypto library didn't start");
@@ -62,12 +198,12 @@ static int setup_once(char *err, size_t err_cap) {
   const char *env = getenv("SSL_CERT_FILE");
   int loaded = 0;
   if (env && *env) {
-    loaded = mbedtls_x509_crt_parse_file(&g_ca, env) >= 0;
+    loaded = parse_bundle(&g_ca, env) >= 0;
   }
   for (size_t i = 0; !loaded && i < sizeof CA_FILES / sizeof *CA_FILES; i++) {
     /* > 0: that many certificates in it didn't parse, the rest did */
-    loaded = access(CA_FILES[i], R_OK) == 0 &&
-             mbedtls_x509_crt_parse_file(&g_ca, CA_FILES[i]) >= 0;
+    loaded =
+        access(CA_FILES[i], R_OK) == 0 && parse_bundle(&g_ca, CA_FILES[i]) >= 0;
   }
   if (!loaded || g_ca.raw.len == 0) {
     mbedtls_x509_crt_free(&g_ca);

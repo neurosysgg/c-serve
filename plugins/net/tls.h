@@ -43,6 +43,14 @@ void ctui_wm_tls_server_free(CTUI_WM_TLS_SERVER *s);
 CTUI_WM_TLS *ctui_wm_tls_accept(int fd, CTUI_WM_TLS_SERVER *s, long deadline,
                                 char *err, size_t err_cap);
 
+/* The next PEM certificate in buf[*pos..len), decoded into der (len
+ * bytes always fit) and *pos moved past it: its DER's length, 0 when none
+ * is left, -1 for a block that isn't clean base64 by mbedtls's rules
+ * (skipped: the next one still reads). How the CA bundle is read
+ * (tls.c). */
+long ctui_wm_tls_pem_next(const char *buf, size_t len, size_t *pos,
+                          unsigned char *der);
+
 /* The other side's certificate after the handshake (a server's, or the
  * client's one a server asked for): its subject's common name (printable
  * bytes, cut at cn_cap; "" without one) and the SHA-256 of its DER as 64
