@@ -23,7 +23,8 @@ requests carries no client.
 make            # build/O2/libcserve.a
 make test       # the suites (T=net for one)
 make check      # ASan+UBSan, TSan, -O2, then clang-format, clang-tidy and cppcheck
-make FUZZ=1 fuzz && build/O2-fuzz/bin/fuzz-http corpus/   # libFuzzer, clang
+make FUZZ=1 fuzz && fuzz/seeds.py build/corpus   # libFuzzer (clang), its seeds first
+build/O2-fuzz/bin/fuzz-http build/corpus
 ```
 
 The tests' PKI in `tests/data/pki/` is a throwaway CA with a localhost certificate; its keys
