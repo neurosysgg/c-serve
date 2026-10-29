@@ -1,5 +1,5 @@
-#ifndef CTUI_WM_NET_LISTEN_H
-#define CTUI_WM_NET_LISTEN_H
+#ifndef CSERVE_LISTEN_H
+#define CSERVE_LISTEN_H
 
 #include "conn.h"
 
@@ -12,15 +12,15 @@
  * with the listener's deadline; its handler owns it and closes it. What
  * the handler shares with others is the handler's to lock. */
 
-typedef struct CTUI_WM_LISTEN CTUI_WM_LISTEN;
+typedef struct CSERVE_LISTEN CSERVE_LISTEN;
 
-/* the handler: c (close it with ctui_wm_conn_close()), the peer's address
+/* the handler: c (close it with cserve_conn_close()), the peer's address
  * as text ("127.0.0.1:50412", "[::1]:50412"), the listener's ud */
-typedef void (*CTUI_WM_LISTEN_FN)(CTUI_WM_CONN *c, const char *peer, void *ud);
+typedef void (*CSERVE_LISTEN_FN)(CSERVE_CONN *c, const char *peer, void *ud);
 
-struct CTUI_WM_LISTEN {
+struct CSERVE_LISTEN {
   /* set by the caller (new() fills the defaults) */
-  CTUI_WM_LISTEN_FN handler;
+  CSERVE_LISTEN_FN handler;
   void *ud;
   int max;        /* connections at once (64) */
   int timeout_ms; /* each connection's first deadline (30 s) */
@@ -31,17 +31,17 @@ struct CTUI_WM_LISTEN {
 
 /* a socket listening on host ("127.0.0.1", "::", "localhost") and port,
  * or NULL with why in err */
-CTUI_WM_LISTEN *ctui_wm_listen_new(const char *host, int port,
-                                   CTUI_WM_LISTEN_FN handler, void *ud,
-                                   char *err, size_t err_cap);
-void ctui_wm_listen_free(CTUI_WM_LISTEN *l);
+CSERVE_LISTEN *cserve_listen_new(const char *host, int port,
+                                 CSERVE_LISTEN_FN handler, void *ud, char *err,
+                                 size_t err_cap);
+void cserve_listen_free(CSERVE_LISTEN *l);
 
 /* serves ls[0..n) until stop_fd is readable (or poll fails): 0, or -1
  * with why in err. Connections still running are left to finish. */
-int ctui_wm_listen_serve(CTUI_WM_LISTEN *const *ls, int n, int stop_fd,
-                         char *err, size_t err_cap);
+int cserve_listen_serve(CSERVE_LISTEN *const *ls, int n, int stop_fd, char *err,
+                        size_t err_cap);
 
 /* connections running now, over every listener */
-int ctui_wm_listen_active(void);
+int cserve_listen_active(void);
 
 #endif

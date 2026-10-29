@@ -27,7 +27,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-struct CTUI_WM_TLS {
+struct CSERVE_TLS {
   int fd;
   mbedtls_ssl_context ssl;
 };
@@ -77,8 +77,8 @@ static const signed char B64[256] = {
 };
 /* clang-format on */
 
-long ctui_wm_tls_pem_next(const char *buf, size_t len, size_t *pos,
-                          unsigned char *der) {
+long cserve_tls_pem_next(const char *buf, size_t len, size_t *pos,
+                         unsigned char *der) {
   static const char BEGIN[] = "-----BEGIN CERTIFICATE-----";
   static const char END[] = "-----END CERTIFICATE-----";
   if (*pos > len) {
@@ -134,9 +134,9 @@ long ctui_wm_tls_pem_next(const char *buf, size_t len, size_t *pos,
  * mbedtls_x509_crt_parse_file() counts: how many didn't), else < 0. PEM
  * decoded here and handed over as DER: mbedtls's own base64 is constant
  * time (for secret keys), ~7x slower on the system bundle (121
- * certificates 4-8 ms -> 0.6 ms; ctui-wm's notes/self-improving.md,
- * session 219) -- certificates are public. A file without PEM blocks (one
- * DER certificate) goes to mbedtls whole. */
+ * certificates 4-8 ms -> 0.6 ms; ctui-wm's notes/self-improving.md (where this
+ * began), session 219) -- certificates are public. A file without PEM blocks
+ * (one DER certificate) goes to mbedtls whole. */
 static int parse_bundle(mbedtls_x509_crt *ca, const char *path) {
   int fd = open(path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
@@ -170,7 +170,7 @@ static int parse_bundle(mbedtls_x509_crt *ca, const char *path) {
   int ok = 0, failed = 0, blocks = 0;
   size_t pos = 0;
   long n;
-  while (der && (n = ctui_wm_tls_pem_next(buf, len, &pos, der)) != 0) {
+  while (der && (n = cserve_tls_pem_next(buf, len, &pos, der)) != 0) {
     blocks++;
     if (n > 0 && mbedtls_x509_crt_parse_der(ca, der, (size_t)n) == 0) {
       ok++;
@@ -261,13 +261,13 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
 
 /* after a WANT_READ/WANT_WRITE: the socket ready before deadline (0), or
  * -1; any other ret is an error (-1, why in err) */
-static int again(CTUI_WM_TLS *t, int ret, const char *what, long deadline,
+static int again(CSERVE_TLS *t, int ret, const char *what, long deadline,
                  char *err, size_t err_cap) {
   if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
-    return ctui_wm_net_wait(t->fd, POLLIN, deadline, err, err_cap);
+    return cserve_net_wait(t->fd, POLLIN, deadline, err, err_cap);
   }
   if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
-    return ctui_wm_net_wait(t->fd, POLLOUT, deadline, err, err_cap);
+    return cserve_net_wait(t->fd, POLLOUT, deadline, err, err_cap);
   }
   why(ret, what, err, err_cap);
   return -1;
@@ -275,10 +275,10 @@ static int again(CTUI_WM_TLS *t, int ret, const char *what, long deadline,
 
 /* a connection on fd under conf, its handshake done (host: the name the
  * server's certificate must carry, NULL on the server side), or NULL */
-static CTUI_WM_TLS *handshake(int fd, const mbedtls_ssl_config *conf,
-                              const char *host, long deadline, char *err,
-                              size_t err_cap) {
-  CTUI_WM_TLS *t = calloc(1, sizeof *t);
+static CSERVE_TLS *handshake(int fd, const mbedtls_ssl_config *conf,
+                             const char *host, long deadline, char *err,
+                             size_t err_cap) {
+  CSERVE_TLS *t = calloc(1, sizeof *t);
   if (!t) {
     snprintf(err, err_cap, "out of memory");
     return NULL;
@@ -325,8 +325,8 @@ fail:
   return NULL;
 }
 
-CTUI_WM_TLS *ctui_wm_tls_open(int fd, const char *host, long deadline,
-                              char *err, size_t err_cap) {
+CSERVE_TLS *cserve_tls_open(int fd, const char *host, long deadline, char *err,
+                            size_t err_cap) {
   if (setup(err, err_cap) != 0) {
     return NULL;
   }
@@ -342,10 +342,10 @@ typedef struct {
   mbedtls_pk_context key;
 } SIDE;
 
-struct CTUI_WM_TLS_SERVER {
+struct CSERVE_TLS_SERVER {
   SIDE side;
 };
-struct CTUI_WM_TLS_CLIENT {
+struct CSERVE_TLS_CLIENT {
   SIDE side;
 };
 
@@ -431,10 +431,10 @@ static int side_init(SIDE *s, int endpoint, const char *cert, const char *key,
   return 0;
 }
 
-CTUI_WM_TLS_SERVER *ctui_wm_tls_server_new(const char *cert, const char *key,
-                                           const char *client_ca, char *err,
-                                           size_t err_cap) {
-  CTUI_WM_TLS_SERVER *s = calloc(1, sizeof *s);
+CSERVE_TLS_SERVER *cserve_tls_server_new(const char *cert, const char *key,
+                                         const char *client_ca, char *err,
+                                         size_t err_cap) {
+  CSERVE_TLS_SERVER *s = calloc(1, sizeof *s);
   if (!s) {
     snprintf(err, err_cap, "out of memory");
     return NULL;
@@ -447,7 +447,7 @@ CTUI_WM_TLS_SERVER *ctui_wm_tls_server_new(const char *cert, const char *key,
   return s;
 }
 
-void ctui_wm_tls_server_free(CTUI_WM_TLS_SERVER *s) {
+void cserve_tls_server_free(CSERVE_TLS_SERVER *s) {
   if (!s) {
     return;
   }
@@ -455,14 +455,14 @@ void ctui_wm_tls_server_free(CTUI_WM_TLS_SERVER *s) {
   free(s);
 }
 
-CTUI_WM_TLS_CLIENT *ctui_wm_tls_client_new(const char *ca, const char *cert,
-                                           const char *key, char *err,
-                                           size_t err_cap) {
+CSERVE_TLS_CLIENT *cserve_tls_client_new(const char *ca, const char *cert,
+                                         const char *key, char *err,
+                                         size_t err_cap) {
   if (!cert != !key) {
     snprintf(err, err_cap, "TLS: a client certificate needs its key");
     return NULL;
   }
-  CTUI_WM_TLS_CLIENT *c = calloc(1, sizeof *c);
+  CSERVE_TLS_CLIENT *c = calloc(1, sizeof *c);
   if (!c) {
     snprintf(err, err_cap, "out of memory");
     return NULL;
@@ -475,7 +475,7 @@ CTUI_WM_TLS_CLIENT *ctui_wm_tls_client_new(const char *ca, const char *cert,
   return c;
 }
 
-void ctui_wm_tls_client_free(CTUI_WM_TLS_CLIENT *c) {
+void cserve_tls_client_free(CSERVE_TLS_CLIENT *c) {
   if (!c) {
     return;
   }
@@ -483,13 +483,12 @@ void ctui_wm_tls_client_free(CTUI_WM_TLS_CLIENT *c) {
   free(c);
 }
 
-CTUI_WM_TLS *ctui_wm_tls_connect(int fd, const char *host,
-                                 CTUI_WM_TLS_CLIENT *c, long deadline,
-                                 char *err, size_t err_cap) {
+CSERVE_TLS *cserve_tls_connect(int fd, const char *host, CSERVE_TLS_CLIENT *c,
+                               long deadline, char *err, size_t err_cap) {
   return handshake(fd, &c->side.conf, host, deadline, err, err_cap);
 }
 
-int ctui_wm_tls_peer(CTUI_WM_TLS *t, char *cn, size_t cn_cap, char fpr[65]) {
+int cserve_tls_peer(CSERVE_TLS *t, char *cn, size_t cn_cap, char fpr[65]) {
   if (cn_cap) {
     cn[0] = '\0';
   }
@@ -526,13 +525,13 @@ int ctui_wm_tls_peer(CTUI_WM_TLS *t, char *cn, size_t cn_cap, char fpr[65]) {
   return 0;
 }
 
-CTUI_WM_TLS *ctui_wm_tls_accept(int fd, CTUI_WM_TLS_SERVER *s, long deadline,
-                                char *err, size_t err_cap) {
+CSERVE_TLS *cserve_tls_accept(int fd, CSERVE_TLS_SERVER *s, long deadline,
+                              char *err, size_t err_cap) {
   return handshake(fd, &s->side.conf, NULL, deadline, err, err_cap);
 }
 
-int ctui_wm_tls_write(CTUI_WM_TLS *t, const char *buf, size_t n, long deadline,
-                      char *err, size_t err_cap) {
+int cserve_tls_write(CSERVE_TLS *t, const char *buf, size_t n, long deadline,
+                     char *err, size_t err_cap) {
   while (n > 0) {
     lock();
     int w = mbedtls_ssl_write(&t->ssl, (const unsigned char *)buf, n);
@@ -547,8 +546,8 @@ int ctui_wm_tls_write(CTUI_WM_TLS *t, const char *buf, size_t n, long deadline,
   return 0;
 }
 
-ssize_t ctui_wm_tls_read(CTUI_WM_TLS *t, char *buf, size_t n, long deadline,
-                         char *err, size_t err_cap) {
+ssize_t cserve_tls_read(CSERVE_TLS *t, char *buf, size_t n, long deadline,
+                        char *err, size_t err_cap) {
   for (;;) {
     lock();
     int r = mbedtls_ssl_read(&t->ssl, (unsigned char *)buf, n);
@@ -572,14 +571,14 @@ ssize_t ctui_wm_tls_read(CTUI_WM_TLS *t, char *buf, size_t n, long deadline,
   }
 }
 
-size_t ctui_wm_tls_pending(const CTUI_WM_TLS *t) {
+size_t cserve_tls_pending(const CSERVE_TLS *t) {
   lock();
   size_t n = mbedtls_ssl_get_bytes_avail(&t->ssl);
   unlock();
   return n;
 }
 
-void ctui_wm_tls_close(CTUI_WM_TLS *t) {
+void cserve_tls_close(CSERVE_TLS *t) {
   if (!t) {
     return;
   }

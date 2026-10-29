@@ -1,0 +1,5 @@
+# ctui's style (ctui/.clang-format), plus: string literals stay whole --
+# help texts, embedded scripts and test JSON are split by hand, at
+# meaningful places, or not at all
+BasedOnStyle: LLVM
+BreakStringLiterals: false

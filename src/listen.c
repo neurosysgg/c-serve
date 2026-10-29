@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 typedef struct {
-  CTUI_WM_LISTEN pub;
+  CSERVE_LISTEN pub;
   atomic_int running;
 } LISTENER;
 
@@ -27,12 +27,12 @@ typedef struct {
 } JOB;
 
 /* connections running over every listener, those freed too (a
- * connection outlives its listener's free: ctui_wm_listen_active()) */
+ * connection outlives its listener's free: cserve_listen_active()) */
 static atomic_int g_active;
 
-CTUI_WM_LISTEN *ctui_wm_listen_new(const char *host, int port,
-                                   CTUI_WM_LISTEN_FN handler, void *ud,
-                                   char *err, size_t err_cap) {
+CSERVE_LISTEN *cserve_listen_new(const char *host, int port,
+                                 CSERVE_LISTEN_FN handler, void *ud, char *err,
+                                 size_t err_cap) {
   char service[8];
   snprintf(service, sizeof service, "%d", port);
   struct addrinfo hints = {.ai_family = AF_UNSPEC,
@@ -90,7 +90,7 @@ CTUI_WM_LISTEN *ctui_wm_listen_new(const char *host, int port,
   return &l->pub;
 }
 
-void ctui_wm_listen_free(CTUI_WM_LISTEN *l) {
+void cserve_listen_free(CSERVE_LISTEN *l) {
   if (!l) {
     return;
   }
@@ -106,7 +106,7 @@ void ctui_wm_listen_free(CTUI_WM_LISTEN *l) {
   }
 }
 
-int ctui_wm_listen_active(void) { return atomic_load(&g_active); }
+int cserve_listen_active(void) { return atomic_load(&g_active); }
 
 static void peer_text(const struct sockaddr_storage *sa, char *out,
                       size_t cap) {
@@ -125,8 +125,8 @@ static void peer_text(const struct sockaddr_storage *sa, char *out,
 static void *job_run(void *arg) {
   JOB *j = arg;
   LISTENER *l = j->l;
-  CTUI_WM_CONN *c =
-      ctui_wm_conn_adopt(j->fd, ctui_wm_net_now() + l->pub.timeout_ms);
+  CSERVE_CONN *c =
+      cserve_conn_adopt(j->fd, cserve_net_now() + l->pub.timeout_ms);
   if (c) {
     l->pub.handler(c, j->peer, l->pub.ud);
   }
@@ -180,8 +180,8 @@ static void accept_all(LISTENER *l) {
   }
 }
 
-int ctui_wm_listen_serve(CTUI_WM_LISTEN *const *ls, int n, int stop_fd,
-                         char *err, size_t err_cap) {
+int cserve_listen_serve(CSERVE_LISTEN *const *ls, int n, int stop_fd, char *err,
+                        size_t err_cap) {
   struct pollfd *pfd = calloc((size_t)n + 1, sizeof *pfd);
   if (!pfd) {
     snprintf(err, err_cap, "out of memory");

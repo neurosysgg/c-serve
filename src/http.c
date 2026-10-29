@@ -14,8 +14,8 @@
  * percent-encodes the rest) */
 static int url_char_ok(unsigned char c) { return c > 0x20 && c < 0x7f; }
 
-int ctui_wm_url_parse(const char *url, CTUI_WM_URL *u, char *err,
-                      size_t err_cap) {
+int cserve_url_parse(const char *url, CSERVE_URL *u, char *err,
+                     size_t err_cap) {
   memset(u, 0, sizeof *u);
   const char *p;
   if (!strncasecmp(url, "https://", 8)) {
@@ -99,16 +99,16 @@ int ctui_wm_url_parse(const char *url, CTUI_WM_URL *u, char *err,
   return 0;
 }
 
-int ctui_wm_url_resolve(const CTUI_WM_URL *base, const char *loc,
-                        CTUI_WM_URL *u, char *err, size_t err_cap) {
+int cserve_url_resolve(const CSERVE_URL *base, const char *loc, CSERVE_URL *u,
+                       char *err, size_t err_cap) {
   if (!strncasecmp(loc, "https://", 8) || !strncasecmp(loc, "http://", 7)) {
-    return ctui_wm_url_parse(loc, u, err, err_cap);
+    return cserve_url_parse(loc, u, err, err_cap);
   }
   char url[sizeof u->path + sizeof u->host + 64];
   const char *scheme = base->tls ? "https" : "http";
   if (loc[0] == '/' && loc[1] == '/') {
     snprintf(url, sizeof url, "%s:%s", scheme, loc);
-    return ctui_wm_url_parse(url, u, err, err_cap);
+    return cserve_url_parse(url, u, err, err_cap);
   }
   int n = snprintf(url, sizeof url, "%s://%s%s%s:%s", scheme,
                    strchr(base->host, ':') ? "[" : "", base->host,
@@ -132,10 +132,10 @@ int ctui_wm_url_resolve(const CTUI_WM_URL *base, const char *loc,
     return -1;
   }
   strcpy(url + at, loc);
-  return ctui_wm_url_parse(url, u, err, err_cap);
+  return cserve_url_parse(url, u, err, err_cap);
 }
 
-int ctui_wm_url_format(const CTUI_WM_URL *u, char *out, size_t cap) {
+int cserve_url_format(const CSERVE_URL *u, char *out, size_t cap) {
   int v6 = strchr(u->host, ':') != NULL;
   int own = !strcmp(u->port, u->tls ? "443" : "80");
   int n = snprintf(out, cap, "%s://%s%s%s%s%s%s", u->tls ? "https" : "http",
@@ -178,7 +178,7 @@ static void out_str(OUT *o, const char *s) { out_add(o, s, strlen(s)); }
 
 static int has_crlf(const char *s) { return s && strpbrk(s, "\r\n"); }
 
-int ctui_wm_http_req_has(const CTUI_WM_HTTP_REQ *req, const char *name) {
+int cserve_http_req_has(const CSERVE_HTTP_REQ *req, const char *name) {
   size_t n = strlen(name);
   for (const char *const *h = req->headers; h && *h; h++) {
     if (!strncasecmp(*h, name, n) && (*h)[n] == ':') {
@@ -188,8 +188,8 @@ int ctui_wm_http_req_has(const CTUI_WM_HTTP_REQ *req, const char *name) {
   return 0;
 }
 
-int ctui_wm_http_format(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_URL *u,
-                        int coded, char **out, size_t *len) {
+int cserve_http_format(const CSERVE_HTTP_REQ *req, const CSERVE_URL *u,
+                       int coded, char **out, size_t *len) {
   const char *method = req->method ? req->method : "GET";
   if (has_crlf(method) || strchr(method, ' ') || has_crlf(req->content_type) ||
       has_crlf(req->agent)) {
@@ -214,12 +214,12 @@ int ctui_wm_http_format(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_URL *u,
     out_str(&o, u->port);
   }
   out_str(&o, "\r\nUser-Agent: ");
-  out_str(&o, req->agent ? req->agent : "ctui-wm");
+  out_str(&o, req->agent ? req->agent : CSERVE_HTTP_AGENT);
   out_str(&o, "\r\n");
-  if (!ctui_wm_http_req_has(req, "Accept")) {
+  if (!cserve_http_req_has(req, "Accept")) {
     out_str(&o, "Accept: */*\r\n");
   }
-  if (!ctui_wm_http_req_has(req, "Accept-Encoding")) {
+  if (!cserve_http_req_has(req, "Accept-Encoding")) {
     out_str(&o, coded ? "Accept-Encoding: gzip, deflate\r\n"
                       : "Accept-Encoding: identity\r\n");
   }
@@ -293,13 +293,13 @@ static int header_in(const char *h, size_t hlen, const char *name, char *val,
   return 0;
 }
 
-int ctui_wm_http_header(const CTUI_WM_HTTP_PARSED *p, const char *name,
-                        char *val, size_t cap) {
+int cserve_http_header(const CSERVE_HTTP_PARSED *p, const char *name, char *val,
+                       size_t cap) {
   return header_in(p->headers, p->headers_len, name, val, cap);
 }
 
-int ctui_wm_http_reply_header(const CTUI_WM_HTTP_REPLY *rep, const char *name,
-                              char *val, size_t cap) {
+int cserve_http_reply_header(const CSERVE_HTTP_REPLY *rep, const char *name,
+                             char *val, size_t cap) {
   return rep->headers &&
          header_in(rep->headers, rep->headers_len, name, val, cap);
 }
@@ -320,12 +320,12 @@ enum {
   D_DONE
 };
 
-void ctui_wm_http_dec_init(CTUI_WM_HTTP_DEC *d) {
+void cserve_http_dec_init(CSERVE_HTTP_DEC *d) {
   memset(d, 0, sizeof *d);
   d->state = D_HEAD;
 }
 
-void ctui_wm_http_dec_free(CTUI_WM_HTTP_DEC *d) {
+void cserve_http_dec_free(CSERVE_HTTP_DEC *d) {
   free(d->head);
   d->head = NULL;
 }
@@ -356,7 +356,7 @@ static int status_line(const char *p, size_t ll) {
 
 /* the head is complete: an interim reply dropped (0, more head wanted),
  * or the body's framing chosen (0), or -1 with why in err */
-static int head_done(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
+static int head_done(CSERVE_HTTP_DEC *d, char *err, size_t err_cap) {
   if (d->status >= 100 && d->status < 200 && d->status != 101) {
     d->head_len = 0;
     d->status = 0;
@@ -407,7 +407,7 @@ static int head_done(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
 
 /* one byte of the head (it's small: a byte at a time keeps the line
  * bookkeeping simple): 0, or -1 with why in err */
-static int head_byte(CTUI_WM_HTTP_DEC *d, char c, char *err, size_t err_cap) {
+static int head_byte(CSERVE_HTTP_DEC *d, char c, char *err, size_t err_cap) {
   if (d->head_len == d->head_cap) {
     if (d->head_cap >= HEAD_MAX) {
       snprintf(err, err_cap, "the reply's headers are over %d bytes", HEAD_MAX);
@@ -447,7 +447,7 @@ static int head_byte(CTUI_WM_HTTP_DEC *d, char c, char *err, size_t err_cap) {
 }
 
 /* a chunk's size line (without its LF): 0, or -1 with why in err */
-static int chunk_size(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
+static int chunk_size(CSERVE_HTTP_DEC *d, char *err, size_t err_cap) {
   unsigned long long size = 0;
   size_t i = 0;
   for (; i < d->line_len; i++) {
@@ -479,15 +479,15 @@ static int chunk_size(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
 }
 
 /* n bytes of the body to on_body(): 1 if it stopped the reply */
-static int deliver(CTUI_WM_HTTP_DEC *d, const char *p, size_t n) {
+static int deliver(CSERVE_HTTP_DEC *d, const char *p, size_t n) {
   if (n && d->on_body(d, p, n)) {
     d->stopped = 1;
   }
   return d->stopped;
 }
 
-int ctui_wm_http_dec_feed(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n,
-                          char *err, size_t err_cap) {
+int cserve_http_dec_feed(CSERVE_HTTP_DEC *d, const char *buf, size_t n,
+                         char *err, size_t err_cap) {
   const char *p = buf, *end = buf + n;
   while (!d->stopped && d->state != D_DONE && p < end) {
     size_t have = (size_t)(end - p), k;
@@ -560,7 +560,7 @@ int ctui_wm_http_dec_feed(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n,
   return d->stopped || d->state == D_DONE;
 }
 
-int ctui_wm_http_dec_end(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
+int cserve_http_dec_end(CSERVE_HTTP_DEC *d, char *err, size_t err_cap) {
   switch (d->state) {
   case D_CLOSE:
   case D_TRAIL: /* the last chunk came: its trailers cut short */
@@ -578,28 +578,28 @@ int ctui_wm_http_dec_end(CTUI_WM_HTTP_DEC *d, char *err, size_t err_cap) {
   }
 }
 
-int ctui_wm_http_dec_reusable(const CTUI_WM_HTTP_DEC *d) {
+int cserve_http_dec_reusable(const CSERVE_HTTP_DEC *d) {
   return d->state == D_DONE && !d->stopped && d->keep;
 }
 
-static int parse_body(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n) {
+static int parse_body(CSERVE_HTTP_DEC *d, const char *buf, size_t n) {
   OUT *o = d->ctx;
   out_add(o, buf, n);
   return o->oom;
 }
 
-int ctui_wm_http_parse(const char *buf, size_t n, CTUI_WM_HTTP_PARSED *out,
-                       char *err, size_t err_cap) {
+int cserve_http_parse(const char *buf, size_t n, CSERVE_HTTP_PARSED *out,
+                      char *err, size_t err_cap) {
   memset(out, 0, sizeof *out);
   OUT o = {0};
   out_add(&o, "", 0);
-  CTUI_WM_HTTP_DEC d;
-  ctui_wm_http_dec_init(&d);
+  CSERVE_HTTP_DEC d;
+  cserve_http_dec_init(&d);
   d.on_body = parse_body;
   d.ctx = &o;
-  int r = ctui_wm_http_dec_feed(&d, buf, n, err, err_cap);
+  int r = cserve_http_dec_feed(&d, buf, n, err, err_cap);
   if (r == 0) {
-    r = ctui_wm_http_dec_end(&d, err, err_cap) == 0 ? 1 : -1;
+    r = cserve_http_dec_end(&d, err, err_cap) == 0 ? 1 : -1;
   }
   if (r > 0 && o.oom) {
     snprintf(err, err_cap, "out of memory");
@@ -607,7 +607,7 @@ int ctui_wm_http_parse(const char *buf, size_t n, CTUI_WM_HTTP_PARSED *out,
   }
   if (r < 0) {
     free(o.s);
-    ctui_wm_http_dec_free(&d);
+    cserve_http_dec_free(&d);
     return -1;
   }
   out->status = d.status;
@@ -616,6 +616,6 @@ int ctui_wm_http_parse(const char *buf, size_t n, CTUI_WM_HTTP_PARSED *out,
   out->headers_len = d.headers_len;
   out->body = o.s;
   out->len = o.len;
-  ctui_wm_http_dec_free(&d);
+  cserve_http_dec_free(&d);
   return 0;
 }

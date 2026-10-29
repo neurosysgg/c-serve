@@ -9,7 +9,7 @@
 #include <strings.h>
 #include <zlib.h>
 
-struct CTUI_WM_HTTP_CODING {
+struct CSERVE_HTTP_CODING {
   z_stream z;
   int gzip;    /* else deflate */
   int started; /* inflateInit2() done */
@@ -20,8 +20,8 @@ struct CTUI_WM_HTTP_CODING {
   size_t nfirst;
 };
 
-int ctui_wm_http_coding_open(const char *value, CTUI_WM_HTTP_CODING **c,
-                             char *err, size_t err_cap) {
+int cserve_http_coding_open(const char *value, CSERVE_HTTP_CODING **c,
+                            char *err, size_t err_cap) {
   *c = NULL;
   const char *v = value, *ve = value + strlen(value);
   while (v < ve && (*v == ' ' || *v == '\t')) {
@@ -54,7 +54,7 @@ int ctui_wm_http_coding_open(const char *value, CTUI_WM_HTTP_CODING **c,
   return 1;
 }
 
-static int start(CTUI_WM_HTTP_CODING *c, int wbits, char *err, size_t err_cap) {
+static int start(CSERVE_HTTP_CODING *c, int wbits, char *err, size_t err_cap) {
   if (inflateInit2(&c->z, wbits) != Z_OK) {
     snprintf(err, err_cap, "out of memory");
     return -1;
@@ -64,8 +64,8 @@ static int start(CTUI_WM_HTTP_CODING *c, int wbits, char *err, size_t err_cap) {
 }
 
 /* in[0..n) through inflate, its output to out */
-static int run(CTUI_WM_HTTP_CODING *c, const unsigned char *in, size_t n,
-               CTUI_WM_HTTP_CODING_OUT out, void *ctx, char *err,
+static int run(CSERVE_HTTP_CODING *c, const unsigned char *in, size_t n,
+               CSERVE_HTTP_CODING_OUT out, void *ctx, char *err,
                size_t err_cap) {
   unsigned char buf[16384];
   while (n > 0 && !c->ended) {
@@ -97,9 +97,9 @@ static int run(CTUI_WM_HTTP_CODING *c, const unsigned char *in, size_t n,
   return 0;
 }
 
-int ctui_wm_http_coding_feed(CTUI_WM_HTTP_CODING *c, const char *buf, size_t n,
-                             CTUI_WM_HTTP_CODING_OUT out, void *ctx, char *err,
-                             size_t err_cap) {
+int cserve_http_coding_feed(CSERVE_HTTP_CODING *c, const char *buf, size_t n,
+                            CSERVE_HTTP_CODING_OUT out, void *ctx, char *err,
+                            size_t err_cap) {
   const unsigned char *p = (const unsigned char *)buf;
   if (n) {
     c->any = 1;
@@ -131,7 +131,7 @@ int ctui_wm_http_coding_feed(CTUI_WM_HTTP_CODING *c, const char *buf, size_t n,
   return r ? r : run(c, p, n, out, ctx, err, err_cap);
 }
 
-int ctui_wm_http_coding_end(CTUI_WM_HTTP_CODING *c, char *err, size_t err_cap) {
+int cserve_http_coding_end(CSERVE_HTTP_CODING *c, char *err, size_t err_cap) {
   /* an empty body labelled compressed (some servers' empty replies) */
   if (c->ended || !c->any) {
     return 0;
@@ -140,7 +140,7 @@ int ctui_wm_http_coding_end(CTUI_WM_HTTP_CODING *c, char *err, size_t err_cap) {
   return -1;
 }
 
-void ctui_wm_http_coding_free(CTUI_WM_HTTP_CODING *c) {
+void cserve_http_coding_free(CSERVE_HTTP_CODING *c) {
   if (!c) {
     return;
   }

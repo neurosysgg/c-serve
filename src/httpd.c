@@ -43,7 +43,7 @@ static int has_token(const char *list, const char *tok) {
   return 0;
 }
 
-static int request_line(char *line, CTUI_WM_HTTPD_REQ *r, char *err,
+static int request_line(char *line, CSERVE_HTTPD_REQ *r, char *err,
                         size_t err_cap) {
   char *sp1 = strchr(line, ' ');
   if (!sp1 || sp1 == line || (size_t)(sp1 - line) >= sizeof r->method) {
@@ -110,8 +110,8 @@ static int request_line(char *line, CTUI_WM_HTTPD_REQ *r, char *err,
   return 0;
 }
 
-int ctui_wm_httpd_parse(char *buf, CTUI_WM_HTTPD_REQ *r, char *err,
-                        size_t err_cap) {
+int cserve_httpd_parse(char *buf, CSERVE_HTTPD_REQ *r, char *err,
+                       size_t err_cap) {
   memset(r, 0, sizeof *r);
   r->length = -1;
   r->query = "";
@@ -155,7 +155,7 @@ int ctui_wm_httpd_parse(char *buf, CTUI_WM_HTTPD_REQ *r, char *err,
         return refuse(400, err, err_cap, "a bad header name");
       }
     }
-    if (r->n == CTUI_WM_HTTPD_HEADERS) {
+    if (r->n == CSERVE_HTTPD_HEADERS) {
       return refuse(431, err, err_cap, "too many header lines");
     }
     *colon = '\0';
@@ -192,16 +192,16 @@ int ctui_wm_httpd_parse(char *buf, CTUI_WM_HTTPD_REQ *r, char *err,
     return refuse(r->length >= 0 ? 400 : 411, err, err_cap,
                   "a Transfer-Encoding (only Content-Length is taken)");
   }
-  if (r->minor == 1 && !ctui_wm_httpd_header(r, "Host")) {
+  if (r->minor == 1 && !cserve_httpd_header(r, "Host")) {
     return refuse(400, err, err_cap, "no Host");
   }
-  const char *conn = ctui_wm_httpd_header(r, "Connection");
+  const char *conn = cserve_httpd_header(r, "Connection");
   r->keep_alive = r->minor == 1 ? !(conn && has_token(conn, "close"))
                                 : conn && has_token(conn, "keep-alive");
   return 0;
 }
 
-const char *ctui_wm_httpd_header(const CTUI_WM_HTTPD_REQ *r, const char *name) {
+const char *cserve_httpd_header(const CSERVE_HTTPD_REQ *r, const char *name) {
   for (int i = 0; i < r->n; i++) {
     if (strcasecmp(r->h[i].name, name) == 0) {
       return r->h[i].value;
@@ -210,7 +210,7 @@ const char *ctui_wm_httpd_header(const CTUI_WM_HTTPD_REQ *r, const char *name) {
   return NULL;
 }
 
-const char *ctui_wm_httpd_reason(int status) {
+const char *cserve_httpd_reason(int status) {
   static const struct {
     int status;
     const char *text;
@@ -243,8 +243,8 @@ const char *ctui_wm_httpd_reason(int status) {
   return "";
 }
 
-void ctui_wm_httpd_text(CTUI_WM_HTTPD_REPLY *rep, int status, const char *type,
-                        const char *body, size_t len) {
+void cserve_httpd_text(CSERVE_HTTPD_REPLY *rep, int status, const char *type,
+                       const char *body, size_t len) {
   char *copy = malloc(len + 1);
   if (!copy) {
     rep->status = 500;
@@ -263,39 +263,39 @@ void ctui_wm_httpd_text(CTUI_WM_HTTPD_REPLY *rep, int status, const char *type,
   rep->owned = 1;
 }
 
-void ctui_wm_httpd_take(CTUI_WM_HTTPD_REPLY *rep, int status, const char *type,
-                        CTUI_BUF *b) {
+void cserve_httpd_take(CSERVE_HTTPD_REPLY *rep, int status, const char *type,
+                       char *body, size_t len) {
   rep->status = status;
   rep->type = type;
-  rep->body = b->s ? b->s : (char *)"";
-  rep->len = b->len;
-  rep->owned = b->s != NULL;
-  *b = (CTUI_BUF){0};
+  rep->body = body ? body : (char *)"";
+  rep->len = body ? len : 0;
+  rep->owned = body != NULL;
 }
 
-void ctui_wm_httpd_escape(CTUI_BUF *b, const char *s) {
+void cserve_httpd_escape(void (*add)(void *ctx, const char *s, size_t n),
+                         void *ctx, const char *s) {
   for (const char *p = s; *p;) {
     size_t k = strcspn(p, "&<>\"'");
-    ctui_buf_add(b, p, k);
+    add(ctx, p, k);
     p += k;
     if (!*p) {
       break;
     }
     switch (*p++) {
     case '&':
-      ctui_buf_add(b, "&amp;", 5);
+      add(ctx, "&amp;", 5);
       break;
     case '<':
-      ctui_buf_add(b, "&lt;", 4);
+      add(ctx, "&lt;", 4);
       break;
     case '>':
-      ctui_buf_add(b, "&gt;", 4);
+      add(ctx, "&gt;", 4);
       break;
     case '"':
-      ctui_buf_add(b, "&quot;", 6);
+      add(ctx, "&quot;", 6);
       break;
     default:
-      ctui_buf_add(b, "&#39;", 5);
+      add(ctx, "&#39;", 5);
       break;
     }
   }
@@ -306,13 +306,13 @@ void ctui_wm_httpd_escape(CTUI_BUF *b, const char *s) {
 /* the next request's head into buf (cap bytes): its length; 0 when the
  * client closed or went quiet before sending anything (just close); -1
  * with a status to refuse it with in *status */
-static long read_head(CTUI_WM_CONN *c, char *buf, size_t cap, int *status,
+static long read_head(CSERVE_CONN *c, char *buf, size_t cap, int *status,
                       char *err, size_t err_cap) {
   size_t len = 0;
   int lines = 0, blanks = 0;
   for (;;) {
     const char *line;
-    ssize_t n = ctui_wm_conn_line(c, &line, cap, err, err_cap);
+    ssize_t n = cserve_conn_line(c, &line, cap, err, err_cap);
     if (n < 0) {
       if (len == 0) {
         return 0;
@@ -345,14 +345,14 @@ static long read_head(CTUI_WM_CONN *c, char *buf, size_t cap, int *status,
   }
 }
 
-struct CTUI_WM_HTTPD_OUT {
-  CTUI_WM_CONN *c;
+struct CSERVE_HTTPD_OUT {
+  CSERVE_CONN *c;
   int chunked;
   int drop; /* no body to send (HEAD, 204, 304): writes do nothing */
   int failed;
 };
 
-int ctui_wm_httpd_out(CTUI_WM_HTTPD_OUT *o, const char *buf, size_t n) {
+int cserve_httpd_out(CSERVE_HTTPD_OUT *o, const char *buf, size_t n) {
   if (o->failed) {
     return -1;
   }
@@ -361,9 +361,9 @@ int ctui_wm_httpd_out(CTUI_WM_HTTPD_OUT *o, const char *buf, size_t n) {
   }
   char err[200], size[24];
   int k = o->chunked ? snprintf(size, sizeof size, "%zx\r\n", n) : 0;
-  if ((k > 0 && ctui_wm_conn_write(o->c, size, (size_t)k, err, sizeof err)) ||
-      ctui_wm_conn_write(o->c, buf, n, err, sizeof err) ||
-      (o->chunked && ctui_wm_conn_write(o->c, "\r\n", 2, err, sizeof err))) {
+  if ((k > 0 && cserve_conn_write(o->c, size, (size_t)k, err, sizeof err)) ||
+      cserve_conn_write(o->c, buf, n, err, sizeof err) ||
+      (o->chunked && cserve_conn_write(o->c, "\r\n", 2, err, sizeof err))) {
     o->failed = 1;
     return -1;
   }
@@ -372,10 +372,9 @@ int ctui_wm_httpd_out(CTUI_WM_HTTPD_OUT *o, const char *buf, size_t n) {
 
 /* the reply's head, then its body: 0, or -1 with why in err. A streamed
  * one's stream() runs here, whatever happens to the head. */
-static int send_reply(CTUI_WM_CONN *c, const CTUI_WM_HTTPD *h,
-                      const CTUI_WM_HTTPD_REQ *r,
-                      const CTUI_WM_HTTPD_REPLY *rep, int keep, char *err,
-                      size_t err_cap) {
+static int send_reply(CSERVE_CONN *c, const CSERVE_HTTPD *h,
+                      const CSERVE_HTTPD_REQ *r, const CSERVE_HTTPD_REPLY *rep,
+                      int keep, char *err, size_t err_cap) {
   char head[5120], length[48];
   int body = rep->status >= 200 && rep->status != 204 && rep->status != 304;
   int head_only = r && strcmp(r->method, "HEAD") == 0;
@@ -390,7 +389,7 @@ static int send_reply(CTUI_WM_CONN *c, const CTUI_WM_HTTPD *h,
   int n = snprintf(head, sizeof head,
                    "HTTP/1.1 %d %s\r\n%s%s%s"
                    "%s%s%s%sConnection: %s\r\n%s\r\n",
-                   rep->status, ctui_wm_httpd_reason(rep->status),
+                   rep->status, cserve_httpd_reason(rep->status),
                    h->server && *h->server ? "Server: " : "",
                    h->server && *h->server ? h->server : "",
                    h->server && *h->server ? "\r\n" : "", length,
@@ -402,36 +401,36 @@ static int send_reply(CTUI_WM_CONN *c, const CTUI_WM_HTTPD *h,
   if (n < 0 || (size_t)n >= sizeof head) {
     snprintf(err, err_cap, "the reply's head is too long");
     ret = -1;
-  } else if (ctui_wm_conn_write(c, head, (size_t)n, err, err_cap) != 0) {
+  } else if (cserve_conn_write(c, head, (size_t)n, err, err_cap) != 0) {
     ret = -1;
   }
   if (rep->stream) {
-    CTUI_WM_HTTPD_OUT o = {.c = c,
-                           .chunked = chunked,
-                           .drop = !body || head_only,
-                           .failed = ret != 0};
+    CSERVE_HTTPD_OUT o = {.c = c,
+                          .chunked = chunked,
+                          .drop = !body || head_only,
+                          .failed = ret != 0};
     int done = rep->stream(&o, rep->stream_ud);
     if (ret == 0 && (done != 0 || o.failed)) {
       snprintf(err, err_cap, "the streamed body was cut short");
       ret = -1;
     }
     if (ret == 0 && chunked && body && !head_only) {
-      ret = ctui_wm_conn_write(c, "0\r\n\r\n", 5, err, err_cap);
+      ret = cserve_conn_write(c, "0\r\n\r\n", 5, err, err_cap);
     }
     return ret;
   }
   if (ret == 0 && body && rep->len && !head_only) {
-    return ctui_wm_conn_write(c, rep->body, rep->len, err, err_cap);
+    return cserve_conn_write(c, rep->body, rep->len, err, err_cap);
   }
   return ret;
 }
 
-static void refuse_reply(CTUI_WM_CONN *c, const CTUI_WM_HTTPD *h, int status,
+static void refuse_reply(CSERVE_CONN *c, const CSERVE_HTTPD *h, int status,
                          const char *why) {
-  CTUI_WM_HTTPD_REPLY rep = {0};
+  CSERVE_HTTPD_REPLY rep = {0};
   char text[300];
   int n = snprintf(text, sizeof text, "%d %s: %s\n", status,
-                   ctui_wm_httpd_reason(status), why);
+                   cserve_httpd_reason(status), why);
   rep.status = status;
   rep.type = "text/plain; charset=utf-8";
   rep.body = text;
@@ -440,25 +439,25 @@ static void refuse_reply(CTUI_WM_CONN *c, const CTUI_WM_HTTPD *h, int status,
   send_reply(c, h, NULL, &rep, 0, err, sizeof err);
 }
 
-void ctui_wm_httpd_serve(const CTUI_WM_HTTPD *h, CTUI_WM_CONN *c,
-                         const char *peer) {
+void cserve_httpd_serve(const CSERVE_HTTPD *h, CSERVE_CONN *c,
+                        const char *peer) {
   int idle = h->idle_ms > 0 ? h->idle_ms : 10000;
   int timeout = h->timeout_ms > 0 ? h->timeout_ms : 30000;
   long long body_max = h->body_max > 0 ? h->body_max : 1 << 20;
   int max_req = h->max_requests > 0 ? h->max_requests : 100;
-  char *head = malloc(CTUI_WM_HTTPD_HEAD_MAX);
-  CTUI_WM_HTTPD_REQ *r = malloc(sizeof *r);
+  char *head = malloc(CSERVE_HTTPD_HEAD_MAX);
+  CSERVE_HTTPD_REQ *r = malloc(sizeof *r);
   char err[256];
   for (int k = 0; head && r && k < max_req; k++) {
-    ctui_wm_conn_deadline(c, ctui_wm_net_now() + (k ? idle : timeout));
+    cserve_conn_deadline(c, cserve_net_now() + (k ? idle : timeout));
     int status = 0;
     long hl =
-        read_head(c, head, CTUI_WM_HTTPD_HEAD_MAX, &status, err, sizeof err);
+        read_head(c, head, CSERVE_HTTPD_HEAD_MAX, &status, err, sizeof err);
     if (hl == 0) {
       break;
     }
-    ctui_wm_conn_deadline(c, ctui_wm_net_now() + timeout);
-    if (hl < 0 || (status = ctui_wm_httpd_parse(head, r, err, sizeof err))) {
+    cserve_conn_deadline(c, cserve_net_now() + timeout);
+    if (hl < 0 || (status = cserve_httpd_parse(head, r, err, sizeof err))) {
       refuse_reply(c, h, status, err);
       break;
     }
@@ -471,14 +470,14 @@ void ctui_wm_httpd_serve(const CTUI_WM_HTTPD *h, CTUI_WM_CONN *c,
     }
     if (r->length > 0) {
       body = malloc((size_t)r->length + 1);
-      if (!body || ctui_wm_conn_bytes(c, body, (size_t)r->length, err,
-                                      sizeof err) != 0) {
+      if (!body ||
+          cserve_conn_bytes(c, body, (size_t)r->length, err, sizeof err) != 0) {
         free(body);
         break;
       }
       body[r->length] = '\0';
     }
-    CTUI_WM_HTTPD_REPLY rep = {0};
+    CSERVE_HTTPD_REPLY rep = {0};
     h->handler(r, body, &rep, h->ud);
     free(body);
     if (rep.status == 0) {
@@ -486,12 +485,12 @@ void ctui_wm_httpd_serve(const CTUI_WM_HTTPD *h, CTUI_WM_CONN *c,
         free(rep.body);
       }
       if (rep.stream) {
-        CTUI_WM_HTTPD_OUT gone = {.c = c, .failed = 1};
+        CSERVE_HTTPD_OUT gone = {.c = c, .failed = 1};
         rep.stream(&gone, rep.stream_ud);
         rep.stream = NULL;
       }
-      ctui_wm_httpd_text(&rep, 500, "text/plain; charset=utf-8", "no answer\n",
-                         10);
+      cserve_httpd_text(&rep, 500, "text/plain; charset=utf-8", "no answer\n",
+                        10);
     }
     /* HTTP/1.0 has no chunks: a streamed body ends with the connection */
     int keep =
@@ -506,5 +505,5 @@ void ctui_wm_httpd_serve(const CTUI_WM_HTTPD *h, CTUI_WM_CONN *c,
   }
   free(r);
   free(head);
-  ctui_wm_conn_close(c);
+  cserve_conn_close(c);
 }

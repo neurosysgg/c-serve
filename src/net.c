@@ -28,7 +28,7 @@
 #define POOL_IDLE_MS 30000
 
 typedef struct {
-  CTUI_WM_CONN *c;
+  CSERVE_CONN *c;
   int tls;
   char host[256], port[8];
   long since;
@@ -56,10 +56,10 @@ static void pool_drop(int i) {
 }
 
 /* an idle connection to u's host, or NULL; the expired ones closed */
-static CTUI_WM_CONN *pool_take(const CTUI_WM_URL *u) {
-  CTUI_WM_CONN *got = NULL, *old[POOL_MAX];
+static CSERVE_CONN *pool_take(const CSERVE_URL *u) {
+  CSERVE_CONN *got = NULL, *old[POOL_MAX];
   int nold = 0;
-  long now = ctui_wm_net_now();
+  long now = cserve_net_now();
   pthread_mutex_lock(&g_pool_mu);
   pool_own();
   /* the newest first: the likeliest to be open still */
@@ -76,18 +76,18 @@ static CTUI_WM_CONN *pool_take(const CTUI_WM_URL *u) {
   }
   pthread_mutex_unlock(&g_pool_mu);
   for (int i = 0; i < nold; i++) {
-    ctui_wm_conn_close(old[i]);
+    cserve_conn_close(old[i]);
   }
-  if (got && !ctui_wm_conn_idle_ok(got)) {
-    ctui_wm_conn_close(got);
+  if (got && !cserve_conn_idle_ok(got)) {
+    cserve_conn_close(got);
     got = NULL;
   }
   return got;
 }
 
 /* c kept for u's host's next request (the oldest one closed when full) */
-static void pool_put(const CTUI_WM_URL *u, CTUI_WM_CONN *c) {
-  CTUI_WM_CONN *old = NULL;
+static void pool_put(const CSERVE_URL *u, CSERVE_CONN *c) {
+  CSERVE_CONN *old = NULL;
   pthread_mutex_lock(&g_pool_mu);
   pool_own();
   if (g_npool == POOL_MAX) {
@@ -99,13 +99,13 @@ static void pool_put(const CTUI_WM_URL *u, CTUI_WM_CONN *c) {
   e->tls = u->tls;
   snprintf(e->host, sizeof e->host, "%s", u->host);
   snprintf(e->port, sizeof e->port, "%s", u->port);
-  e->since = ctui_wm_net_now();
+  e->since = cserve_net_now();
   pthread_mutex_unlock(&g_pool_mu);
-  ctui_wm_conn_close(old);
+  cserve_conn_close(old);
 }
 
-void ctui_wm_net_idle_close(void) {
-  CTUI_WM_CONN *all[POOL_MAX];
+void cserve_net_idle_close(void) {
+  CSERVE_CONN *all[POOL_MAX];
   pthread_mutex_lock(&g_pool_mu);
   pool_own();
   int n = g_npool;
@@ -115,11 +115,11 @@ void ctui_wm_net_idle_close(void) {
   g_npool = 0;
   pthread_mutex_unlock(&g_pool_mu);
   for (int i = 0; i < n; i++) {
-    ctui_wm_conn_close(all[i]);
+    cserve_conn_close(all[i]);
   }
 }
 
-int ctui_wm_net_idle_count(void) {
+int cserve_net_idle_count(void) {
   pthread_mutex_lock(&g_pool_mu);
   pool_own();
   int n = g_npool;
@@ -131,20 +131,20 @@ int ctui_wm_net_idle_count(void) {
 
 /* one exchange's reply, as the decoder hands it over */
 typedef struct {
-  CTUI_WM_HTTP_DEC d;
-  const CTUI_WM_HTTP_REQ *req;
-  const CTUI_WM_HTTP_SINK *sink; /* NULL: the body gathered */
-  CTUI_WM_HTTP_REPLY *rep;       /* the sink's, filled at the head */
-  char *body;                    /* gathered: malloc'd */
+  CSERVE_HTTP_DEC d;
+  const CSERVE_HTTP_REQ *req;
+  const CSERVE_HTTP_SINK *sink; /* NULL: the body gathered */
+  CSERVE_HTTP_REPLY *rep;       /* the sink's, filled at the head */
+  char *body;                   /* gathered: malloc'd */
   size_t len, cap, max;
   size_t total; /* the Content-Length, for req->progress; 0: not said */
   size_t raw;   /* the body's bytes as they came (before decoding) */
   int over, oom;
-  int coded;                   /* gzip/deflate were offered */
-  CTUI_WM_HTTP_CODING *coding; /* and one came: undone into body */
-  char cerr[128];              /* why the coding was refused */
-  char *hdr;                   /* the head's header lines (malloc'd), for rep */
-  const char *url;             /* where a redirect led, NULL: the first URL */
+  int coded;                  /* gzip/deflate were offered */
+  CSERVE_HTTP_CODING *coding; /* and one came: undone into body */
+  char cerr[128];             /* why the coding was refused */
+  char *hdr;                  /* the head's header lines (malloc'd), for rep */
+  const char *url;            /* where a redirect led, NULL: the first URL */
   int redirect;
   int again; /* the redirect a POST's 307 / 308: sent again as it was */
   char loc[4096 + 256 + 16];
@@ -168,12 +168,12 @@ static size_t strip(char *h, size_t n) {
   return w;
 }
 
-static int ex_head(CTUI_WM_HTTP_DEC *d) {
+static int ex_head(CSERVE_HTTP_DEC *d) {
   EX *ex = d->ctx;
   const char *method = ex->req->method ? ex->req->method : "GET";
-  CTUI_WM_HTTP_PARSED p = {.status = d->status,
-                           .headers = d->headers,
-                           .headers_len = d->headers_len};
+  CSERVE_HTTP_PARSED p = {.status = d->status,
+                          .headers = d->headers,
+                          .headers_len = d->headers_len};
   if (ex->req->replied) {
     ex->req->replied(ex->req->cookie_ctx, ex->url ? ex->url : ex->req->url,
                      d->headers, d->headers_len);
@@ -184,7 +184,7 @@ static int ex_head(CTUI_WM_HTTP_DEC *d) {
       moved = p.status == 301 || p.status == 302 || p.status == 303,
       again = p.status == 307 || p.status == 308;
   if ((get || post) && (moved || again) &&
-      ctui_wm_http_header(&p, "Location", ex->loc, sizeof ex->loc)) {
+      cserve_http_header(&p, "Location", ex->loc, sizeof ex->loc)) {
     ex->again = post && again;
     /* its body read and dropped, so the connection can go on */
     ex->redirect = 1;
@@ -198,9 +198,8 @@ static int ex_head(CTUI_WM_HTTP_DEC *d) {
   memcpy(ex->hdr, d->headers, d->headers_len);
   ex->hdr[d->headers_len] = '\0';
   char ce[128];
-  if (ex->coded && ctui_wm_http_header(&p, "Content-Encoding", ce, sizeof ce)) {
-    int r =
-        ctui_wm_http_coding_open(ce, &ex->coding, ex->cerr, sizeof ex->cerr);
+  if (ex->coded && cserve_http_header(&p, "Content-Encoding", ce, sizeof ce)) {
+    int r = cserve_http_coding_open(ce, &ex->coding, ex->cerr, sizeof ex->cerr);
     if (r < 0) {
       return 1;
     }
@@ -213,7 +212,7 @@ static int ex_head(CTUI_WM_HTTP_DEC *d) {
   if (!ex->sink) {
     char v[32];
     if (ex->req->progress &&
-        ctui_wm_http_header(&p, "Content-Length", v, sizeof v)) {
+        cserve_http_header(&p, "Content-Length", v, sizeof v)) {
       ex->total = (size_t)strtoull(v, NULL, 10);
     }
     return 0;
@@ -263,7 +262,7 @@ static int gather(void *ctx, const char *buf, size_t n) {
   return 0;
 }
 
-static int ex_body(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n) {
+static int ex_body(CSERVE_HTTP_DEC *d, const char *buf, size_t n) {
   EX *ex = d->ctx;
   ex->raw += n;
   if (ex->redirect) {
@@ -272,8 +271,8 @@ static int ex_body(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n) {
   if (ex->sink) {
     return ex->sink->body(ex->sink->ctx, buf, n);
   }
-  int r = ex->coding ? ctui_wm_http_coding_feed(ex->coding, buf, n, gather, ex,
-                                                ex->cerr, sizeof ex->cerr)
+  int r = ex->coding ? cserve_http_coding_feed(ex->coding, buf, n, gather, ex,
+                                               ex->cerr, sizeof ex->cerr)
                      : gather(ex, buf, n);
   if (r == 0 && ex->req->progress) {
     ex->req->progress(ex->req->progress_ctx, ex->raw, ex->total);
@@ -284,10 +283,10 @@ static int ex_body(CTUI_WM_HTTP_DEC *d, const char *buf, size_t n) {
 /* req sent on c, the reply fed to ex's decoder until it's complete,
  * stopped or the server closes; *keep: c can take the next request. A
  * sink's body waits at most idle_ms for each read once the head is in. */
-static int talk(EX *ex, CTUI_WM_CONN *c, const char *req, size_t req_len,
+static int talk(EX *ex, CSERVE_CONN *c, const char *req, size_t req_len,
                 int idle_ms, int *keep, char *err, size_t err_cap) {
   *keep = 0;
-  if (ctui_wm_conn_write(c, req, req_len, err, err_cap) != 0) {
+  if (cserve_conn_write(c, req, req_len, err, err_cap) != 0) {
     return -1;
   }
   char buf[16384];
@@ -295,47 +294,47 @@ static int talk(EX *ex, CTUI_WM_CONN *c, const char *req, size_t req_len,
   int rc;
   for (;;) {
     if (ex->sink && ex->rep->body) {
-      ctui_wm_conn_deadline(c, ctui_wm_net_now() + idle_ms);
+      cserve_conn_deadline(c, cserve_net_now() + idle_ms);
     }
-    ssize_t r = ctui_wm_conn_read(c, buf, sizeof buf, err, err_cap);
+    ssize_t r = cserve_conn_read(c, buf, sizeof buf, err, err_cap);
     if (r < 0) {
       return -1;
     }
     if (r == 0) {
-      rc = ctui_wm_http_dec_end(&ex->d, err, err_cap);
+      rc = cserve_http_dec_end(&ex->d, err, err_cap);
       break;
     }
     given += (size_t)r;
-    rc = ctui_wm_http_dec_feed(&ex->d, buf, (size_t)r, err, err_cap);
+    rc = cserve_http_dec_feed(&ex->d, buf, (size_t)r, err, err_cap);
     if (rc != 0) {
       rc = rc < 0 ? -1 : 0;
       break;
     }
   }
   /* nothing after the reply (the next one would start inside it) */
-  *keep = rc == 0 && ctui_wm_http_dec_reusable(&ex->d) && given == ex->d.fed &&
-          !ctui_wm_conn_pending(c);
+  *keep = rc == 0 && cserve_http_dec_reusable(&ex->d) && given == ex->d.fed &&
+          !cserve_conn_pending(c);
   return rc;
 }
 
 /* one exchange with u, on a kept connection if reuse and there is one
  * (once more on a new one if that turns out closed), else a new one */
-static int exchange(EX *ex, const CTUI_WM_URL *u, int reuse, const char *req,
+static int exchange(EX *ex, const CSERVE_URL *u, int reuse, const char *req,
                     size_t req_len, long deadline, int idle_ms, char *err,
                     size_t err_cap) {
-  CTUI_WM_CONN *c = reuse ? pool_take(u) : NULL;
+  CSERVE_CONN *c = reuse ? pool_take(u) : NULL;
   int keep = 0, rc = -1;
   if (c) {
-    ctui_wm_conn_deadline(c, deadline);
+    cserve_conn_deadline(c, deadline);
     rc = talk(ex, c, req, req_len, idle_ms, &keep, err, err_cap);
     if (rc != 0 && ex->d.fed == 0) {
       /* the server had closed it meanwhile: nothing came */
-      ctui_wm_conn_close(c);
+      cserve_conn_close(c);
       c = NULL;
     }
   }
   if (!c) {
-    c = ctui_wm_conn_open(u, deadline, err, err_cap);
+    c = cserve_conn_open(u, deadline, err, err_cap);
     if (!c) {
       return -1;
     }
@@ -351,27 +350,27 @@ static int exchange(EX *ex, const CTUI_WM_URL *u, int reuse, const char *req,
     snprintf(err, err_cap, "%s", ex->cerr);
     rc = -1;
   } else if (rc == 0 && ex->coding && !ex->d.stopped &&
-             ctui_wm_http_coding_end(ex->coding, err, err_cap) != 0) {
+             cserve_http_coding_end(ex->coding, err, err_cap) != 0) {
     rc = -1;
   }
   if (rc == 0 && keep) {
     pool_put(u, c);
   } else {
-    ctui_wm_conn_close(c);
+    cserve_conn_close(c);
   }
   return rc;
 }
 
 static void ex_free(EX *ex) {
-  ctui_wm_http_dec_free(&ex->d);
-  ctui_wm_http_coding_free(ex->coding);
+  cserve_http_dec_free(&ex->d);
+  cserve_http_coding_free(ex->coding);
   free(ex->body);
   free(ex->hdr);
 }
 
 /* h's headers: req's, with a Cookie line when req->cookie gives one for
  * url (malloc'd: cookies_free() gives back what to free). 0, or -1 */
-static int cookies(CTUI_WM_HTTP_REQ *h, const CTUI_WM_HTTP_REQ *req,
+static int cookies(CSERVE_HTTP_REQ *h, const CSERVE_HTTP_REQ *req,
                    const char *url) {
   h->headers = req->headers;
   if (!req->cookie) {
@@ -404,39 +403,39 @@ static int cookies(CTUI_WM_HTTP_REQ *h, const CTUI_WM_HTTP_REQ *req,
 }
 
 /* what cookies() allocated for h, if anything (h's headers back to req's) */
-static void *cookies_free(CTUI_WM_HTTP_REQ *h, const CTUI_WM_HTTP_REQ *req) {
+static void *cookies_free(CSERVE_HTTP_REQ *h, const CSERVE_HTTP_REQ *req) {
   void *p = h->headers != req->headers ? (void *)h->headers : NULL;
   h->headers = req->headers;
   return p;
 }
 
 /* req, redirects followed: the body gathered into rep, or handed to sink */
-static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
-                   CTUI_WM_HTTP_REPLY *rep, char *err, size_t err_cap) {
+static int request(const CSERVE_HTTP_REQ *req, const CSERVE_HTTP_SINK *sink,
+                   CSERVE_HTTP_REPLY *rep, char *err, size_t err_cap) {
   memset(rep, 0, sizeof *rep);
   int timeout = req->timeout_ms > 0 ? req->timeout_ms : NET_TIMEOUT_MS;
-  long deadline = ctui_wm_net_now() + timeout;
-  CTUI_WM_URL u;
-  if (ctui_wm_url_parse(req->url, &u, err, err_cap) != 0) {
+  long deadline = cserve_net_now() + timeout;
+  CSERVE_URL u;
+  if (cserve_url_parse(req->url, &u, err, err_cap) != 0) {
     return -1;
   }
   char url[sizeof u.path + sizeof u.host + 32];
   /* this hop's request: req, a GET of it after a POST's redirect, with
    * its cookies */
-  CTUI_WM_HTTP_REQ hreq = *req;
+  CSERVE_HTTP_REQ hreq = *req;
   for (int hop = 0;; hop++) {
-    if (hop > 0 && ctui_wm_url_format(&u, url, sizeof url) != 0) {
+    if (hop > 0 && cserve_url_format(&u, url, sizeof url) != 0) {
       snprintf(err, err_cap, "the redirect is too long");
       return -1;
     }
     /* a gathered body may come compressed (undone here), unless the
      * caller says what it takes; a stream comes as it is (a download
      * resumed by Range, its progress by Content-Length) */
-    int coded = !sink && !ctui_wm_http_req_has(req, "Accept-Encoding");
+    int coded = !sink && !cserve_http_req_has(req, "Accept-Encoding");
     char *out = NULL;
     size_t out_len = 0;
     if (cookies(&hreq, req, hop > 0 ? url : req->url) != 0 ||
-        ctui_wm_http_format(&hreq, &u, coded, &out, &out_len) != 0) {
+        cserve_http_format(&hreq, &u, coded, &out, &out_len) != 0) {
       free(cookies_free(&hreq, req));
       snprintf(err, err_cap, "a header with a line break, or out of memory");
       return -1;
@@ -448,7 +447,7 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
              .max = req->max ? req->max : NET_MAX,
              .url = hop > 0 ? url : NULL,
              .coded = coded};
-    ctui_wm_http_dec_init(&ex.d);
+    cserve_http_dec_init(&ex.d);
     ex.d.on_head = ex_head;
     ex.d.on_body = ex_body;
     ex.d.ctx = &ex;
@@ -502,8 +501,8 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
       snprintf(err, err_cap, "more than %d redirects", NET_REDIRECTS);
       return -1;
     }
-    CTUI_WM_URL next;
-    if (ctui_wm_url_resolve(&u, loc, &next, err, err_cap) != 0) {
+    CSERVE_URL next;
+    if (cserve_url_resolve(&u, loc, &next, err, err_cap) != 0) {
       return -1;
     }
     if (ex_again && u.tls && !next.tls) {
@@ -513,13 +512,13 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
     }
     if (req->hop) {
       char said[sizeof url];
-      if (ctui_wm_url_format(&next, url, sizeof url) != 0) {
+      if (cserve_url_format(&next, url, sizeof url) != 0) {
         snprintf(err, err_cap, "the redirect is too long");
         return -1;
       }
       said[0] = '\0';
       if (req->hop(req->hop_ctx, url, said, sizeof said, err, err_cap) != 0 ||
-          (said[0] && ctui_wm_url_parse(said, &next, err, err_cap) != 0)) {
+          (said[0] && cserve_url_parse(said, &next, err, err_cap) != 0)) {
         return -1;
       }
     }
@@ -534,14 +533,13 @@ static int request(const CTUI_WM_HTTP_REQ *req, const CTUI_WM_HTTP_SINK *sink,
   }
 }
 
-int ctui_wm_net_http(const CTUI_WM_HTTP_REQ *req, CTUI_WM_HTTP_REPLY *rep,
-                     char *err, size_t err_cap) {
+int cserve_net_http(const CSERVE_HTTP_REQ *req, CSERVE_HTTP_REPLY *rep,
+                    char *err, size_t err_cap) {
   return request(req, NULL, rep, err, err_cap);
 }
 
-int ctui_wm_net_http_stream(const CTUI_WM_HTTP_REQ *req,
-                            const CTUI_WM_HTTP_SINK *sink,
-                            CTUI_WM_HTTP_REPLY *rep, char *err,
-                            size_t err_cap) {
+int cserve_net_http_stream(const CSERVE_HTTP_REQ *req,
+                           const CSERVE_HTTP_SINK *sink, CSERVE_HTTP_REPLY *rep,
+                           char *err, size_t err_cap) {
   return request(req, sink, rep, err, err_cap);
 }

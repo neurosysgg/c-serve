@@ -17,25 +17,25 @@
 #include <time.h>
 #include <unistd.h>
 
-struct CTUI_WM_CONN {
+struct CSERVE_CONN {
   int fd;
   long deadline;
-  CTUI_WM_TLS *tls; /* NULL: plain */
+  CSERVE_TLS *tls; /* NULL: plain */
   /* what line() read past its line: in[off, len) */
   char *in;
   size_t off, len, cap;
 };
 
-long ctui_wm_net_now(void) {
+long cserve_net_now(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-int ctui_wm_net_wait(int fd, short events, long deadline, char *err,
-                     size_t err_cap) {
+int cserve_net_wait(int fd, short events, long deadline, char *err,
+                    size_t err_cap) {
   for (;;) {
-    long left = deadline - ctui_wm_net_now();
+    long left = deadline - cserve_net_now();
     if (left <= 0) {
       snprintf(err, err_cap, "timed out");
       return -1;
@@ -68,7 +68,7 @@ static int connect_one(const struct addrinfo *ai, long deadline, char *err,
       close(fd);
       return -1;
     }
-    if (ctui_wm_net_wait(fd, POLLOUT, deadline, err, err_cap) != 0) {
+    if (cserve_net_wait(fd, POLLOUT, deadline, err, err_cap) != 0) {
       close(fd);
       return -1;
     }
@@ -84,8 +84,8 @@ static int connect_one(const struct addrinfo *ai, long deadline, char *err,
   return fd;
 }
 
-CTUI_WM_CONN *ctui_wm_conn_open(const CTUI_WM_URL *u, long deadline, char *err,
-                                size_t err_cap) {
+CSERVE_CONN *cserve_conn_open(const CSERVE_URL *u, long deadline, char *err,
+                              size_t err_cap) {
   struct addrinfo hints = {.ai_family = AF_UNSPEC,
                            .ai_socktype = SOCK_STREAM,
                            .ai_flags = AI_ADDRCONFIG};
@@ -104,7 +104,7 @@ CTUI_WM_CONN *ctui_wm_conn_open(const CTUI_WM_URL *u, long deadline, char *err,
   if (fd < 0) {
     return NULL;
   }
-  CTUI_WM_CONN *c = calloc(1, sizeof *c);
+  CSERVE_CONN *c = calloc(1, sizeof *c);
   if (!c) {
     snprintf(err, err_cap, "out of memory");
     close(fd);
@@ -113,7 +113,7 @@ CTUI_WM_CONN *ctui_wm_conn_open(const CTUI_WM_URL *u, long deadline, char *err,
   c->fd = fd;
   c->deadline = deadline;
   if (u->tls) {
-    c->tls = ctui_wm_tls_open(fd, u->host, deadline, err, err_cap);
+    c->tls = cserve_tls_open(fd, u->host, deadline, err, err_cap);
     if (!c->tls) {
       close(fd);
       free(c);
@@ -123,15 +123,15 @@ CTUI_WM_CONN *ctui_wm_conn_open(const CTUI_WM_URL *u, long deadline, char *err,
   return c;
 }
 
-int ctui_wm_conn_write(CTUI_WM_CONN *c, const char *buf, size_t n, char *err,
-                       size_t err_cap) {
+int cserve_conn_write(CSERVE_CONN *c, const char *buf, size_t n, char *err,
+                      size_t err_cap) {
   if (c->tls) {
-    return ctui_wm_tls_write(c->tls, buf, n, c->deadline, err, err_cap);
+    return cserve_tls_write(c->tls, buf, n, c->deadline, err, err_cap);
   }
   while (n > 0) {
     ssize_t w = send(c->fd, buf, n, MSG_NOSIGNAL);
     if (w < 0 && (errno == EAGAIN || errno == EINTR)) {
-      if (ctui_wm_net_wait(c->fd, POLLOUT, c->deadline, err, err_cap) != 0) {
+      if (cserve_net_wait(c->fd, POLLOUT, c->deadline, err, err_cap) != 0) {
         return -1;
       }
       continue;
@@ -147,10 +147,10 @@ int ctui_wm_conn_write(CTUI_WM_CONN *c, const char *buf, size_t n, char *err,
 }
 
 /* the socket (or TLS) straight, past the buffer */
-static ssize_t raw_read(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
+static ssize_t raw_read(CSERVE_CONN *c, char *buf, size_t n, char *err,
                         size_t err_cap) {
   if (c->tls) {
-    return ctui_wm_tls_read(c->tls, buf, n, c->deadline, err, err_cap);
+    return cserve_tls_read(c->tls, buf, n, c->deadline, err, err_cap);
   }
   for (;;) {
     ssize_t r = recv(c->fd, buf, n, 0);
@@ -161,14 +161,14 @@ static ssize_t raw_read(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
       snprintf(err, err_cap, "receiving: %s", strerror(errno));
       return -1;
     }
-    if (ctui_wm_net_wait(c->fd, POLLIN, c->deadline, err, err_cap) != 0) {
+    if (cserve_net_wait(c->fd, POLLIN, c->deadline, err, err_cap) != 0) {
       return -1;
     }
   }
 }
 
-ssize_t ctui_wm_conn_read(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
-                          size_t err_cap) {
+ssize_t cserve_conn_read(CSERVE_CONN *c, char *buf, size_t n, char *err,
+                         size_t err_cap) {
   if (c->off < c->len) {
     size_t k = c->len - c->off < n ? c->len - c->off : n;
     memcpy(buf, c->in + c->off, k);
@@ -178,23 +178,23 @@ ssize_t ctui_wm_conn_read(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
   return raw_read(c, buf, n, err, err_cap);
 }
 
-void ctui_wm_conn_close(CTUI_WM_CONN *c) {
+void cserve_conn_close(CSERVE_CONN *c) {
   if (!c) {
     return;
   }
   if (c->tls) {
-    ctui_wm_tls_close(c->tls);
+    cserve_tls_close(c->tls);
   }
   close(c->fd);
   free(c->in);
   free(c);
 }
 
-void ctui_wm_conn_deadline(CTUI_WM_CONN *c, long deadline) {
+void cserve_conn_deadline(CSERVE_CONN *c, long deadline) {
   c->deadline = deadline;
 }
 
-void ctui_wm_conn_keepalive(CTUI_WM_CONN *c, int idle_s) {
+void cserve_conn_keepalive(CSERVE_CONN *c, int idle_s) {
   int on = 1, intvl = 30, cnt = 4;
   setsockopt(c->fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);
   setsockopt(c->fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_s, sizeof idle_s);
@@ -202,8 +202,8 @@ void ctui_wm_conn_keepalive(CTUI_WM_CONN *c, int idle_s) {
   setsockopt(c->fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
 }
 
-int ctui_wm_conn_starttls(CTUI_WM_CONN *c, const char *host, char *err,
-                          size_t err_cap) {
+int cserve_conn_starttls(CSERVE_CONN *c, const char *host, char *err,
+                         size_t err_cap) {
   if (c->tls) {
     snprintf(err, err_cap, "TLS already");
     return -1;
@@ -214,12 +214,12 @@ int ctui_wm_conn_starttls(CTUI_WM_CONN *c, const char *host, char *err,
     snprintf(err, err_cap, "the server sent more before TLS started");
     return -1;
   }
-  c->tls = ctui_wm_tls_open(c->fd, host, c->deadline, err, err_cap);
+  c->tls = cserve_tls_open(c->fd, host, c->deadline, err, err_cap);
   return c->tls ? 0 : -1;
 }
 
-CTUI_WM_CONN *ctui_wm_conn_adopt(int fd, long deadline) {
-  CTUI_WM_CONN *c = calloc(1, sizeof *c);
+CSERVE_CONN *cserve_conn_adopt(int fd, long deadline) {
+  CSERVE_CONN *c = calloc(1, sizeof *c);
   if (!c) {
     close(fd);
     return NULL;
@@ -229,8 +229,8 @@ CTUI_WM_CONN *ctui_wm_conn_adopt(int fd, long deadline) {
   return c;
 }
 
-int ctui_wm_conn_accept_tls(CTUI_WM_CONN *c, CTUI_WM_TLS_SERVER *srv, char *err,
-                            size_t err_cap) {
+int cserve_conn_accept_tls(CSERVE_CONN *c, CSERVE_TLS_SERVER *srv, char *err,
+                           size_t err_cap) {
   if (c->tls) {
     snprintf(err, err_cap, "TLS already");
     return -1;
@@ -241,14 +241,14 @@ int ctui_wm_conn_accept_tls(CTUI_WM_CONN *c, CTUI_WM_TLS_SERVER *srv, char *err,
     snprintf(err, err_cap, "the client sent more before TLS started");
     return -1;
   }
-  c->tls = ctui_wm_tls_accept(c->fd, srv, c->deadline, err, err_cap);
+  c->tls = cserve_tls_accept(c->fd, srv, c->deadline, err, err_cap);
   return c->tls ? 0 : -1;
 }
 
-int ctui_wm_conn_tls(const CTUI_WM_CONN *c) { return c->tls != NULL; }
+int cserve_conn_tls(const CSERVE_CONN *c) { return c->tls != NULL; }
 
-int ctui_wm_conn_peer_cert(const CTUI_WM_CONN *c, char *cn, size_t cn_cap,
-                           char fpr[65]) {
+int cserve_conn_peer_cert(const CSERVE_CONN *c, char *cn, size_t cn_cap,
+                          char fpr[65]) {
   if (!c->tls) {
     if (cn_cap) {
       cn[0] = '\0';
@@ -256,12 +256,12 @@ int ctui_wm_conn_peer_cert(const CTUI_WM_CONN *c, char *cn, size_t cn_cap,
     fpr[0] = '\0';
     return -1;
   }
-  return ctui_wm_tls_peer(c->tls, cn, cn_cap, fpr);
+  return cserve_tls_peer(c->tls, cn, cn_cap, fpr);
 }
 
-int ctui_wm_conn_fd(const CTUI_WM_CONN *c) { return c->fd; }
+int cserve_conn_fd(const CSERVE_CONN *c) { return c->fd; }
 
-int ctui_wm_conn_idle_ok(const CTUI_WM_CONN *c) {
+int cserve_conn_idle_ok(const CSERVE_CONN *c) {
   if (c->off < c->len) {
     return 0;
   }
@@ -275,12 +275,12 @@ int ctui_wm_conn_idle_ok(const CTUI_WM_CONN *c) {
   return !(pfd.revents & POLLIN) || c->tls != NULL;
 }
 
-int ctui_wm_conn_pending(const CTUI_WM_CONN *c) {
-  return c->off < c->len || (c->tls && ctui_wm_tls_pending(c->tls) > 0);
+int cserve_conn_pending(const CSERVE_CONN *c) {
+  return c->off < c->len || (c->tls && cserve_tls_pending(c->tls) > 0);
 }
 
-ssize_t ctui_wm_conn_line(CTUI_WM_CONN *c, const char **line, size_t max,
-                          char *err, size_t err_cap) {
+ssize_t cserve_conn_line(CSERVE_CONN *c, const char **line, size_t max,
+                         char *err, size_t err_cap) {
   /* the last line handed out is used up: keep only what follows it */
   if (c->off > 0) {
     memmove(c->in, c->in + c->off, c->len - c->off);
@@ -330,10 +330,10 @@ ssize_t ctui_wm_conn_line(CTUI_WM_CONN *c, const char **line, size_t max,
   }
 }
 
-int ctui_wm_conn_bytes(CTUI_WM_CONN *c, char *buf, size_t n, char *err,
-                       size_t err_cap) {
+int cserve_conn_bytes(CSERVE_CONN *c, char *buf, size_t n, char *err,
+                      size_t err_cap) {
   while (n > 0) {
-    ssize_t r = ctui_wm_conn_read(c, buf, n, err, err_cap);
+    ssize_t r = cserve_conn_read(c, buf, n, err, err_cap);
     if (r < 0) {
       return -1;
     }
