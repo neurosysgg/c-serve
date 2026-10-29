@@ -45,11 +45,25 @@ def http():
                                          mtime=0),
             b"\x04\x06" + zlib.compress(b"{\"a\": [1, 2, 3]}" * 20),
             b"\x04\x0a" + zlib.compress(b"body { color: red }" * 30)[2:-4],
+            # a CGI's reply head (php-cgi's, ctui-remote's)
+            b"\x05Content-type: text/html; charset=UTF-8\r\n"
+            b"Set-Cookie: s=1; HttpOnly\r\nX-Powered-By: PHP\r\n\r\n<p>",
+            b"\x05Status: 404 Not Found\nLocation: /x\nConnection: "
+            b"close\nContent-Length: 3\n\nabc",
+            b"\x05Location: /there\r\n\n",
             # CA bundles' PEM: the test CA, padding, a broken block
             b"\x06" + ca,
             b"\x06x\n-----BEGIN CERTIFICATE-----\r\nAQ  \r\nI=\r\n-----END "
             b"CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nAQ=D\n"
-            b"-----END CERTIFICATE-----\n"]
+            b"-----END CERTIFICATE-----\n",
+            # paths routed: a method byte, then the path
+            b"\x07\x00/assets/js/v-0123abcd/main.js",
+            b"\x07\x00/a.css",
+            b"\x07\x02/releases/ill/flac",
+            b"\x07\x03/assets/js/v-00000000/../../index.php",
+            b"\x07\x00//sub//page.html",
+            b"\x07\x04/x/y/z/rest/of/it",
+            b"\x07\x00/releases/.user.ini"]
 
 
 def main():

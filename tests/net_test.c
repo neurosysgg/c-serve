@@ -1374,6 +1374,14 @@ static void test_streamed(int port) {
   char *end = strstr(got, "\r\n\r\n");
   CSERVE_TEST_ASSERT(end && end[4] == '\0' && strstr(got, "200 OK"),
                      "HEAD: the head only");
+  long t0 = cserve_net_now();
+  raw_exchange(port, "HEAD /stream HTTP/1.1\r\nHost: x\r\n\r\n", got,
+               sizeof got);
+  CSERVE_TEST_ASSERT(
+      !strstr(got, "Transfer-Encoding") && !strstr(got, "Content-Length") &&
+          strstr(got, "Connection: close\r\n") && cserve_net_now() - t0 < 2000,
+      "HEAD kept-alive: no framing, closed at once (curl -X "
+      "HEAD reads it as a GET's)");
 }
 
 /* the server asking for a client certificate from its CA: the phone's

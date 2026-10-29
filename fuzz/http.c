@@ -7,16 +7,27 @@
  * a request's head as the server side takes it (httpd.c); 4 = a body
  * under a Content-Encoding (the next byte: its low bit gzip or deflate,
  * the rest seeds the pieces' sizes), which must decode in pieces as it
- * does whole (coding.c); 5 = nothing here (ctui-wm's tools/fuzz/http.c
- * keeps it: ctui-remote's CGI head), so a corpus stays good in both; 6 =
- * a CA bundle's PEM (src/tls.c): every block it takes must be
- * what mbedtls's own base64 decoder makes of it. */
+ * does whole (coding.c); 5 = a CGI's reply head (cgi.c), whole and fed
+ * a byte more at a time; 6 = a CA bundle's PEM (src/tls.c): every block
+ * it takes must be what mbedtls's own base64 decoder makes of it; 7 = a
+ * request's path routed (static.c, in both climb modes, against a small
+ * root of its own; route.c, against a fixed table): a file is always
+ * inside the root, a capture never a dot-segment or more than one. Any
+ * other first byte: as 3. */
 #include "fuzz.h"
 
+#include "cgi.h"
 #include "coding.h"
 #include "http.h"
 #include "httpd.h"
+#include "route.h"
+#include "static.h"
 #include "tls.h"
+
+#include <limits.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <mbedtls/base64.h>
 
@@ -241,6 +252,147 @@ static void pem(const uint8_t *data, size_t size) {
   free(ref);
 }
 
+static void cgi_head(const uint8_t *data, size_t size) {
+  char *buf = malloc(size ? size : 1);
+  memcpy(buf, data, size);
+  CSERVE_HTTPD_REPLY rep;
+  char type[256], err[160];
+  memset(&rep, 0, sizeof rep);
+  long whole =
+      cserve_cgi_head(buf, size, &rep, type, sizeof type, err, sizeof err);
+  if (whole > 0) {
+    FUZZ_CHECK((size_t)whole <= size, "the body starts past the end (%ld)",
+               whole);
+    FUZZ_CHECK(rep.status >= 200 && rep.status <= 599, "status %d", rep.status);
+    FUZZ_CHECK(!strpbrk(type, "\r\n") &&
+                   strlen(rep.headers) < sizeof rep.headers,
+               "a line break in the type, or headers overrun");
+    /* every header line well formed: no bare CR or LF inside */
+    for (const char *p = rep.headers; *p;) {
+      const char *e = strstr(p, "\r\n");
+      FUZZ_CHECK(e && !memchr(p, '\n', (size_t)(e - p)) &&
+                     !memchr(p, '\r', (size_t)(e - p)),
+                 "a header line that isn't one");
+      if (!e) {
+        break;
+      }
+      p = e + 2;
+    }
+  } else if (whole < 0) {
+    FUZZ_CHECK(err[0], "a refused head without why");
+  }
+  /* as it comes in: not whole until the length it's whole at */
+  for (size_t n = 0; whole > 0 && n < (size_t)whole && n < 512; n++) {
+    long r = cserve_cgi_head(buf, n, &rep, type, sizeof type, err, sizeof err);
+    FUZZ_CHECK(r <= 0, "whole at %zu of %ld", n, whole);
+  }
+  free(buf);
+}
+
+static char g_paths_root[PATH_MAX];
+
+static void paths_gone(void) {
+  char rm[PATH_MAX + 16];
+  snprintf(rm, sizeof rm, "rm -rf '%s'", g_paths_root);
+  (void)!system(rm);
+}
+
+/* the root mode 7 routes into (gone at exit): a file, a stamped asset's,
+ * a directory */
+static const char *paths_root(void) {
+  char *root = g_paths_root;
+  if (!root[0]) {
+    char dir[] = "/tmp/cserve-fuzz-XXXXXX";
+    if (!mkdtemp(dir)) {
+      abort();
+    }
+    char p[PATH_MAX];
+    const char *dirs[] = {"assets", "assets/js", "sub"};
+    for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++) {
+      snprintf(p, sizeof p, "%s/%s", dir, dirs[i]);
+      mkdir(p, 0700);
+    }
+    const char *files[] = {"a.css", "assets/js/main.js", "sub/page.html",
+                           "index.php", ".user.ini"};
+    for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
+      snprintf(p, sizeof p, "%s/%s", dir, files[i]);
+      FILE *f = fopen(p, "w");
+      if (f) {
+        fclose(f);
+      }
+    }
+    if (!realpath(dir, root)) {
+      abort();
+    }
+    atexit(paths_gone);
+  }
+  return root;
+}
+
+static void on_any(const CSERVE_HTTPD_REQ *r, const char *body,
+                   const CSERVE_ROUTE_MATCH *m, CSERVE_HTTPD_REPLY *rep) {
+  (void)r;
+  (void)body;
+  for (int i = 0; i < m->n; i++) {
+    const char *v = m->p[i].value;
+    if (strcmp(m->p[i].name, "*") == 0) {
+      /* the rest: no segment of it dotted */
+      for (const char *q = v; *q; q++) {
+        FUZZ_CHECK(!(*q == '.' && (q == v || q[-1] == '/')),
+                   "a dot-segment in the rest: %s", v);
+      }
+    } else {
+      FUZZ_CHECK(*v && *v != '.' && !strchr(v, '/'),
+                 "a capture that isn't one segment: %s", v);
+    }
+  }
+  rep->status = 200;
+}
+
+static const CSERVE_ROUTE FUZZ_ROUTES[] = {
+    {CSERVE_GET, "/", on_any},
+    {CSERVE_GET, "/releases/{slug}", on_any},
+    {CSERVE_GET | CSERVE_POST, "/releases/{slug}/{format}", on_any},
+    {CSERVE_DELETE, "/releases/{slug}/{format}", on_any},
+    {CSERVE_GET, "/assets/*", on_any},
+    {CSERVE_GET, "/{a}/{b}/{c}/*", on_any},
+};
+
+static void paths(const uint8_t *data, size_t size) {
+  if (size == 0) {
+    return;
+  }
+  /* the first byte: the method; the rest the path (as httpd decoded it) */
+  static const char *const METHOD[] = {"GET", "HEAD", "POST", "DELETE", "BREW"};
+  CSERVE_HTTPD_REQ r;
+  memset(&r, 0, sizeof r);
+  snprintf(r.method, sizeof r.method, "%s", METHOD[data[0] % 5]);
+  size_t n = size - 1 < sizeof r.path - 1 ? size - 1 : sizeof r.path - 1;
+  memcpy(r.path, data + 1, n);
+  r.path[n] = '\0';
+  const char *root = paths_root();
+  size_t rl = strlen(root);
+  for (int front = 0; front < 2; front++) {
+    CSERVE_STATIC s = {.root = root, .climb_front = front};
+    CSERVE_STATIC_ROUTE rt;
+    cserve_static_route(&s, r.path, &rt);
+    FUZZ_CHECK(rt.kind != CSERVE_STATIC_FILE ||
+                   (!strncmp(rt.file, root, rl) && rt.file[rl] == '/'),
+               "a file outside the root: %s", rt.file);
+    FUZZ_CHECK(rt.kind == CSERVE_STATIC_FILE || !rt.immutable,
+               "immutable but not a file");
+  }
+  CSERVE_HTTPD_REPLY rep = {0};
+  int answered = cserve_route_dispatch(
+      FUZZ_ROUTES, (int)(sizeof FUZZ_ROUTES / sizeof *FUZZ_ROUTES), &r, NULL,
+      &rep);
+  FUZZ_CHECK(!answered || rep.status == 200 || rep.status == 405,
+             "dispatch answered %d", rep.status);
+  if (rep.owned) {
+    free(rep.body);
+  }
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size == 0) {
     return 0;
@@ -254,9 +406,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   } else if (data[0] == 4) {
     coded(data + 1, size - 1);
   } else if (data[0] == 5) {
-    return 0; /* ctui-wm's: ctui-remote's CGI head, in its own harness */
+    cgi_head(data + 1, size - 1);
   } else if (data[0] == 6) {
     pem(data + 1, size - 1);
+  } else if (data[0] == 7) {
+    paths(data + 1, size - 1);
   } else {
     request(data + 1, size - 1);
   }

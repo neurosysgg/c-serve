@@ -49,24 +49,79 @@ BIN = $(B)/bin
 obj = $(patsubst %.c,$(B)/%.o,$(1))
 
 SRC = $(wildcard src/*.c)
-# what a server-only host compiles; the client is net.c
-SERVE_SRC = src/listen.c src/httpd.c
+# what a server-only host compiles (the static files and the CGI with
+# it); the client is net.c
+SERVE_SRC = src/listen.c src/httpd.c src/static.c src/cgi.c src/process.c \
+	src/log.c src/route.c
 CLIENT_SRC = $(filter-out $(SERVE_SRC),$(SRC))
 TESTS = $(patsubst tests/%_test.c,%,$(wildcard tests/*_test.c))
 FUZZERS = $(patsubst fuzz/%.c,%,$(filter-out fuzz/fuzz.h,$(wildcard fuzz/*.c)))
 
-all: $(B)/libcserve.a
+# the apps (apps/NAME/*.c, each exporting cserve_app_NAME): a .so each for
+# the development host, and STATIC_APPS linked into the production one
+APPS = $(notdir $(wildcard apps/*))
+STATIC_APPS ?= hello
+app_src = $(wildcard $(1:%=apps/%/*.c))
 
+all: $(B)/libcserve.a $(BIN)/cserve $(BIN)/cserve-static $(APPS:%=$(BIN)/apps/%.so)
+
+# made anew: ar updates an archive in place, so an object whose source
+# went (a rename) would stay in it
 $(B)/libcserve.a: $(call obj,$(SRC))
+	rm -f $@
 	$(AR) rcs $@ $^
 
 $(B)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
+# an app's objects go into a .so too
+$(B)/apps/%.o: CFLAGS += -fPIC
+
+# the host, twice: cserve dlopen()s the apps it's given as paths (its own
+# symbols exported for them: -rdynamic, the whole library), cserve-static
+# has STATIC_APPS in its table and no dlopen at all
+$(B)/host/main-dev.o: host/main.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -DCSERVE_DLOPEN -MMD -MP -c $< -o $@
+
+# the apps' table, rewritten only when STATIC_APPS changes what it says
+$(B)/gen/apps-static.c: FORCE
+	@mkdir -p $(@D)
+	@{ echo '#include "app.h"'; \
+	  for a in $(STATIC_APPS); do echo "extern const CSERVE_APP cserve_app_$$a;"; done; \
+	  printf 'const CSERVE_APP *const cserve_apps[] = {'; \
+	  for a in $(STATIC_APPS); do printf '&cserve_app_%s, ' $$a; done; \
+	  echo 'NULL};'; } > $@.tmp
+	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
+$(B)/gen/apps-dev.c:
+	@mkdir -p $(@D)
+	@printf '#include "app.h"\nconst CSERVE_APP *const cserve_apps[] = {NULL};\n' > $@
+$(B)/gen/%.o: $(B)/gen/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BIN)/cserve: $(B)/host/main-dev.o $(B)/gen/apps-dev.o $(B)/libcserve.a
+	@mkdir -p $(@D)
+	$(CC) $(LDFLAGS) -rdynamic $(filter %.o,$^) -Wl,--whole-archive $(B)/libcserve.a \
+		-Wl,--no-whole-archive $(LDLIBS) -ldl -o $@
+
+$(BIN)/cserve-static: $(B)/host/main.o $(B)/gen/apps-static.o \
+		$(call obj,$(call app_src,$(STATIC_APPS))) $(B)/libcserve.a
+	@mkdir -p $(@D)
+	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+.SECONDEXPANSION:
+$(BIN)/apps/%.so: $$(call obj,$$(call app_src,%))
+	@mkdir -p $(@D)
+	$(CC) $(LDFLAGS) -shared $^ -o $@
+
 $(BIN)/test-%: $(call obj,tests/%_test.c) $(B)/libcserve.a
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+# the host's suite runs both hosts and the app as built here
+$(B)/tests/host_test.o: CFLAGS += -DCSERVE_BIN='"$(BIN)"'
+$(BIN)/test-host: | $(BIN)/cserve $(BIN)/cserve-static $(APPS:%=$(BIN)/apps/%.so)
 
 # T=NAME runs one suite. The suites read tests/data/ relative to here.
 test: $(if $(T),$(BIN)/test-$(T),$(TESTS:%=$(BIN)/test-%))
@@ -86,7 +141,7 @@ check:
 	$(MAKE) --no-print-directory -j$(shell nproc) SAN= TSAN= all test
 	$(MAKE) --no-print-directory SAN= TSAN= lint
 
-FMT_SRC = $(wildcard src/*.[ch] tests/*.[ch] fuzz/*.[ch])
+FMT_SRC = $(wildcard src/*.[ch] host/*.c apps/*/*.[ch] tests/*.[ch] fuzz/*.[ch])
 # clang-tidy's bugprone-* and cert-*, minus the policy checks ctui-wm's
 # tools/lint.py keeps quiet for the same reasons (each is said there); no
 # baseline: a finding fails
@@ -108,10 +163,12 @@ CPPCHECK_QUIET = nullPointerOutOfMemory nullPointerOutOfResources \
 
 lint:
 	clang-format --dry-run -Werror $(FMT_SRC) && echo "clang-format: clean"
-	clang-tidy --quiet --warnings-as-errors='*' --checks='$(TIDY_CHECKS)' $(SRC) -- $(CFLAGS) \
+	clang-tidy --quiet --warnings-as-errors='*' --checks='$(TIDY_CHECKS)' \
+		$(SRC) host/main.c $(call app_src,$(APPS)) -- $(CFLAGS) -DCSERVE_DLOPEN \
 		&& echo "clang-tidy: clean"
 	cppcheck --quiet --error-exitcode=1 --enable=warning,portability --std=c11 -Isrc \
-		$(CPPCHECK_QUIET:%=--suppress=%) src && echo "cppcheck: clean"
+		-DCSERVE_DLOPEN $(CPPCHECK_QUIET:%=--suppress=%) src host apps \
+		&& echo "cppcheck: clean"
 
 format:
 	clang-format -i $(FMT_SRC)
@@ -119,5 +176,7 @@ format:
 clean:
 	rm -rf build
 
-.PHONY: all test fuzz check lint format clean
+FORCE:
+
+.PHONY: all test fuzz check lint format clean FORCE
 -include $(shell find build -name '*.d' 2>/dev/null)

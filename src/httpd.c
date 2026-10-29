@@ -378,7 +378,10 @@ static int send_reply(CSERVE_CONN *c, const CSERVE_HTTPD *h,
   char head[5120], length[48];
   int body = rep->status >= 200 && rep->status != 204 && rep->status != 304;
   int head_only = r && strcmp(r->method, "HEAD") == 0;
-  int chunked = rep->stream && r && r->minor >= 1;
+  /* HEAD of a streamed body: no framing at all (none of it follows) and
+   * the connection closed after (httpd_serve()), so a client that reads
+   * the reply as a GET's -- curl -X HEAD -- isn't left waiting for one */
+  int chunked = rep->stream && r && r->minor >= 1 && !head_only;
   if (!rep->stream) {
     snprintf(length, sizeof length, "Content-Length: %zu\r\n",
              body ? rep->len : 0);
@@ -492,9 +495,10 @@ void cserve_httpd_serve(const CSERVE_HTTPD *h, CSERVE_CONN *c,
       cserve_httpd_text(&rep, 500, "text/plain; charset=utf-8", "no answer\n",
                         10);
     }
-    /* HTTP/1.0 has no chunks: a streamed body ends with the connection */
-    int keep =
-        r->keep_alive && k + 1 < max_req && !(rep.stream && r->minor < 1);
+    /* HTTP/1.0 has no chunks: a streamed body ends with the connection;
+     * so does HEAD's, which is said without framing (send_reply()) */
+    int keep = r->keep_alive && k + 1 < max_req &&
+               !(rep.stream && (r->minor < 1 || !strcmp(r->method, "HEAD")));
     int sent = send_reply(c, h, r, &rep, keep, err, sizeof err);
     if (rep.owned) {
       free(rep.body);
