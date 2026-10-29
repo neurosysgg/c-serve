@@ -18,9 +18,22 @@ and carries a small web host, `cserve`, whose sites are compiled in as first-cla
 | `src/cgi.{c,h}` + `src/process.{c,h}` | a front controller (php-cgi) per request: Apache's CGI variables, the body fed while the reply streams, every wait bounded |
 | `src/route.{c,h}` | an app's routes: `/releases/{slug}`, a trailing `*`, a 405 with `Allow` |
 | `src/app.{h}` | the app ABI: one vtable per app, `cserve_app_<name>`, slots only ever appended |
+| `src/policy.{c,h}` | an app's security headers built from what it loads elsewhere: HSTS, the CSP, and the rest, phpanta's values |
 | `src/log.{c,h}` | the one hook everything says things through |
-| `host/main.c` | `cserve`: listeners (plain, TLS, mutual TLS), then a file, an app's route, the front, or 404 |
-| `apps/hello/` | the test app |
+| `kit/arena.{c,h}` | one request's memory, and its first error |
+| `kit/reading.{c,h}` | a query parameter, a cookie, Accept-Language, If-None-Match, Range, the SPA's fetch — pure, on strings |
+| `kit/text.{c,h}` | languages and catalogs: every word in each language, a phrase's `{name}`, resolved at render |
+| `kit/markup.{c,h}` + `kit/html.{c,h}` | the page as a tree, HTML's tags and attributes typed, render with escaping and the URL check in it |
+| `kit/headers.{c,h}` | a reply's headers by name, refusing a value that would end one |
+| `kit/page.{c,h}` | a view answered: the shell or the fragment, the language, ETag / 304, Vary |
+| `host/main.c` | `cserve`: listeners (plain, TLS, mutual TLS), then a file, an app's route, the front, the app's 404, or 404 |
+| `apps/hello/` | the test app: the ABI, both ways of linking, and the toolkit end to end |
+
+`kit/` is an app's toolkit, what phpanta was to a site: an app builds a page as a tree of nodes
+and never as a string, every word it says is a catalog entry in each of its languages (one missing
+is a compiler error), and `cserve_page()` answers with it. Its render is phpanta's byte for byte, and
+its readers decide as phpanta's do, each case's answer in `tests/data/goldens.h` printed by Phpanta
+itself (neurosys's `test/cserve/goldens.php`), so a page can be moved off PHP and diffed.
 
 A host compiles `src/` into itself; there is nothing to install. `-ffunction-sections` and a
 host's `--gc-sections` keep what it never calls out of its binary, so a server that makes no
@@ -44,6 +57,7 @@ make test       # the suites (T=net for one)
 make check      # ASan+UBSan, TSan, -O2, then clang-format, clang-tidy and cppcheck
 make FUZZ=1 fuzz && fuzz/seeds.py build/corpus   # libFuzzer (clang), its seeds first
 build/O2-fuzz/bin/fuzz-http build/corpus
+fuzz/seeds.py build/corpus-kit kit && build/O2-fuzz/bin/fuzz-kit build/corpus-kit
 ```
 
 Fuzz without `-fork`: clang 23.1's libFuzzer crashes in its own fork-mode bookkeeping

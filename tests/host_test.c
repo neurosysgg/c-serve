@@ -1,7 +1,10 @@
 /* the host as built (CSERVE_BIN: build/O2/bin): cserve with the hello app
  * dlopen()ed, cserve-static with it linked in -- the order a request
- * goes through (a file, an app's routes, the front controller), the climb
- * modes, an app it can't have, a clean stop on SIGTERM */
+ * goes through (a file, an app's routes, the front controller or the
+ * app's own 404), the app's security headers on what it answers and on
+ * nothing else, its pages as the toolkit makes them (the language, the
+ * fragment, a 304, the switch's cookie), the climb modes, an app it
+ * can't have, a clean stop on SIGTERM */
 /* mkdtemp/kill are POSIX, not C11 */
 #define _GNU_SOURCE
 
@@ -14,6 +17,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,13 +85,15 @@ static int stop(HOST *h) {
   return cserve_spawn_wait(&h->proc, 5000);
 }
 
-/* method target on h: the whole reply (malloc'd) */
-static char *ask(const HOST *h, const char *method, const char *target) {
-  char req[512];
+/* method target on h, with extra header lines (each ending in CRLF; NULL:
+ * none): the whole reply (malloc'd) */
+static char *ask_with(const HOST *h, const char *method, const char *target,
+                      const char *extra) {
+  char req[1024];
   int rn = snprintf(req, sizeof req,
                     "%s %s HTTP/1.1\r\nHost: localhost\r\nContent-Length: "
-                    "0\r\nConnection: close\r\n\r\n",
-                    method, target);
+                    "0\r\n%sConnection: close\r\n\r\n",
+                    method, target, extra ? extra : "");
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in a = {.sin_family = AF_INET,
                           .sin_port = htons((uint16_t)h->port),
@@ -109,12 +115,116 @@ static char *ask(const HOST *h, const char *method, const char *target) {
   return got;
 }
 
+static char *ask(const HOST *h, const char *method, const char *target) {
+  return ask_with(h, method, target, NULL);
+}
+
 static int replied(const HOST *h, const char *method, const char *target,
                    const char *status, const char *has) {
   char *got = ask(h, method, target);
   int ok = got && strstr(got, status) && (!has || strstr(got, has));
   free(got);
   return ok;
+}
+
+/* the hello app's security headers, the way phpanta sends them */
+static const char CSP[] =
+    "Content-Security-Policy: default-src 'self'; script-src 'self'; "
+    "style-src 'self'; img-src 'self' https://images.example; frame-src "
+    "'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; "
+    "object-src 'none'\r\n";
+
+/* what target with extra headers gets: whether it has each of the
+ * NULL-terminated strings */
+static int has_all(const HOST *h, const char *target, const char *extra, ...) {
+  char *got = ask_with(h, "GET", target, extra);
+  int ok = got != NULL;
+  va_list ap;
+  va_start(ap, extra);
+  for (const char *s; ok && (s = va_arg(ap, const char *));) {
+    ok = strstr(got, s) != NULL;
+    if (!ok) {
+      printf("    no \"%s\" in:\n%s\n", s, got);
+    }
+  }
+  va_end(ap);
+  free(got);
+  return ok;
+}
+
+/* the value of header name in reply (into v) */
+static void value_of(const char *reply, const char *name, char *v, size_t cap) {
+  v[0] = '\0';
+  const char *at = reply ? strstr(reply, name) : NULL;
+  if (at) {
+    at += strlen(name);
+    snprintf(v, cap, "%.*s", (int)strcspn(at, "\r"), at);
+  }
+}
+
+/* the app's pages, as the toolkit answers them */
+static void pages(const HOST *h, const char *bin) {
+  char hello[PATH_MAX + 64];
+  snprintf(hello, sizeof hello, "<p>hello, world (from %s)</p>", g_root);
+  CSERVE_TEST_ASSERT(
+      has_all(h, "/hello", NULL, " 200 ", hello, "<!DOCTYPE html>\n",
+              "<title>world \xE2\x80\x94 hello</title>",
+              "Content-Language: en\r\n", "Cache-Control: no-cache\r\n",
+              "Vary: X-Requested-With, Accept-Language, Cookie\r\n",
+              "Strict-Transport-Security: max-age=31536000; "
+              "includeSubDomains\r\n",
+              CSP, "Cross-Origin-Resource-Policy: same-origin\r\n", NULL),
+      "%s: the app's page, its init() seen, its security headers on it", bin);
+  CSERVE_TEST_ASSERT(has_all(h, "/hello/neuro", "Accept-Language: de-AT\r\n",
+                             " 200 ", "<p>hallo, neuro (aus ",
+                             "Content-Language: de\r\n", NULL),
+                     "%s: a capture, in the language asked for", bin);
+  CSERVE_TEST_ASSERT(
+      has_all(h, "/hello",
+              "Accept-Language: de\r\nCookie: theme=dark; lang=en\r\n",
+              "<p>hello, world", NULL),
+      "%s: the cookie before Accept-Language", bin);
+  char *doc = ask(h, "GET", "/hello");
+  char *frag =
+      ask_with(h, "GET", "/hello", "X-Requested-With: XMLHttpRequest\r\n");
+  char etag[80] = "", fetag[80] = "";
+  value_of(doc, "ETag: ", etag, sizeof etag);
+  value_of(frag, "ETag: ", fetag, sizeof fetag);
+  CSERVE_TEST_ASSERT(
+      frag &&
+          strstr(frag, "\r\n\r\n<title>world \xE2\x80\x94 "
+                       "hello</title>\n<p>hello") &&
+          !strstr(frag, "<html") && *etag && *fetag && strcmp(etag, fetag),
+      "%s: the SPA's fetch: the fragment, its own validator", bin);
+  char inm[128];
+  snprintf(inm, sizeof inm, "If-None-Match: %s\r\n", etag);
+  char *again = ask_with(h, "GET", "/hello", inm);
+  CSERVE_TEST_ASSERT(again && strstr(again, " 304 ") &&
+                         strstr(again, "Content-Length: 0\r\n") &&
+                         !strstr(again, "\r\nContent-Type:") &&
+                         strstr(again, CSP),
+                     "%s: the copy the client holds: 304", bin);
+  free(doc);
+  free(frag);
+  free(again);
+  CSERVE_TEST_ASSERT(
+      has_all(h, "/language/de", "Referer: http://localhost/hello/x\r\n",
+              " 303 ", "Location: /hello/x\r\n",
+              "Set-Cookie: lang=de; Path=/; Max-Age=31536000; SameSite=Lax; "
+              "Secure; HttpOnly\r\n",
+              "Cache-Control: no-store, private\r\n", NULL),
+      "%s: the language switch: the cookie, and back", bin);
+  CSERVE_TEST_ASSERT(has_all(h, "/language/de",
+                             "Referer: http://localhost//evil.example\r\n",
+                             "Location: /\r\n", NULL),
+                     "%s: back to nowhere off the origin: home", bin);
+  CSERVE_TEST_ASSERT(replied(h, "GET", "/language/fr", " 404 ", CSP),
+                     "%s: a language not offered: 404", bin);
+  char *file = ask(h, "GET", "/hello.txt");
+  CSERVE_TEST_ASSERT(file && strstr(file, " 200 ") &&
+                         !strstr(file, "Content-Security-Policy"),
+                     "%s: a file: none of the app's headers", bin);
+  free(file);
 }
 
 /* the same checks for either host, app given as app */
@@ -127,14 +237,11 @@ static void serve_through(const char *bin, const char *app) {
     CSERVE_TEST_ASSERT(0, "%s --app %s started (%d)", bin, app, status);
     return;
   }
-  char hello[PATH_MAX + 64];
-  snprintf(hello, sizeof hello, "hello, world (from %s)", g_root);
-  CSERVE_TEST_ASSERT(replied(&h, "GET", "/hello", " 200 ", hello),
-                     "%s: the app's route, its init() seen", bin);
-  CSERVE_TEST_ASSERT(replied(&h, "GET", "/hello/neuro", " 200 ", "neuro"),
-                     "%s: a capture", bin);
-  CSERVE_TEST_ASSERT(replied(&h, "POST", "/hello", " 405 ", "Allow: GET, HEAD"),
-                     "%s: a method the route hasn't: 405", bin);
+  pages(&h, bin);
+  CSERVE_TEST_ASSERT(
+      replied(&h, "POST", "/hello", " 405 ", "Allow: GET, HEAD") &&
+          replied(&h, "POST", "/hello", " 405 ", CSP),
+      "%s: a method the route hasn't: 405, secured", bin);
   CSERVE_TEST_ASSERT(replied(&h, "GET", "/hello.txt", " 200 ", "a file"),
                      "%s: a file comes first", bin);
   CSERVE_TEST_ASSERT(
@@ -155,6 +262,22 @@ static void test_hosts(void) {
 
   HOST h;
   int status;
+  const char *own[] = {"--listen", "127.0.0.1:0", "--root", g_root,
+                       "--app",    "hello",       NULL};
+  if (start(&h, stat_bin, own, &status) == 0) {
+    CSERVE_TEST_ASSERT(
+        has_all(&h, "/nope", NULL, " 404 ", "<p>nothing at /nope</p>", CSP,
+                NULL) &&
+            has_all(&h, "/nope", "X-Requested-With: XMLHttpRequest\r\n",
+                    "\r\n\r\n<title>not found", NULL),
+        "no front: the app's own 404, secured, a fragment when asked");
+    char *got = ask(&h, "GET", "/nope");
+    CSERVE_TEST_ASSERT(got && !strstr(got, "ETag"), "and no validator");
+    free(got);
+    CSERVE_TEST_ASSERT(stop(&h) == 0, "and stopped");
+  } else {
+    CSERVE_TEST_ASSERT(0, "--app hello without --cgi started");
+  }
   const char *front[] = {"--listen", "127.0.0.1:0", "--root", g_root, "--cgi",
                          g_front,    "--climb",     "front",  NULL};
   if (start(&h, stat_bin, front, &status) == 0) {

@@ -7,7 +7,7 @@ CC ?= cc
 OPT ?= -O2
 # -ffunction-sections -fdata-sections: a host's --gc-sections drops what
 # it never calls (a server that makes no requests links no client)
-CFLAGS = -Wall -Wextra -Wno-format-truncation $(WARN) -std=c11 -Isrc -g $(OPT) \
+CFLAGS = -Wall -Wextra -Wno-format-truncation $(WARN) -std=c11 -Isrc -Ikit -g $(OPT) \
 	-ffunction-sections -fdata-sections
 
 # mbedtls 4 (with its PSA crypto) for TLS, zlib to undo gzip / deflate
@@ -48,12 +48,15 @@ B = build/$(subst -,,$(OPT))$(if $(SAN),-san)$(if $(TSAN),-tsan)$(if $(FUZZ),-fu
 BIN = $(B)/bin
 obj = $(patsubst %.c,$(B)/%.o,$(1))
 
-SRC = $(wildcard src/*.c)
+# kit/ is an app's toolkit (reading a request, the markup tree, catalogs,
+# a page answered): what an app links, which the host itself never calls
+KIT_SRC = $(wildcard kit/*.c)
+SRC = $(wildcard src/*.c) $(KIT_SRC)
 # what a server-only host compiles (the static files and the CGI with
 # it); the client is net.c
 SERVE_SRC = src/listen.c src/httpd.c src/static.c src/cgi.c src/process.c \
-	src/log.c src/route.c
-CLIENT_SRC = $(filter-out $(SERVE_SRC),$(SRC))
+	src/log.c src/route.c src/policy.c
+CLIENT_SRC = $(filter-out $(SERVE_SRC) $(KIT_SRC),$(SRC))
 TESTS = $(patsubst tests/%_test.c,%,$(wildcard tests/*_test.c))
 FUZZERS = $(patsubst fuzz/%.c,%,$(filter-out fuzz/fuzz.h,$(wildcard fuzz/*.c)))
 
@@ -141,7 +144,7 @@ check:
 	$(MAKE) --no-print-directory -j$(shell nproc) SAN= TSAN= all test
 	$(MAKE) --no-print-directory SAN= TSAN= lint
 
-FMT_SRC = $(wildcard src/*.[ch] host/*.c apps/*/*.[ch] tests/*.[ch] fuzz/*.[ch])
+FMT_SRC = $(wildcard src/*.[ch] kit/*.[ch] host/*.c apps/*/*.[ch] tests/*.[ch] fuzz/*.[ch])
 # clang-tidy's bugprone-* and cert-*, minus the policy checks ctui-wm's
 # tools/lint.py keeps quiet for the same reasons (each is said there); no
 # baseline: a finding fails
@@ -161,13 +164,20 @@ CPPCHECK_QUIET = nullPointerOutOfMemory nullPointerOutOfResources \
 	nullPointerArithmeticOutOfMemory ctunullpointerOutOfMemory memleakOnRealloc \
 	varFuncNullUB constStatement missingIncludeSystem checkersReport
 
+# a page is a tree (kit/markup.h): only markup.c writes a '<', so a string
+# literal holding a tag anywhere else in the toolkit or an app is refused
+MARKUP_FREE = $(filter-out kit/markup.c,$(KIT_SRC)) $(wildcard apps/*/*.c)
+
 lint:
+	@if grep -n '"[^"]*<[A-Za-z/!]' $(MARKUP_FREE); then \
+		echo "markup: a tag written as a string (only kit/markup.c writes '<')"; \
+		exit 1; fi; echo "markup: clean"
 	clang-format --dry-run -Werror $(FMT_SRC) && echo "clang-format: clean"
 	clang-tidy --quiet --warnings-as-errors='*' --checks='$(TIDY_CHECKS)' \
 		$(SRC) host/main.c $(call app_src,$(APPS)) -- $(CFLAGS) -DCSERVE_DLOPEN \
 		&& echo "clang-tidy: clean"
-	cppcheck --quiet --error-exitcode=1 --enable=warning,portability --std=c11 -Isrc \
-		-DCSERVE_DLOPEN $(CPPCHECK_QUIET:%=--suppress=%) src host apps \
+	cppcheck --quiet --error-exitcode=1 --enable=warning,portability --std=c11 -Isrc -Ikit \
+		-DCSERVE_DLOPEN $(CPPCHECK_QUIET:%=--suppress=%) src kit host apps \
 		&& echo "cppcheck: clean"
 
 format:

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""The fuzzers' seeds: fuzz/seeds.py DIR writes fuzz-http's into DIR
-(made if missing), one file per seed. libFuzzer starts from them and
-grows DIR as it finds more:
+"""The fuzzers' seeds: fuzz/seeds.py DIR [NAME] writes fuzz-NAME's (http
+when not said) into DIR (made if missing), one file per seed. libFuzzer
+starts from them and grows DIR as it finds more:
 
     fuzz/seeds.py build/corpus && build/O2-fuzz/bin/fuzz-http build/corpus
+    fuzz/seeds.py build/corpus-kit kit && build/O2-fuzz/bin/fuzz-kit build/corpus-kit
 
-The first byte picks what fuzz/http.c does with the rest."""
+The first byte picks what fuzz/NAME.c does with the rest."""
 import gzip
 import hashlib
 import os
@@ -66,12 +67,35 @@ def http():
             b"\x07\x00/releases/.user.ini"]
 
 
+def kit():
+    return [b"\x00a=1&b=two+words&c=%C3%BC",
+            b"\x00a&a=2&%61=%FF",
+            b"\x01theme=dark; lang=\"de\"; x",
+            b"\x01 lang = en ;lang=de",
+            b"\x02de-AT, en;q=0.9, *;q=0.1",
+            b"\x02fr;q=0, *, en;Q=1.000;level=1",
+            b"\x03W/\"abc-gzip\", \"0123456789abcdef0123456789abcdef\"",
+            b"\x03 * ",
+            b"\x04\x01\x00bytes=0-99",
+            b"\x04\x00\x0aBYTES=-5",
+            b"\x04\x00\x00bytes=9223372036854775808-",
+            j(b"\x05a < b & 'c' \"d\" \xc3\xbc \xc3", "/releases/ill"),
+            j(b"\x05\xed\xa0\x80\xf4\x90\x80\x80", "/\t/evil.example"),
+            j(b"\x05x", "mailto:x@y"),
+            j(b"\x05x", " \\\\host"),
+            j(b"\x05x", "javascript:alert(1)")]
+
+
+SEEDS = {"http": http, "kit": kit}
+
+
 def main():
-    if len(sys.argv) != 2:
-        sys.exit("usage: fuzz/seeds.py DIR")
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and
+                                         sys.argv[2] not in SEEDS):
+        sys.exit("usage: fuzz/seeds.py DIR [http|kit]")
     out = sys.argv[1]
     os.makedirs(out, exist_ok=True)
-    for seed in http():
+    for seed in SEEDS[sys.argv[2] if len(sys.argv) == 3 else "http"]():
         name = hashlib.sha1(seed).hexdigest()
         with open(os.path.join(out, name), "wb") as f:
             f.write(seed)

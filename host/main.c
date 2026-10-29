@@ -11,6 +11,7 @@
 #include "httpd.h"
 #include "listen.h"
 #include "log.h"
+#include "policy.h"
 #include "route.h"
 #include "static.h"
 #include "tls.h"
@@ -42,6 +43,7 @@ typedef struct {
   int have_cgi;
   const char *env[ENV_MAX + 1];
   const CSERVE_APP *apps[APPS_MAX];
+  char *security[APPS_MAX]; /* each app's security header lines, or NULL */
   int napps;
   CSERVE_TLS_SERVER *tls;
   int verbose;
@@ -57,6 +59,35 @@ typedef struct {
 
 static void text(CSERVE_HTTPD_REPLY *rep, int status, const char *t) {
   cserve_httpd_text(rep, status, "text/plain; charset=utf-8", t, strlen(t));
+}
+
+/* app i's security headers put before what it answered with. Headers
+ * that won't fit with them are a 500: a reply never goes out without
+ * them (a streamed one keeps its stream, whose bytes become the 500's) */
+static void secure(CSERVE_HTTPD_REPLY *rep, int i) {
+  const char *lines = H.security[i];
+  if (!lines) {
+    return;
+  }
+  size_t n = strlen(lines), have = strlen(rep->headers);
+  if (n + have >= sizeof rep->headers) {
+    cserve_logf(CSERVE_LOG_WARN,
+                "%s: a reply whose headers leave no room "
+                "for its security headers",
+                H.apps[i]->name);
+    if (rep->owned) {
+      free(rep->body);
+      rep->owned = 0;
+    }
+    rep->status = 500;
+    rep->type = "text/plain; charset=utf-8";
+    rep->body = (char *)"500 Internal Server Error\n";
+    rep->len = strlen(rep->body);
+    rep->headers[0] = '\0';
+    have = 0;
+  }
+  memmove(rep->headers + n, rep->headers, have + 1);
+  memcpy(rep->headers, lines, n);
 }
 
 static void handle(const CSERVE_HTTPD_REQ *r, const char *body,
@@ -77,6 +108,20 @@ static void handle(const CSERVE_HTTPD_REQ *r, const char *body,
       if (routes &&
           cserve_route_dispatch(routes, H.apps[i]->nroutes, r, body, rep)) {
         by = H.apps[i]->name;
+        secure(rep, i);
+      }
+    }
+    for (int i = 0; i < H.napps && !rep->status && !H.have_cgi; i++) {
+      void (*not_found)(const CSERVE_HTTPD_REQ *, const char *,
+                        CSERVE_HTTPD_REPLY *) =
+          CSERVE_APP_SLOT(H.apps[i], not_found);
+      if (not_found) {
+        not_found(r, body, rep);
+        if (!rep->status) {
+          text(rep, 500, "an app's not_found answered nothing\n");
+        }
+        by = H.apps[i]->name;
+        secure(rep, i);
       }
     }
     if (!rep->status && H.have_cgi) {
@@ -260,6 +305,15 @@ int main(int argc, char **argv) {
       fprintf(stderr, "cserve: app %s: %s\n", app_names[i], err);
       return 1;
     }
+    const CSERVE_SECURITY *policy = CSERVE_APP_SLOT(a, security);
+    char lines[2048];
+    if (policy && (cserve_security_headers(policy, lines, sizeof lines, err,
+                                           sizeof err) != 0 ||
+                   !(H.security[H.napps] = strdup(lines)))) {
+      fprintf(stderr, "cserve: app %s: its security headers: %s\n",
+              app_names[i], err);
+      return 1;
+    }
     H.apps[H.napps++] = a;
   }
   if (cert &&
@@ -305,6 +359,7 @@ int main(int argc, char **argv) {
     if (fini) {
       fini();
     }
+    free(H.security[i]);
   }
   cserve_tls_server_free(H.tls);
   return rc ? 1 : 0;

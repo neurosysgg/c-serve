@@ -20,6 +20,16 @@ repo's log and in ctui-wm's HISTORY.md.
 - **The app ABI only grows.** A slot is appended to `CSERVE_APP`, never inserted, renamed or
   retyped; a host reads one through `CSERVE_APP_SLOT`, so an app built against fewer slots
   still loads. Bump `CSERVE_APP_ABI` only for a break, and then every app is rebuilt.
+- **A page is a tree, never a string.** Only `kit/markup.c` writes a `<`; lint fails a string
+  literal holding a tag anywhere else in `kit/` or `apps/`. Escaping and the URL check live in
+  render, so they hold however a tree was built.
+- **Every visible word is a `CSERVE_TEXT`**, declared through an app's macro that takes each of
+  its languages, so a missing one is a compiler error; init() checks the catalog for blanks.
+- **A builder that is refused fails the request's arena and returns something harmless**; render
+  then fails and the page is a 500 with why in the log. Nothing in `kit/` aborts or exits.
+- **`kit/` decides as phpanta does.** Its render and readers are checked case by case against
+  `tests/data/goldens.h`, which neurosys's `test/cserve/goldens.php` prints from Phpanta itself:
+  regenerate it, never edit it, and a disagreement is a bug here unless Phpanta's answer is wrong.
 - **The host takes flags, not a config file**: a config parser would be one more parser of
   outside input.
 - **No header is named like a system one.** ctui-wm puts `src/` on every `-I`, and `-I` is

@@ -1,6 +1,7 @@
 #ifndef CSERVE_APP_H
 #define CSERVE_APP_H
 
+#include "policy.h"
 #include "route.h"
 
 #include <stddef.h>
@@ -34,6 +35,15 @@ typedef struct CSERVE_APP {
   int nroutes;
   /* after the last request */
   void (*fini)(void);
+  /* what its pages load from elsewhere: the host builds its security
+   * headers of it once and puts them first on every reply this app
+   * answers (policy.h); NULL: none */
+  const CSERVE_SECURITY *security;
+  /* a request no route of any app fits, when there's no front (--cgi)
+   * to hand it to: the first app's with one answers it; NULL: the host's
+   * plain 404 */
+  void (*not_found)(const CSERVE_HTTPD_REQ *r, const char *body,
+                    CSERVE_HTTPD_REPLY *rep);
 } CSERVE_APP;
 
 #define CSERVE_APP_HEADER(n)                                                   \
