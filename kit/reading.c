@@ -365,3 +365,93 @@ CSERVE_RANGE cserve_range(const char *header, long long size, long long *first,
   *last = b;
   return CSERVE_RANGE_PARTIAL;
 }
+
+/* a base64 digit's value, -1 for the whitespace strict base64_decode()
+ * steps over, -2 for anything else */
+static int b64(unsigned char c) {
+  if (c >= 'A' && c <= 'Z') {
+    return c - 'A';
+  }
+  if (c >= 'a' && c <= 'z') {
+    return c - 'a' + 26;
+  }
+  if (c >= '0' && c <= '9') {
+    return c - '0' + 52;
+  }
+  if (c == '+' || c == '/') {
+    return c == '+' ? 62 : 63;
+  }
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' ? -1 : -2;
+}
+
+/* s[0, n) through base64_decode($s, true) into out (n bytes hold it):
+ * its length, or -1 where PHP answers false */
+static long b64_strict(const char *s, size_t n, unsigned char *out) {
+  size_t i = 0, pad = 0, j = 0;
+  for (size_t k = 0; k < n; k++) {
+    if (s[k] == '=') {
+      pad++;
+      continue;
+    }
+    int v = b64((unsigned char)s[k]);
+    if (v == -1) {
+      continue;
+    }
+    if (v == -2 || pad) {
+      return -1;
+    }
+    switch (i % 4) {
+    case 0:
+      out[j] = (unsigned char)(v << 2);
+      break;
+    case 1:
+      out[j++] |= (unsigned char)(v >> 4);
+      out[j] = (unsigned char)((v & 0x0f) << 4);
+      break;
+    case 2:
+      out[j++] |= (unsigned char)(v >> 2);
+      out[j] = (unsigned char)((v & 0x03) << 6);
+      break;
+    default:
+      out[j++] |= (unsigned char)v;
+      break;
+    }
+    i++;
+  }
+  if (i % 4 == 1 || (pad && (pad > 2 || (i + pad) % 4 != 0))) {
+    return -1;
+  }
+  return (long)j;
+}
+
+int cserve_basic_credentials(const char *authorization, char *user,
+                             size_t user_cap, char *pass, size_t pass_cap) {
+  user[0] = pass[0] = '\0';
+  if (!authorization || strncasecmp(authorization, "basic ", 6) != 0) {
+    return 1;
+  }
+  const char *s = authorization + 5;
+  while (*s == ' ') {
+    s++;
+  }
+  size_t n = strlen(s);
+  unsigned char buf[1024];
+  if (n > sizeof buf) {
+    return 1;
+  }
+  long len = b64_strict(s, n, buf);
+  if (len < 0 || memchr(buf, '\0', (size_t)len)) {
+    return 1;
+  }
+  const unsigned char *colon = memchr(buf, ':', (size_t)len);
+  size_t ul = colon ? (size_t)(colon - buf) : (size_t)len;
+  size_t pl = colon ? (size_t)len - ul - 1 : 0;
+  if (ul >= user_cap || pl >= pass_cap) {
+    return 1;
+  }
+  memcpy(user, buf, ul);
+  user[ul] = '\0';
+  memcpy(pass, colon ? colon + 1 : buf, pl);
+  pass[pl] = '\0';
+  return 0;
+}

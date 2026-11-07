@@ -26,7 +26,7 @@
 #include <unistd.h>
 
 static char g_dir[] = "/tmp/cserve-host-XXXXXX";
-static char g_root[PATH_MAX], g_front[PATH_MAX];
+static char g_root[PATH_MAX], g_front[PATH_MAX], g_data[PATH_MAX];
 
 static void put(const char *path, const char *text, mode_t mode) {
   FILE *f = fopen(path, "w");
@@ -227,12 +227,76 @@ static void pages(const HOST *h, const char *bin) {
   free(file);
 }
 
+/* the app's refuse(): a method no route takes is a 405 in the visitor's
+ * words, an OPTIONS a 204 naming what they do take */
+static void refusals(const HOST *h, const char *bin) {
+  char *got = ask_with(h, "PUT", "/hello", "Accept-Language: de\r\n");
+  CSERVE_TEST_ASSERT(
+      got && strstr(got, " 405 ") &&
+          strstr(got, "Cache-Control: no-store, private\r\n"
+                      "Allow: GET, HEAD\r\n") &&
+          strstr(got, "\r\n\r\nhallo ist schreibgesch") && strstr(got, CSP),
+      "%s: the app's 405: no-store, Allow, its words, secured", bin);
+  free(got);
+  got = ask(h, "OPTIONS", "/hello/x");
+  CSERVE_TEST_ASSERT(got && strstr(got, " 204 ") &&
+                         strstr(got, "Allow: GET, HEAD, OPTIONS\r\n") &&
+                         !strstr(got, "\r\nContent-Type:"),
+                     "%s: OPTIONS: 204, the methods and OPTIONS", bin);
+  free(got);
+}
+
+/* a file from the app's data, behind Basic, whole or in ranges */
+#define OPEN "Authorization: Basic aGVsbG86b3BlbiBzZXNhbWU=\r\n"
+static void files(const HOST *h, const char *bin) {
+  CSERVE_TEST_ASSERT(
+      has_all(h, "/hello-file/f.txt", NULL, " 401 ",
+              "WWW-Authenticate: Basic realm=\"hello: f.txt\"\r\n", NULL) &&
+          has_all(h, "/hello-file/x%20y",
+                  "Authorization: Basic "
+                  "aGVsbG86d3Jvbmc=\r\n",
+                  " 401 ", "realm=\"hello: x%20y\"", NULL),
+      "%s: no password, or a wrong one: 401, the realm encoded", bin);
+  CSERVE_TEST_ASSERT(
+      has_all(h, "/hello-file/f.txt", OPEN, " 200 ", "Content-Length: 10\r\n",
+              "Accept-Ranges: bytes\r\nCache-Control: no-store, private\r\n"
+              "X-Robots-Tag: noindex\r\n",
+              "\r\n\r\n0123456789", NULL),
+      "%s: the right one: the file, its headers in phpanta's order", bin);
+  CSERVE_TEST_ASSERT(
+      has_all(h, "/hello-file/f.txt", OPEN "Range: bytes=2-4\r\n", " 206 ",
+              "Content-Length: 3\r\n", "Content-Range: bytes 2-4/10\r\n",
+              "\r\n\r\n234", NULL) &&
+          has_all(h, "/hello-file/f.txt", OPEN "Range: bytes=-3\r\n",
+                  "\r\n\r\n789", NULL) &&
+          has_all(h, "/hello-file/f.txt", OPEN "Range: bytes=10-\r\n", " 416 ",
+                  "Content-Length: 0\r\n", "Content-Range: bytes */10\r\n",
+                  NULL) &&
+          has_all(h, "/hello-file/f.txt", OPEN "Range: bytes=1-2,4-5\r\n",
+                  " 200 ", "Content-Length: 10\r\n", NULL),
+      "%s: a range: 206, the last bytes, past the end 416, a list 200", bin);
+  char *head =
+      ask_with(h, "HEAD", "/hello-file/f.txt", OPEN "Range: bytes=0-1\r\n");
+  CSERVE_TEST_ASSERT(head && strstr(head, " 200 ") &&
+                         strstr(head, "Content-Length: 10\r\n") &&
+                         strstr(head, "\r\n\r\n")[4] == '\0',
+                     "%s: HEAD: told the GET's length, no Range, no body", bin);
+  free(head);
+  CSERVE_TEST_ASSERT(replied(h, "GET", "/hello-file/none", " 401 ", NULL),
+                     "%s: a file there isn't: the same 401", bin);
+  char *gone = ask_with(h, "GET", "/hello-file/none", OPEN);
+  CSERVE_TEST_ASSERT(gone && strstr(gone, " 404 "),
+                     "%s: and past the password, 404", bin);
+  free(gone);
+}
+
 /* the same checks for either host, app given as app */
 static void serve_through(const char *bin, const char *app) {
   HOST h;
   int status;
-  const char *args[] = {"--listen", "127.0.0.1:0", "--root", g_root, "--cgi",
-                        g_front,    "--app",       app,      NULL};
+  const char *args[] = {"--listen", "127.0.0.1:0", "--root", g_root,
+                        "--cgi",    g_front,       "--app",  app,
+                        "--data",   g_data,        NULL};
   if (start(&h, bin, args, &status) != 0) {
     CSERVE_TEST_ASSERT(0, "%s --app %s started (%d)", bin, app, status);
     return;
@@ -242,6 +306,8 @@ static void serve_through(const char *bin, const char *app) {
       replied(&h, "POST", "/hello", " 405 ", "Allow: GET, HEAD") &&
           replied(&h, "POST", "/hello", " 405 ", CSP),
       "%s: a method the route hasn't: 405, secured", bin);
+  refusals(&h, bin);
+  files(&h, bin);
   CSERVE_TEST_ASSERT(replied(&h, "GET", "/hello.txt", " 200 ", "a file"),
                      "%s: a file comes first", bin);
   CSERVE_TEST_ASSERT(
@@ -318,6 +384,10 @@ int main(void) {
   if (!realpath(pub, g_root)) {
     return 1;
   }
+  snprintf(g_data, sizeof g_data, "%s/data", g_dir);
+  mkdir(g_data, 0700);
+  snprintf(file, sizeof file, "%s/f.txt", g_data);
+  put(file, "0123456789", 0600);
   snprintf(file, sizeof file, "%s/hello.txt", g_root);
   put(file, "a file\n", 0600);
   snprintf(g_front, sizeof g_front, "%s/front.sh", g_dir);

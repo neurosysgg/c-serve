@@ -15,6 +15,7 @@ static const char *const NAMES[CSERVE_H_COUNT] = {
     [CSERVE_H_CONTENT_RANGE] = "Content-Range",
     [CSERVE_H_ACCEPT_RANGES] = "Accept-Ranges",
     [CSERVE_H_X_ROBOTS_TAG] = "X-Robots-Tag",
+    [CSERVE_H_WWW_AUTHENTICATE] = "WWW-Authenticate",
 };
 
 const char *cserve_header_name(CSERVE_HEADER h) {
@@ -55,4 +56,52 @@ int cserve_header_has(const CSERVE_HTTPD_REPLY *rep, CSERVE_HEADER h) {
 
 const char *cserve_cache_value(CSERVE_CACHE c) {
   return c == CSERVE_CACHE_NO_STORE ? "no-store, private" : "no-cache";
+}
+
+/* RFC 9110's qdtext: HTAB, SP, and printable ASCII but '"' and '\\' */
+static int qdtext(unsigned char c) {
+  return c == '\t' || c == ' ' || c == '!' || (c >= '#' && c <= '[') ||
+         (c >= ']' && c <= '~');
+}
+
+int cserve_basic_challenge(CSERVE_HTTPD_REPLY *rep, const char *realm) {
+  if (!*realm) {
+    return -1;
+  }
+  for (const unsigned char *p = (const unsigned char *)realm; *p; p++) {
+    if (!qdtext(*p)) {
+      return -1;
+    }
+  }
+  char value[1024];
+  int n = snprintf(value, sizeof value, "Basic realm=\"%s\"", realm);
+  if (n < 0 || (size_t)n >= sizeof value) {
+    return -1;
+  }
+  return cserve_header(rep, CSERVE_H_WWW_AUTHENTICATE, value);
+}
+
+int cserve_rawurlencode(const char *s, char *out, size_t cap) {
+  static const char HEX[] = "0123456789ABCDEF";
+  size_t k = 0;
+  for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    int keep = (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+               (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' ||
+               *p == '.' || *p == '~';
+    if (k + (keep ? 1 : 3) >= cap) {
+      return -1;
+    }
+    if (keep) {
+      out[k++] = (char)*p;
+    } else {
+      out[k++] = '%';
+      out[k++] = HEX[*p >> 4];
+      out[k++] = HEX[*p & 15];
+    }
+  }
+  if (k >= cap) {
+    return -1;
+  }
+  out[k] = '\0';
+  return 0;
 }

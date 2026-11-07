@@ -7,11 +7,19 @@
  * inside the file; 5 = text and an address (NUL-separated) rendered as
  * <p>text</p> and <a href>: the text's escaping leaves no &<>"' of its
  * own, what comes out is UTF-8, and an address let through is https:,
- * mailto: or stays on the origin. Any other first byte: as 5. */
+ * mailto: or stays on the origin; 6 = a JSON file (kit/json.c): a tree
+ * read has strings that are UTF-8, keys said once; 7 = an Authorization
+ * header's Basic credentials: both fit, neither holds a NUL; 8 = a
+ * password digest's grammar (kit/password.c; read only -- matching costs
+ * 100 000 iterations a run); 9 = a realm made of rawurlencode(): every
+ * one is a challenge. Any other first byte: as 5. */
 #include "fuzz.h"
 
+#include "headers.h"
 #include "html.h"
+#include "json.h"
 #include "markup.h"
+#include "password.h"
 #include "reading.h"
 
 #include <strings.h>
@@ -132,6 +140,63 @@ static void render(const uint8_t *data, size_t size) {
   fuzz_free(part, 2);
 }
 
+/* every string and key under v is UTF-8, every object's keys distinct */
+static void json_walk(const CSERVE_JSON *v) {
+  FUZZ_CHECK(v->type != CSERVE_JSON_STRING ||
+                 cserve_utf8_valid(v->string, strlen(v->string)),
+             "a string read that isn't UTF-8");
+  for (int i = 0; i < v->count; i++) {
+    if (v->type == CSERVE_JSON_OBJECT) {
+      for (int k = 0; k < i; k++) {
+        FUZZ_CHECK(strcmp(v->keys[i], v->keys[k]) != 0, "a key read twice");
+      }
+    }
+    json_walk(&v->items[i]);
+  }
+}
+
+static void json(const uint8_t *data, size_t size) {
+  char *t = fuzz_str(data, size), err[128] = "";
+  CSERVE_JSON *v = cserve_json_parse(t, err, sizeof err);
+  FUZZ_CHECK(v || !strncmp(err, "line ", 5), "refused, and not said where");
+  if (v) {
+    json_walk(v);
+  }
+  cserve_json_free(v);
+  free(t);
+}
+
+static void basic(const uint8_t *data, size_t size) {
+  char *h = fuzz_str(data, size), user[16], pass[16];
+  int rc = cserve_basic_credentials(h, user, sizeof user, pass, sizeof pass);
+  FUZZ_CHECK(rc == 0 || (rc == 1 && !*user && !*pass),
+             "no credential, but something kept: %d", rc);
+  FUZZ_CHECK(strlen(user) < sizeof user && strlen(pass) < sizeof pass &&
+                 !strchr(user, ':'),
+             "a user with a ':', or past its buffer");
+  free(h);
+}
+
+static void digest(const uint8_t *data, size_t size) {
+  char *d = fuzz_str(data, size);
+  int valid = cserve_password_valid(d);
+  FUZZ_CHECK(!valid || !strncmp(d, "$pbkdf2-sha256$", 15),
+             "a digest read that isn't one: %s", d);
+  free(d);
+}
+
+static void realm(const uint8_t *data, size_t size) {
+  char *s = fuzz_str(data, size), enc[512], r[600];
+  if (cserve_rawurlencode(s, enc, sizeof enc) == 0) {
+    CSERVE_HTTPD_REPLY rep = {0};
+    snprintf(r, sizeof r, "x: %s", enc);
+    FUZZ_CHECK(cserve_basic_challenge(&rep, r) == 0,
+               "rawurlencode() made a realm qdtext refuses: %s", r);
+    FUZZ_CHECK(!strpbrk(enc, "\"\\ "), "an encoding with a quote");
+  }
+  free(s);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size == 0) {
     return 0;
@@ -151,6 +216,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     break;
   case 4:
     range(data + 1, size - 1);
+    break;
+  case 6:
+    json(data + 1, size - 1);
+    break;
+  case 7:
+    basic(data + 1, size - 1);
+    break;
+  case 8:
+    digest(data + 1, size - 1);
+    break;
+  case 9:
+    realm(data + 1, size - 1);
     break;
   default:
     render(data + 1, size - 1);

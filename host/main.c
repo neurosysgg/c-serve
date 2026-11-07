@@ -90,6 +90,36 @@ static void secure(CSERVE_HTTPD_REPLY *rep, int i) {
   memcpy(rep->headers, lines, n);
 }
 
+/* app i's routes asked: 1 when one of its patterns fits (it answered, or
+ * its refuse did, or the router's 405), 0 when none does */
+static int route(int i, const CSERVE_HTTPD_REQ *r, const char *body,
+                 CSERVE_HTTPD_REPLY *rep) {
+  const CSERVE_APP *app = H.apps[i];
+  const CSERVE_ROUTE *routes = CSERVE_APP_SLOT(app, routes);
+  void (*refuse)(const CSERVE_HTTPD_REQ *, const char *, unsigned,
+                 CSERVE_HTTPD_REPLY *) = CSERVE_APP_SLOT(app, refuse);
+  if (!routes) {
+    return 0;
+  }
+  if (!refuse) {
+    return cserve_route_dispatch(routes, app->nroutes, r, body, rep);
+  }
+  CSERVE_ROUTE_MATCH m;
+  unsigned allow;
+  int k = cserve_route_find(routes, app->nroutes, r, &m, &allow);
+  if (k >= 0) {
+    routes[k].fn(r, body, &m, rep);
+  } else if (allow) {
+    refuse(r, body, allow, rep);
+  } else {
+    return 0;
+  }
+  if (!rep->status) {
+    text(rep, 500, "an app's route answered nothing\n");
+  }
+  return 1;
+}
+
 static void handle(const CSERVE_HTTPD_REQ *r, const char *body,
                    CSERVE_HTTPD_REPLY *rep, void *ud) {
   const CONN_CTX *cc = ud;
@@ -104,9 +134,7 @@ static void handle(const CSERVE_HTTPD_REQ *r, const char *body,
     by = "refused";
   } else {
     for (int i = 0; i < H.napps && !rep->status; i++) {
-      const CSERVE_ROUTE *routes = CSERVE_APP_SLOT(H.apps[i], routes);
-      if (routes &&
-          cserve_route_dispatch(routes, H.apps[i]->nroutes, r, body, rep)) {
+      if (route(i, r, body, rep)) {
         by = H.apps[i]->name;
         secure(rep, i);
       }

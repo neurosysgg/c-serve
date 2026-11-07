@@ -44,6 +44,12 @@ typedef struct CSERVE_APP {
    * plain 404 */
   void (*not_found)(const CSERVE_HTTPD_REQ *r, const char *body,
                     CSERVE_HTTPD_REPLY *rep);
+  /* a request one of its routes' patterns fits but none of their methods
+   * does: allow is those methods (CSERVE_GET | ...; cserve_route_allow_
+   * text() spells them), and the app answers -- its own 405, an OPTIONS's
+   * 204. NULL: the router's plain 405 with Allow */
+  void (*refuse)(const CSERVE_HTTPD_REQ *r, const char *body, unsigned allow,
+                 CSERVE_HTTPD_REPLY *rep);
 } CSERVE_APP;
 
 #define CSERVE_APP_HEADER(n)                                                   \

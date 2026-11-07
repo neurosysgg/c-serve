@@ -146,8 +146,32 @@ static void test_dispatch(void) {
                      "an encoded \"..\": no capture takes it");
 }
 
+static void test_find(void) {
+  char buf[512], err[128], allow[64];
+  snprintf(buf, sizeof buf, "PUT /releases/ill HTTP/1.1\r\nHost: h\r\n\r\n");
+  CSERVE_HTTPD_REQ r;
+  CSERVE_ROUTE_MATCH m;
+  unsigned methods = 0;
+  int n = (int)(sizeof ROUTES / sizeof *ROUTES);
+  int parsed = cserve_httpd_parse(buf, &r, err, sizeof err) == 0;
+  int k = parsed ? cserve_route_find(ROUTES, n, &r, &m, &methods) : 0;
+  cserve_route_allow_text(methods, allow, sizeof allow);
+  CSERVE_TEST_ASSERT(parsed && k == -1 &&
+                         !strcmp(allow, "GET, HEAD, POST, DELETE"),
+                     "find: no method fits, and which would (%s)", allow);
+  snprintf(buf, sizeof buf, "GET /releases/ill HTTP/1.1\r\nHost: h\r\n\r\n");
+  parsed = cserve_httpd_parse(buf, &r, err, sizeof err) == 0;
+  k = parsed ? cserve_route_find(ROUTES, n, &r, &m, &methods) : -1;
+  CSERVE_TEST_ASSERT(k >= 0 && methods == 0 &&
+                         !strcmp(cserve_route_param(&m, "slug"), "ill"),
+                     "find: the route that fits, its captures");
+  cserve_route_allow_text(0, allow, sizeof allow);
+  CSERVE_TEST_ASSERT(!*allow, "no methods: nothing said");
+}
+
 int main(void) {
   test_match();
   test_dispatch();
+  test_find();
   return cserve_test_summary();
 }

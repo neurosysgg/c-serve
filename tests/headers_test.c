@@ -6,6 +6,7 @@
 #include "headers.h"
 #include "policy.h"
 
+#include "data/goldens.h"
 #include "test.h"
 
 #include <stdio.h>
@@ -100,10 +101,41 @@ static void test_arena(void) {
   cserve_arena_free(a);
 }
 
+#define N(a) (sizeof(a) / sizeof *(a))
+
+static void test_challenge(void) {
+  int bad = 0;
+  for (size_t i = 0; i < N(GOLD_RAWURLENCODE); i++) {
+    char out[64];
+    bad += cserve_rawurlencode(GOLD_RAWURLENCODE[i].in, out, sizeof out) != 0 ||
+           strcmp(out, GOLD_RAWURLENCODE[i].out) != 0;
+  }
+  CSERVE_TEST_ASSERT(!bad, "rawurlencode()'s bytes (%zu)",
+                     N(GOLD_RAWURLENCODE));
+  char tiny[3];
+  CSERVE_TEST_ASSERT(cserve_rawurlencode("ab", tiny, sizeof tiny) == 0 &&
+                         cserve_rawurlencode(" ", tiny, sizeof tiny) == -1,
+                     "rawurlencode() into a buffer just big enough, or not");
+  bad = 0;
+  for (size_t i = 0; i < N(GOLD_REALM); i++) {
+    CSERVE_HTTPD_REPLY rep = {0};
+    bad += (cserve_basic_challenge(&rep, GOLD_REALM[i].realm) == 0) !=
+           GOLD_REALM[i].ok;
+  }
+  CSERVE_TEST_ASSERT(!bad, "a realm BasicChallenge takes, and none it refuses");
+  CSERVE_HTTPD_REPLY rep = {0};
+  CSERVE_TEST_ASSERT(
+      cserve_basic_challenge(&rep, "neuro.SYS demo: a%20b") == 0 &&
+          !strcmp(rep.headers, "WWW-Authenticate: Basic "
+                               "realm=\"neuro.SYS demo: a%20b\"\r\n"),
+      "the challenge as BasicChallenge renders it");
+}
+
 int main(void) {
   printf("headers_test\n");
   test_headers();
   test_policy();
   test_arena();
+  test_challenge();
   return cserve_test_summary();
 }

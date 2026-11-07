@@ -22,6 +22,7 @@ typedef enum {
   CSERVE_H_CONTENT_RANGE,
   CSERVE_H_ACCEPT_RANGES,
   CSERVE_H_X_ROBOTS_TAG,
+  CSERVE_H_WWW_AUTHENTICATE,
   CSERVE_H_COUNT
 } CSERVE_HEADER;
 
@@ -41,5 +42,16 @@ typedef enum {
 } CSERVE_CACHE;
 
 const char *cserve_cache_value(CSERVE_CACHE c);
+
+/* WWW-Authenticate: Basic realm="realm" on rep (BasicChallenge): 0, or
+ * -1 when realm is empty or holds what qdtext doesn't -- a '"', a '\\',
+ * a control, a byte past ASCII -- or the headers would outgrow their
+ * buffer. A realm carrying a request's text has it through
+ * cserve_rawurlencode() first. */
+int cserve_basic_challenge(CSERVE_HTTPD_REPLY *rep, const char *realm);
+
+/* s as rawurlencode() writes it (RFC 3986's unreserved kept, every other
+ * byte %XX, upper-case) into out: 0, or -1 when it won't fit in cap */
+int cserve_rawurlencode(const char *s, char *out, size_t cap);
 
 #endif

@@ -2,12 +2,16 @@
  * app (dlopen()ed, built in) and the toolkit (kit/) have to answer --
  * pages in a shell, in two languages, as a document or as the SPA's
  * fragment, validated; a phrase; the language switch's cookie; its own
- * 404 and its security headers */
+ * 404, 405 and OPTIONS, and its security headers; a file from its data
+ * behind a password, in ranges */
 #include "app.h"
+#include "file.h"
 #include "headers.h"
 #include "html.h"
 #include "markup.h"
 #include "page.h"
+#include "password.h"
+#include "reading.h"
 #include "text.h"
 
 #include <stdio.h>
@@ -21,13 +25,18 @@ T(GREETING, "hello, {name} (from {root})", "hallo, {name} (aus {root})");
 T(NOT_FOUND, "nothing at {path}", "nichts unter {path}");
 T(NOT_FOUND_TITLE, "not found", "nicht gefunden");
 T(SWITCH, "deutsch", "english");
+T(READ_ONLY, "hello is read-only.", "hallo ist schreibgesch\xC3\xBCtzt.");
 #undef T
-static const CSERVE_TEXT *const TEXTS[] = {&SITE_NAME, &GREETING, &NOT_FOUND,
-                                           &NOT_FOUND_TITLE, &SWITCH};
+static const CSERVE_TEXT *const TEXTS[] = {
+    &SITE_NAME, &GREETING, &NOT_FOUND, &NOT_FOUND_TITLE, &SWITCH, &READ_ONLY};
 
 static const CSERVE_LANGUAGES LANGS = {{"en", "de"}, 2};
 
-static char g_root[256];
+static char g_root[256], g_data[256];
+
+/* "open sesame", user "hello": a test's password, nobody's secret */
+static const char DIGEST[] = "$pbkdf2-sha256$100000$aGhoaGhoaGhoaGhoaGhoaA==$"
+                             "Q6BUTVDg4JmC3fbGn2UQW2VqnUApAFQdUVTYYah0k1s=";
 
 #define EL(t) cserve_el(a, &cserve_tag_##t)
 #define ATTR(n, attr, v) cserve_attr(a, n, &cserve_attr_##attr, v)
@@ -117,6 +126,72 @@ static void language(const CSERVE_HTTPD_REQ *r, const char *body,
   cserve_httpd_text(rep, 303, NULL, "", 0);
 }
 
+/* /hello-file/{name}: data/name, behind Basic and in ranges -- the 401
+ * the same for a file there is and one there isn't */
+static void hello_file(const CSERVE_HTTPD_REQ *r, const char *body,
+                       const CSERVE_ROUTE_MATCH *m, CSERVE_HTTPD_REPLY *rep) {
+  (void)body;
+  char user[64], pass[128], path[512];
+  cserve_basic_credentials(cserve_httpd_header(r, "Authorization"), user,
+                           sizeof user, pass, sizeof pass);
+  int user_ok = strcmp(user, "hello") == 0;
+  int pass_ok = cserve_password_matches(DIGEST, pass, strlen(pass));
+  if (!user_ok || !pass_ok) {
+    char realm[160], name[128];
+    if (cserve_rawurlencode(cserve_route_param(m, "name"), name, sizeof name) !=
+            0 ||
+        snprintf(realm, sizeof realm, "hello: %s", name) >= (int)sizeof realm ||
+        cserve_basic_challenge(rep, realm) != 0) {
+      rep->headers[0] = '\0';
+      cserve_httpd_text(rep, 500, "text/plain; charset=utf-8", "", 0);
+      return;
+    }
+    cserve_httpd_text(rep, 401, "text/plain; charset=utf-8", "", 0);
+    return;
+  }
+  if (!*g_data ||
+      snprintf(path, sizeof path, "%s/%s", g_data,
+               cserve_route_param(m, "name")) >= (int)sizeof path ||
+      cserve_file_reply(r, path, "text/plain", rep) != 0) {
+    if (!rep->status) {
+      cserve_httpd_text(rep, 404, "text/plain; charset=utf-8", "", 0);
+    }
+    return;
+  }
+  if (cserve_header(rep, CSERVE_H_X_ROBOTS_TAG, "noindex") != 0) {
+    rep->status = 500;
+  }
+}
+
+/* a method none of its routes take: an OPTIONS is told which they do
+ * (204), anything else that this is read-only, in the visitor's
+ * language (405) */
+static void refuse(const CSERVE_HTTPD_REQ *r, const char *body, unsigned allow,
+                   CSERVE_HTTPD_REPLY *rep) {
+  (void)body;
+  char methods[64];
+  if (!strcmp(r->method, "OPTIONS")) {
+    cserve_route_allow_text(allow | CSERVE_OPTIONS, methods, sizeof methods);
+    if (cserve_header(rep, CSERVE_H_ALLOW, methods) == 0) {
+      cserve_httpd_text(rep, 204, NULL, "", 0);
+    }
+    return;
+  }
+  cserve_route_allow_text(allow, methods, sizeof methods);
+  CSERVE_ARENA *a = cserve_arena_new();
+  const char *words =
+      a ? cserve_tr_in(a, &READ_ONLY, cserve_page_language(&SITE, r)) : NULL;
+  char text[128];
+  if (words &&
+      cserve_header(rep, CSERVE_H_CACHE_CONTROL,
+                    cserve_cache_value(CSERVE_CACHE_NO_STORE)) == 0 &&
+      cserve_header(rep, CSERVE_H_ALLOW, methods) == 0) {
+    int n = snprintf(text, sizeof text, "%s\n", words);
+    cserve_httpd_text(rep, 405, "text/plain; charset=utf-8", text, (size_t)n);
+  }
+  cserve_arena_free(a);
+}
+
 static void not_found(const CSERVE_HTTPD_REQ *r, const char *body,
                       CSERVE_HTTPD_REPLY *rep) {
   (void)body;
@@ -134,6 +209,7 @@ static const CSERVE_ROUTE ROUTES[] = {
     {CSERVE_GET, "/hello", hello},
     {CSERVE_GET, "/hello/{name}", hello},
     {CSERVE_GET, "/language/{language}", language},
+    {CSERVE_GET, "/hello-file/{name}", hello_file},
 };
 
 static const char *const IMAGES[] = {"https://images.example", NULL};
@@ -148,6 +224,11 @@ static int init(const CSERVE_APP_ENV *env, char *err, size_t err_cap) {
     snprintf(err, err_cap, "a root too long for hello");
     return -1;
   }
+  if (snprintf(g_data, sizeof g_data, "%s", env->data ? env->data : "") >=
+      (int)sizeof g_data) {
+    snprintf(err, err_cap, "a data directory too long for hello");
+    return -1;
+  }
   return 0;
 }
 
@@ -155,4 +236,5 @@ const CSERVE_APP cserve_app_hello = {
     CSERVE_APP_HEADER("hello"), .init = init,
     .routes = ROUTES,           .nroutes = sizeof ROUTES / sizeof *ROUTES,
     .security = &SECURITY,      .not_found = not_found,
+    .refuse = refuse,
 };

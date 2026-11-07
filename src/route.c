@@ -113,35 +113,52 @@ static unsigned allowed(unsigned methods) {
   return methods & CSERVE_GET ? methods | CSERVE_HEAD : methods;
 }
 
-int cserve_route_dispatch(const CSERVE_ROUTE *routes, int n,
-                          const CSERVE_HTTPD_REQ *r, const char *body,
-                          CSERVE_HTTPD_REPLY *rep) {
-  unsigned want = cserve_route_method(r->method), allow = 0;
-  CSERVE_ROUTE_MATCH m;
+int cserve_route_find(const CSERVE_ROUTE *routes, int n,
+                      const CSERVE_HTTPD_REQ *r, CSERVE_ROUTE_MATCH *m,
+                      unsigned *allow) {
+  unsigned want = cserve_route_method(r->method);
+  *allow = 0;
   for (int i = 0; i < n; i++) {
-    if (!cserve_route_match(routes[i].pattern, r->path, &m)) {
+    if (!cserve_route_match(routes[i].pattern, r->path, m)) {
       continue;
     }
     if (want & allowed(routes[i].methods)) {
-      routes[i].fn(r, body, &m, rep);
-      return 1;
+      return i;
     }
-    allow |= allowed(routes[i].methods);
+    *allow |= allowed(routes[i].methods);
+  }
+  return -1;
+}
+
+void cserve_route_allow_text(unsigned allow, char *out, size_t cap) {
+  size_t k = 0;
+  const char *sep = "";
+  out[0] = '\0';
+  for (size_t i = 0; i < sizeof METHODS / sizeof *METHODS && k < cap; i++) {
+    if (allow & METHODS[i].bit) {
+      k += (size_t)snprintf(out + k, cap - k, "%s%s", sep, METHODS[i].name);
+      sep = ", ";
+    }
+  }
+}
+
+int cserve_route_dispatch(const CSERVE_ROUTE *routes, int n,
+                          const CSERVE_HTTPD_REQ *r, const char *body,
+                          CSERVE_HTTPD_REPLY *rep) {
+  CSERVE_ROUTE_MATCH m;
+  unsigned allow;
+  int i = cserve_route_find(routes, n, r, &m, &allow);
+  if (i >= 0) {
+    routes[i].fn(r, body, &m, rep);
+    return 1;
   }
   if (!allow) {
     return 0;
   }
   /* "Allow: GET, HEAD, POST\r\n", in METHODS' order */
-  size_t k = (size_t)snprintf(rep->headers, sizeof rep->headers, "Allow:");
-  const char *sep = " ";
-  for (size_t i = 0; i < sizeof METHODS / sizeof *METHODS; i++) {
-    if (allow & METHODS[i].bit) {
-      k += (size_t)snprintf(rep->headers + k, sizeof rep->headers - k, "%s%s",
-                            sep, METHODS[i].name);
-      sep = ", ";
-    }
-  }
-  snprintf(rep->headers + k, sizeof rep->headers - k, "\r\n");
+  char methods[64];
+  cserve_route_allow_text(allow, methods, sizeof methods);
+  snprintf(rep->headers, sizeof rep->headers, "Allow: %s\r\n", methods);
   static const char TEXT[] = "method not allowed\n";
   cserve_httpd_text(rep, 405, "text/plain; charset=utf-8", TEXT,
                     sizeof TEXT - 1);

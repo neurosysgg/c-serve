@@ -66,6 +66,10 @@ typedef struct {
   char headers[4096];
   int (*stream)(CSERVE_HTTPD_OUT *o, void *stream_ud);
   void *stream_ud;
+  /* > 0: the streamed body's exact length, said as Content-Length (no
+   * chunks, the connection kept, a HEAD told it too); a stream that
+   * writes fewer bytes returns -1 and the connection closes */
+  long long stream_length;
 } CSERVE_HTTPD_REPLY;
 
 /* the reply's text as body: a copy (owned), or a 500 */

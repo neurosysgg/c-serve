@@ -83,7 +83,15 @@ def kit():
             j(b"\x05\xed\xa0\x80\xf4\x90\x80\x80", "/\t/evil.example"),
             j(b"\x05x", "mailto:x@y"),
             j(b"\x05x", " \\\\host"),
-            j(b"\x05x", "javascript:alert(1)")]
+            j(b"\x05x", "javascript:alert(1)"),
+            b'\x06{"wna-bootleg": {"title": "t\\u00fc", "tracks": '
+            b'[{"label": "v3", "file": "v3.mp3", "seconds": 212}]}}',
+            b'\x06[1, -0.5e+3, true, null, "\\ud834\\udd1e"]',
+            b"\x07Basic ZGVtbzpwdw==",
+            b"\x07basic  ZG Vt bzp wdw",
+            b"\x08$pbkdf2-sha256$600000$jWXwxWGgMNM2dKmTGRBisg==$"
+            b"bDb5fZLtrtLDo8Z4gNiC4h5z6lYAShkliLFKEZ/JmOU=",
+            b"\x09wna-bootleg \xc3\xbc\"%"]
 
 
 SEEDS = {"http": http, "kit": kit}

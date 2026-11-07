@@ -61,10 +61,21 @@ TESTS = $(patsubst tests/%_test.c,%,$(wildcard tests/*_test.c))
 FUZZERS = $(patsubst fuzz/%.c,%,$(filter-out fuzz/fuzz.h,$(wildcard fuzz/*.c)))
 
 # the apps (apps/NAME/*.c, each exporting cserve_app_NAME): a .so each for
-# the development host, and STATIC_APPS linked into the production one
-APPS = $(notdir $(wildcard apps/*))
+# the development host, and STATIC_APPS linked into the production one.
+# EXTERNAL_APPS adds apps kept elsewhere, as NAME=DIR pairs (neurosys's:
+# neurosys=/srv/http/neurosys/app): DIR's *.c, at any depth but under a
+# build/, compiled with DIR and DIR/gen on the include path
+EXTERNAL_APPS ?=
+ext_name = $(word 1,$(subst =, ,$(1)))
+ext_dir = $(word 2,$(subst =, ,$(1)))
+EXT_NAMES = $(foreach e,$(EXTERNAL_APPS),$(call ext_name,$(e)))
+ext_dir_of = $(foreach e,$(EXTERNAL_APPS),$(if $(filter $(1),$(call ext_name,$(e))),$(call ext_dir,$(e))))
+ext_src = $(shell find $(call ext_dir_of,$(1)) -name '*.c' -not -path '*/build/*' | sort)
+APPS = $(notdir $(wildcard apps/*)) $(EXT_NAMES)
 STATIC_APPS ?= hello
-app_src = $(wildcard $(1:%=apps/%/*.c))
+app_src = $(foreach a,$(1),$(if $(filter $(a),$(EXT_NAMES)),$(call ext_src,$(a)),$(wildcard apps/$(a)/*.c)))
+app_obj = $(foreach a,$(1),$(if $(filter $(a),$(EXT_NAMES)),$(patsubst \
+	$(call ext_dir_of,$(a))/%.c,$(B)/ext/$(a)/%.o,$(call ext_src,$(a))),$(call obj,$(wildcard apps/$(a)/*.c))))
 
 all: $(B)/libcserve.a $(BIN)/cserve $(BIN)/cserve-static $(APPS:%=$(BIN)/apps/%.so)
 
@@ -80,6 +91,13 @@ $(B)/%.o: %.c
 
 # an app's objects go into a .so too
 $(B)/apps/%.o: CFLAGS += -fPIC
+
+define EXT_RULES
+$(B)/ext/$(1)/%.o: $(2)/%.c
+	@mkdir -p $$(@D)
+	$$(CC) $$(CFLAGS) -fPIC -I$(2) -I$(2)/gen -MMD -MP -c $$< -o $$@
+endef
+$(foreach e,$(EXTERNAL_APPS),$(eval $(call EXT_RULES,$(call ext_name,$(e)),$(call ext_dir,$(e)))))
 
 # the host, twice: cserve dlopen()s the apps it's given as paths (its own
 # symbols exported for them: -rdynamic, the whole library), cserve-static
@@ -109,12 +127,12 @@ $(BIN)/cserve: $(B)/host/main-dev.o $(B)/gen/apps-dev.o $(B)/libcserve.a
 		-Wl,--no-whole-archive $(LDLIBS) -ldl -o $@
 
 $(BIN)/cserve-static: $(B)/host/main.o $(B)/gen/apps-static.o \
-		$(call obj,$(call app_src,$(STATIC_APPS))) $(B)/libcserve.a
+		$(call app_obj,$(STATIC_APPS)) $(B)/libcserve.a
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 .SECONDEXPANSION:
-$(BIN)/apps/%.so: $$(call obj,$$(call app_src,%))
+$(BIN)/apps/%.so: $$(call app_obj,%)
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) -shared $^ -o $@
 
@@ -144,7 +162,14 @@ check:
 	$(MAKE) --no-print-directory -j$(shell nproc) SAN= TSAN= all test
 	$(MAKE) --no-print-directory SAN= TSAN= lint
 
-FMT_SRC = $(wildcard src/*.[ch] kit/*.[ch] host/*.c apps/*/*.[ch] tests/*.[ch] fuzz/*.[ch])
+# an external app's own sources are linted with ours; what it generates
+# (DIR/gen/) is checked for markup only
+EXT_SRC = $(foreach a,$(EXT_NAMES),$(call ext_src,$(a)))
+EXT_OWN = $(foreach f,$(EXT_SRC),$(if $(findstring /gen/,$(f)),,$(f)))
+EXT_HDR = $(foreach e,$(EXTERNAL_APPS),$(shell find $(call ext_dir,$(e)) -name '*.h' \
+	-not -path '*/build/*' -not -path '*/gen/*'))
+FMT_SRC = $(wildcard src/*.[ch] kit/*.[ch] host/*.c apps/*/*.[ch] tests/*.[ch] fuzz/*.[ch]) \
+	$(EXT_OWN) $(EXT_HDR)
 # clang-tidy's bugprone-* and cert-*, minus the policy checks ctui-wm's
 # tools/lint.py keeps quiet for the same reasons (each is said there); no
 # baseline: a finding fails
@@ -166,7 +191,7 @@ CPPCHECK_QUIET = nullPointerOutOfMemory nullPointerOutOfResources \
 
 # a page is a tree (kit/markup.h): only markup.c writes a '<', so a string
 # literal holding a tag anywhere else in the toolkit or an app is refused
-MARKUP_FREE = $(filter-out kit/markup.c,$(KIT_SRC)) $(wildcard apps/*/*.c)
+MARKUP_FREE = $(filter-out kit/markup.c,$(KIT_SRC)) $(wildcard apps/*/*.c) $(EXT_SRC)
 
 lint:
 	@if grep -n '"[^"]*<[A-Za-z/!]' $(MARKUP_FREE); then \
@@ -174,10 +199,12 @@ lint:
 		exit 1; fi; echo "markup: clean"
 	clang-format --dry-run -Werror $(FMT_SRC) && echo "clang-format: clean"
 	clang-tidy --quiet --warnings-as-errors='*' --checks='$(TIDY_CHECKS)' \
-		$(SRC) host/main.c $(call app_src,$(APPS)) -- $(CFLAGS) -DCSERVE_DLOPEN \
+		$(SRC) host/main.c $(wildcard apps/*/*.c) $(EXT_OWN) -- $(CFLAGS) -DCSERVE_DLOPEN \
+		$(foreach e,$(EXTERNAL_APPS),-I$(call ext_dir,$(e)) -I$(call ext_dir,$(e))/gen) \
 		&& echo "clang-tidy: clean"
 	cppcheck --quiet --error-exitcode=1 --enable=warning,portability --std=c11 -Isrc -Ikit \
 		-DCSERVE_DLOPEN $(CPPCHECK_QUIET:%=--suppress=%) src kit host apps \
+		$(foreach e,$(EXTERNAL_APPS),-I$(call ext_dir,$(e))/gen $(call ext_dir,$(e))) \
 		&& echo "cppcheck: clean"
 
 format:

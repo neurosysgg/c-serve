@@ -68,4 +68,14 @@ typedef enum {
 CSERVE_RANGE cserve_range(const char *header, long long size, long long *first,
                           long long *last);
 
+/* the user and password an Authorization header carries in Basic
+ * (AuthScheme::credentials): "Basic", any case, one or more spaces, then
+ * base64 as PHP's strict base64_decode() reads it (whitespace stepped
+ * over, padding optional but never wrong), split at its first ':' -- none
+ * is a user with no password. 0 with both written, 1 with both empty: no
+ * Basic credential, one that doesn't decode, holds a NUL, or won't fit.
+ * Either way the caller compares: an empty password matches no digest. */
+int cserve_basic_credentials(const char *authorization, char *user,
+                             size_t user_cap, char *pass, size_t pass_cap);
+
 #endif

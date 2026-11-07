@@ -55,6 +55,17 @@ int cserve_route_match(const char *pattern, const char *path,
 /* a capture's value ("slug"), or NULL */
 const char *cserve_route_param(const CSERVE_ROUTE_MATCH *m, const char *name);
 
+/* the first of routes (n of them) whose pattern and method fit r: its
+ * index, with m its captures; or -1, with *allow the methods the patterns
+ * that fit take (0: none fits) */
+int cserve_route_find(const CSERVE_ROUTE *routes, int n,
+                      const CSERVE_HTTPD_REQ *r, CSERVE_ROUTE_MATCH *m,
+                      unsigned *allow);
+
+/* allow as an Allow header's value ("GET, HEAD, POST", in the order the
+ * methods are listed above) into out (cap bytes; 64 hold them all) */
+void cserve_route_allow_text(unsigned allow, char *out, size_t cap);
+
 /* r against routes (n of them), in order: 1 when one answered -- the first
  * whose pattern and method fit, or a 405 with Allow when patterns fit but
  * no method does -- 0 when no pattern fits (the next in line's) */

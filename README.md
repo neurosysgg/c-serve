@@ -16,18 +16,25 @@ and carries a small web host, `cserve`, whose sites are compiled in as first-cla
 | `src/net.{c,h}` + `src/http_types.h` | the blocking client: redirects, keep-alive, a streamed body |
 | `src/static.{c,h}` | a web root's files as phpanta's `.htaccess` serves them: the build stamp stripped, types, cache tiers, ETag / 304; everything else the front's |
 | `src/cgi.{c,h}` + `src/process.{c,h}` | a front controller (php-cgi) per request: Apache's CGI variables, the body fed while the reply streams, every wait bounded |
-| `src/route.{c,h}` | an app's routes: `/releases/{slug}`, a trailing `*`, a 405 with `Allow` |
+| `src/route.{c,h}` | an app's routes: `/releases/{slug}`, a trailing `*`, a 405 with `Allow` (or the app's own, `refuse`) |
 | `src/app.{h}` | the app ABI: one vtable per app, `cserve_app_<name>`, slots only ever appended |
 | `src/policy.{c,h}` | an app's security headers built from what it loads elsewhere: HSTS, the CSP, and the rest, phpanta's values |
 | `src/log.{c,h}` | the one hook everything says things through |
 | `kit/arena.{c,h}` | one request's memory, and its first error |
-| `kit/reading.{c,h}` | a query parameter, a cookie, Accept-Language, If-None-Match, Range, the SPA's fetch — pure, on strings |
+| `kit/reading.{c,h}` | a query parameter, a cookie, Accept-Language, If-None-Match, Range, the SPA's fetch, Basic credentials — pure, on strings |
 | `kit/text.{c,h}` | languages and catalogs: every word in each language, a phrase's `{name}`, resolved at render |
 | `kit/markup.{c,h}` + `kit/html.{c,h}` | the page as a tree, HTML's tags and attributes typed, render with escaping and the URL check in it |
-| `kit/headers.{c,h}` | a reply's headers by name, refusing a value that would end one |
+| `kit/headers.{c,h}` | a reply's headers by name, refusing a value that would end one; a Basic challenge whose realm is qdtext |
+| `kit/file.{c,h}` | a file answered, whole or the one range a GET asks for, read as it is sent |
+| `kit/password.{c,h}` | a password against a `$pbkdf2-sha256$` digest (mbedtls), the time a wrong one or none costs the same |
+| `kit/json.{c,h}` | a file an app reads at start-up, as a tree: ctui's parser, made strict |
 | `kit/page.{c,h}` | a view answered: the shell or the fragment, the language, ETag / 304, Vary |
 | `host/main.c` | `cserve`: listeners (plain, TLS, mutual TLS), then a file, an app's route, the front, the app's 404, or 404 |
 | `apps/hello/` | the test app: the ABI, both ways of linking, and the toolkit end to end |
+
+An app may live outside this tree: `EXTERNAL_APPS="name=DIR"` builds DIR's `*.c` (at any depth,
+DIR and DIR/gen on the include path) as `apps/name`, in either link mode, and lints it with
+everything else (neurosys's: `make EXTERNAL_APPS=neurosys=/srv/http/neurosys/app`).
 
 `kit/` is an app's toolkit, what phpanta was to a site: an app builds a page as a tree of nodes
 and never as a string, every word it says is a catalog entry in each of its languages (one missing

@@ -17,6 +17,8 @@ repo's log and in ctui-wm's HISTORY.md.
   development host alone). No buffer type, no logger, no config of anyone's: a helper that needs
   a caller's buffer takes a callback (`cserve_httpd_escape`), and what the library says goes
   through `log.h`'s one hook, which a host points at its own log.
+- **An app may be out of tree** (`EXTERNAL_APPS`), and is then held to every rule here: lint
+  reaches it, and it carries a copy of `.clang-format`.
 - **The app ABI only grows.** A slot is appended to `CSERVE_APP`, never inserted, renamed or
   retyped; a host reads one through `CSERVE_APP_SLOT`, so an app built against fewer slots
   still loads. Bump `CSERVE_APP_ABI` only for a break, and then every app is rebuilt.

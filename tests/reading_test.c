@@ -148,6 +148,31 @@ static void test_range(void) {
                      N(GOLD_RANGE), bad);
 }
 
+static void test_basic(void) {
+  int bad = 0;
+  for (size_t i = 0; i < N(GOLD_BASIC); i++) {
+    char user[256], pass[256];
+    cserve_basic_credentials(GOLD_BASIC[i].header, user, sizeof user, pass,
+                             sizeof pass);
+    if (strcmp(user, GOLD_BASIC[i].user) || strcmp(pass, GOLD_BASIC[i].pass)) {
+      printf("    %s: \"%s\" \"%s\"\n", GOLD_BASIC[i].header, user, pass);
+      bad++;
+    }
+  }
+  CSERVE_TEST_ASSERT(!bad, "Basic credentials as AuthScheme reads them (%zu)",
+                     N(GOLD_BASIC));
+  char user[4], pass[4];
+  CSERVE_TEST_ASSERT(
+      cserve_basic_credentials("Basic ZGVtbzpwdw==", user, sizeof user, pass,
+                               sizeof pass) == 1 &&
+          !*user && !*pass &&
+          cserve_basic_credentials("Basic AGE6Yg==", user, sizeof user, pass,
+                                   sizeof pass) == 1 &&
+          cserve_basic_credentials(NULL, user, sizeof user, pass,
+                                   sizeof pass) == 1,
+      "a credential too long, holding a NUL, or none: both empty");
+}
+
 int main(void) {
   printf("reading_test\n");
   test_utf8();
@@ -156,5 +181,6 @@ int main(void) {
   test_accept_language();
   test_etag();
   test_range();
+  test_basic();
   return cserve_test_summary();
 }
