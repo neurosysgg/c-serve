@@ -56,7 +56,7 @@ SRC = $(wildcard src/*.c) $(KIT_SRC)
 # it); the client is net.c
 SERVE_SRC = src/listen.c src/httpd.c src/static.c src/cgi.c src/process.c \
 	src/log.c src/route.c src/policy.c src/heap.c src/pool.c src/loop.c src/tarpit.c \
-	src/acme.c
+	src/acme.c src/wake.c src/stream.c
 CLIENT_SRC = $(filter-out $(SERVE_SRC) $(KIT_SRC),$(SRC))
 TESTS = $(patsubst tests/%_test.c,%,$(wildcard tests/*_test.c))
 FUZZERS = $(patsubst fuzz/%.c,%,$(filter-out fuzz/fuzz.h,$(wildcard fuzz/*.c)))
@@ -68,7 +68,10 @@ FUZZERS = $(patsubst fuzz/%.c,%,$(filter-out fuzz/fuzz.h,$(wildcard fuzz/*.c)))
 # build/ inside DIR (DIR itself may be in one: a site's prod tree is),
 # compiled with DIR and DIR/gen on the include path. A second build of
 # the same app from another DIR takes a B= of its own, or the two share
-# objects and binaries
+# objects and binaries. An app's DIR/vendor/ is code it took from
+# elsewhere (comms's SQLite amalgamation): compiled with it, but with
+# warnings off and EXTERNAL_VENDOR_CFLAGS_<name> added, and left out of
+# every lint
 EXTERNAL_APPS ?=
 ext_name = $(word 1,$(subst =, ,$(1)))
 ext_dir = $(word 2,$(subst =, ,$(1)))
@@ -99,7 +102,14 @@ $(B)/%.o: %.c
 # an app's objects go into a .so too
 $(B)/apps/%.o: CFLAGS += -fPIC
 
+# vendored code: the sanitizers and the optimisation as everything else,
+# not our warnings, nor our -std
+VENDOR_CFLAGS = $(filter-out -Wall -Wextra -Wno-format-truncation $(WARN) -std=c11,$(CFLAGS)) \
+	-w -std=gnu11
 define EXT_RULES
+$(B)/ext/$(1)/vendor/%.o: $(2)/vendor/%.c
+	@mkdir -p $$(@D)
+	$$(CC) $$(VENDOR_CFLAGS) $$(EXTERNAL_VENDOR_CFLAGS_$(1)) -fPIC -MMD -MP -c $$< -o $$@
 $(B)/ext/$(1)/%.o: $(2)/%.c
 	@mkdir -p $$(@D)
 	$$(CC) $$(CFLAGS) -fPIC -I$(2) -I$(2)/gen -MMD -MP -c $$< -o $$@
@@ -199,9 +209,10 @@ check:
 # an external app's own sources are linted with ours; what it generates
 # (DIR/gen/) is checked for markup only
 EXT_SRC = $(foreach a,$(EXT_NAMES),$(call ext_src,$(a)))
-EXT_OWN = $(foreach f,$(EXT_SRC),$(if $(findstring /gen/,$(f)),,$(f)))
+EXT_OWN = $(foreach f,$(EXT_SRC),$(if $(findstring /gen/,$(f))$(findstring /vendor/,$(f)),,$(f)))
+EXT_NOT_VENDOR = $(foreach f,$(EXT_SRC),$(if $(findstring /vendor/,$(f)),,$(f)))
 EXT_HDR = $(foreach e,$(EXTERNAL_APPS),$(shell cd $(call ext_dir,$(e)) && find . -name '*.h' \
-	-not -path '*/build/*' -not -path '*/gen/*' | sed 's|^\./|$(call ext_dir,$(e))/|'))
+	-not -path '*/build/*' -not -path '*/gen/*' -not -path '*/vendor/*' | sed 's|^\./|$(call ext_dir,$(e))/|'))
 FMT_SRC = $(wildcard src/*.[ch] kit/*.[ch] host/*.c apps/*/*.[ch] tests/*.[ch] fuzz/*.[ch]) \
 	$(EXT_OWN) $(EXT_HDR)
 # clang-tidy's bugprone-* and cert-*, minus the policy checks ctui-wm's
@@ -225,7 +236,7 @@ CPPCHECK_QUIET = nullPointerOutOfMemory nullPointerOutOfResources \
 
 # a page is a tree (kit/markup.h): only markup.c writes a '<', so a string
 # literal holding a tag anywhere else in the toolkit or an app is refused
-MARKUP_FREE = $(filter-out kit/markup.c,$(KIT_SRC)) $(wildcard apps/*/*.c) $(EXT_SRC)
+MARKUP_FREE = $(filter-out kit/markup.c,$(KIT_SRC)) $(wildcard apps/*/*.c) $(EXT_NOT_VENDOR)
 
 lint:
 	@if grep -n '"[^"]*<[A-Za-z/!]' $(MARKUP_FREE); then \
@@ -238,7 +249,8 @@ lint:
 		&& echo "clang-tidy: clean"
 	cppcheck --quiet --error-exitcode=1 --enable=warning,portability --std=c11 -Isrc -Ikit \
 		-DCSERVE_DLOPEN $(CPPCHECK_QUIET:%=--suppress=%) src kit host apps \
-		$(foreach e,$(EXTERNAL_APPS),-I$(call ext_dir,$(e))/gen $(call ext_dir,$(e))) \
+		$(foreach e,$(EXTERNAL_APPS),-I$(call ext_dir,$(e))/gen -i$(call ext_dir,$(e))/vendor \
+		$(call ext_dir,$(e))) \
 		&& echo "cppcheck: clean"
 
 format:

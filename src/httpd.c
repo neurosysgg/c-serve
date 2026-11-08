@@ -572,8 +572,11 @@ void cserve_httpd_serve(const CSERVE_HTTPD *h, CSERVE_CONN *c,
     CSERVE_HTTPD_REPLY rep = {0};
     h->handler(r, body, &rep, h->ud);
     free(body);
-    if (rep.status == 0) {
+    if (rep.status == 0 || rep.stream) {
+      /* a stream waits for news, and only the loop can wait without a
+       * thread: here it's a 500 */
       cserve_httpd_release(&rep);
+      memset(&rep, 0, sizeof rep);
       cserve_httpd_text(&rep, 500, "text/plain; charset=utf-8", "no answer\n",
                         10);
     }

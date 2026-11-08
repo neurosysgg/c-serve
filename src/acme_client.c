@@ -47,36 +47,6 @@ long cserve_b64url(const unsigned char *in, size_t n, char *out, size_t cap) {
   return (long)o;
 }
 
-long cserve_json_quote(const char *s, char *out, size_t cap) {
-  size_t o = 0;
-  if (cap < 3) {
-    return -1;
-  }
-  out[o++] = '"';
-  for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-    char esc[8];
-    size_t k;
-    if (*p == '"' || *p == '\\') {
-      esc[0] = '\\';
-      esc[1] = (char)*p;
-      k = 2;
-    } else if (*p < 0x20 || *p == 0x7f) {
-      k = (size_t)snprintf(esc, sizeof esc, "\\u%04x", *p);
-    } else {
-      esc[0] = (char)*p;
-      k = 1;
-    }
-    if (o + k + 2 > cap) {
-      return -1;
-    }
-    memcpy(out + o, esc, k);
-    o += k;
-  }
-  out[o++] = '"';
-  out[o] = '\0';
-  return (long)o;
-}
-
 /* --- the key --- */
 
 static int psa_up(char *err, size_t err_cap) {

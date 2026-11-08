@@ -3,6 +3,8 @@
 
 #include "json.h"
 
+#include "arena.h"
+
 #include "reading.h"
 
 #include <locale.h>
@@ -396,4 +398,45 @@ int cserve_json_whole(const CSERVE_JSON *v, long long lo, long long hi,
   }
   *out = (long long)v->number;
   return 0;
+}
+
+/* --- writing --- */
+
+long cserve_json_quote(const char *s, char *out, size_t cap) {
+  size_t o = 0;
+  if (cap < 3) {
+    return -1;
+  }
+  out[o++] = '"';
+  for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    char esc[8];
+    size_t k;
+    if (*p == '"' || *p == '\\') {
+      esc[0] = '\\';
+      esc[1] = (char)*p;
+      k = 2;
+    } else if (*p < 0x20 || *p == 0x7f) {
+      k = (size_t)snprintf(esc, sizeof esc, "\\u%04x", *p);
+    } else {
+      esc[0] = (char)*p;
+      k = 1;
+    }
+    if (o + k + 2 > cap) {
+      return -1;
+    }
+    memcpy(out + o, esc, k);
+    o += k;
+  }
+  out[o++] = '"';
+  out[o] = '\0';
+  return (long)o;
+}
+
+const char *cserve_json_string(CSERVE_ARENA *a, const char *s) {
+  size_t cap = strlen(s) * 6 + 3; /* every byte \u00XX at worst */
+  char *out = cserve_arena_alloc(a, cap);
+  if (!out || cserve_json_quote(s, out, cap) < 0) {
+    return "\"\"";
+  }
+  return out;
 }

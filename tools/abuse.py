@@ -17,12 +17,14 @@ limit sees them as strangers do; the good client is 127.0.0.1.
   per-network   200 connections from one network (the limit is 32)
   flood         900 idle connections from 30 networks
   pool          200 password checks at once (PBKDF2 each): 200 or 503.
-                A page then waits behind what the pool's queue holds (64
-                jobs), so this one bounds the wait rather than removing it;
-                --prompt says how long a page may take (3 s; a sanitizer
-                multiplies every PBKDF2, and make abuse allows for it)
+                They hold at most half the workers (the slow lane), so a
+                page never waits behind them: it must come back within
+                LANE_PROMPT (1 s), whatever --prompt says
   parked        wrong passwords from 40 networks: every 401 held back,
                 none of them holding up anyone else
+  streams       400 streams opened from 20 networks and never read: as
+                many as the cap (256) and the per-network limit let in,
+                503 for the rest, none of it holding a worker
 """
 import os
 import resource
@@ -37,6 +39,9 @@ import time
 
 # a page must come back within this, attack or not (--prompt)
 PROMPT = 3.0
+# ... and within this during a password flood, under any sanitizer: the
+# slow lane keeps half the workers for pages
+LANE_PROMPT = 1.0
 GOOD = ("GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
 WRONG = "aGVsbG86d3Jvbmc="  # hello:wrong
 RIGHT = "aGVsbG86b3BlbiBzZXNhbWU="  # hello:open sesame
@@ -87,7 +92,7 @@ def good_client(port, during, results):
         time.sleep(0.05)
 
 
-def run_attack(name, port, attack, seconds=4):
+def run_attack(name, port, attack, seconds=4, bound=None):
     results = []
     held = []
     stop = threading.Event()
@@ -104,7 +109,7 @@ def run_attack(name, port, attack, seconds=4):
             pass
     slow = max(sec for _, sec in results)
     wrong = [st for st, _ in results if st != 200]
-    ok = results and not wrong and slow < PROMPT
+    ok = results and not wrong and slow < (bound or PROMPT)
     print(("  ok  " if ok else "FAIL  ") +
           f"{name}: {len(results)} pages, the slowest {slow:.2f} s" +
           (f", {len(wrong)} not 200 ({wrong[:5]})" if wrong else ""))
@@ -197,6 +202,18 @@ def parked(port, held, stop):
     stop.wait()
 
 
+def streams(port, held, stop):
+    req = b"GET /hello-stream HTTP/1.1\r\nHost: x\r\n\r\n"
+    for i in range(400):
+        try:
+            s = dial(port, src(130 + i % 20))
+            s.sendall(req)
+            held.append(s)
+        except OSError:
+            pass
+    stop.wait()
+
+
 def main():
     global PROMPT
     args = sys.argv[1:]
@@ -220,13 +237,14 @@ def main():
     host, port = start(args[0], root, data, log_file)
     ok = True
     try:
-        for name, attack in [("slowloris", slowloris),
-                             ("slow-read", slow_read),
-                             ("per-network", per_network),
-                             ("flood", flood),
-                             ("pool", pool),
-                             ("parked", parked)]:
-            ok = run_attack(name, port, attack) and ok
+        for name, attack, bound in [("slowloris", slowloris, None),
+                                    ("slow-read", slow_read, None),
+                                    ("per-network", per_network, None),
+                                    ("flood", flood, None),
+                                    ("pool", pool, LANE_PROMPT),
+                                    ("parked", parked, None),
+                                    ("streams", streams, None)]:
+            ok = run_attack(name, port, attack, bound=bound) and ok
             time.sleep(0.5)
     finally:
         host.send_signal(signal.SIGTERM)

@@ -490,6 +490,64 @@ static void test_limits(void) {
   stop(&r);
 }
 
+/* the slow lane: /block counts as slow */
+static int is_slow(const CSERVE_HTTPD_REQ *r, void *ud) {
+  (void)ud;
+  return !strcmp(r->path, "/block");
+}
+
+static void test_lane(void) {
+  RUN r;
+  CSERVE_LOOP_CONFIG cfg = {.workers = 4, .slow = is_slow};
+  if (start(&r, cfg, NULL) != 0) {
+    CSERVE_TEST_ASSERT(0, "a loop with a slow lane started");
+    return;
+  }
+  size_t len;
+  int closed;
+  gate(0);
+  /* two slow requests: the lane (half of four workers) is full */
+  int a = dial(r.port), b = dial(r.port);
+  say(a, "GET /block HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  say(b, "GET /block HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  struct timespec ts = {0, 100 * 1000000L};
+  nanosleep(&ts, NULL);
+  int c = dial(r.port);
+  say(c, "GET /block HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  char *got = drain(c, 2000, &len, &closed);
+  CSERVE_TEST_ASSERT(strstr(got, " 503 ") && strstr(got, "busy with logins") &&
+                         strstr(got, "Retry-After: 1\r\n") && closed,
+                     "the lane full: a third slow request gets a 503 at once");
+  free(got);
+  close(c);
+  int d = dial(r.port);
+  say(d, "GET /hi HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  got = drain(d, 2000, &len, &closed);
+  CSERVE_TEST_ASSERT(strstr(got, "hi there"),
+                     "the lane full: a page still answered, by a free worker");
+  free(got);
+  close(d);
+  gate(1);
+  int answered = 0;
+  for (int i = 0; i < 2; i++) {
+    int fd = i ? b : a;
+    got = drain(fd, 2000, &len, &closed);
+    answered += strstr(got, "let through") != NULL;
+    free(got);
+    close(fd);
+  }
+  CSERVE_TEST_ASSERT(answered == 2,
+                     "the two in the lane: answered once let go");
+  int e = dial(r.port);
+  say(e, "GET /block HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  got = drain(e, 2000, &len, &closed);
+  CSERVE_TEST_ASSERT(strstr(got, "let through"),
+                     "and the lane has room again after them");
+  free(got);
+  close(e);
+  stop(&r);
+}
+
 static void test_tls(void) {
   char err[200];
   CSERVE_TLS_SERVER *srv =
@@ -602,6 +660,7 @@ int main(void) {
   stop(&r);
   test_deadlines();
   test_limits();
+  test_lane();
   test_tls();
   test_stop();
   pthread_mutex_lock(&g_log_lock);

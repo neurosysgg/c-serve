@@ -78,6 +78,17 @@ const char *cserve_httpd_header(const CSERVE_HTTPD_REQ *r, const char *name);
 /* status's reason phrase ("Not Found"; "" for one it doesn't know) */
 const char *cserve_httpd_reason(int status);
 
+/* a pull's "nothing now" (a stream's: below) */
+#define CSERVE_PULL_WAIT (-2)
+
+/* a stream's handle: which connection, and which use of its slot -- a
+ * wake for one that has gone lands on nothing */
+typedef struct {
+  void *loop;
+  int slot;
+  unsigned gen;
+} CSERVE_STREAM;
+
 /* what a handler answers: status, the body (len bytes; free it if
  * owned), its Content-Type, extra header lines (each ending in CRLF; may
  * be NULL). Or, with pull set, a body of unknown length, pulled a piece
@@ -109,6 +120,16 @@ typedef struct {
    * connection waits on a timer, no worker does. The threaded server
    * sends it at once. */
   long delay_ms;
+  /* A stream (the loop's alone, loop.h): a pulled body that stays open.
+   * Its pull may return CSERVE_PULL_WAIT -- nothing now -- and the loop
+   * parks the connection until cserve_stream_wake() says there's news
+   * or the heartbeat comes round, then pulls again. opened(pull_ud, s)
+   * runs on the loop's thread before the head goes, with the handle a
+   * waker uses; done() is still called once at the end. A stream is
+   * chunked and never keeps its connection. The threaded server refuses
+   * one (a 500). */
+  int stream;
+  void (*opened)(void *ud, CSERVE_STREAM s);
 } CSERVE_HTTPD_REPLY;
 
 /* the reply's body let go: an owned one freed, a pull's done() called

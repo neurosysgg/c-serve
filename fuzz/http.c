@@ -362,12 +362,12 @@ static void on_any(const CSERVE_HTTPD_REQ *r, const char *body,
 }
 
 static const CSERVE_ROUTE FUZZ_ROUTES[] = {
-    {CSERVE_GET, "/", on_any},
-    {CSERVE_GET, "/releases/{slug}", on_any},
-    {CSERVE_GET | CSERVE_POST, "/releases/{slug}/{format}", on_any},
-    {CSERVE_DELETE, "/releases/{slug}/{format}", on_any},
-    {CSERVE_GET, "/assets/*", on_any},
-    {CSERVE_GET, "/{a}/{b}/{c}/*", on_any},
+    {CSERVE_GET, "/", on_any, 0},
+    {CSERVE_GET, "/releases/{slug}", on_any, 0},
+    {CSERVE_GET | CSERVE_POST, "/releases/{slug}/{format}", on_any, 0},
+    {CSERVE_DELETE, "/releases/{slug}/{format}", on_any, 0},
+    {CSERVE_GET, "/assets/*", on_any, 0},
+    {CSERVE_GET, "/{a}/{b}/{c}/*", on_any, 0},
 };
 
 static void paths(const uint8_t *data, size_t size) {

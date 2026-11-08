@@ -13,6 +13,7 @@
 #include "listen.h"
 #include "log.h"
 #include "pool.h"
+#include "wake.h"
 
 #include <errno.h>
 #include <netinet/in.h>
@@ -27,89 +28,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define IN_CAP (CSERVE_HTTPD_HEAD_MAX + 4096)
-#define PULL_CAP 65536
-#define PULL_ROOM 16 /* a chunk's size line, written in front of its data */
-#define LISTEN_MAX 16
-#define EVENTS 64
-/* a refusal for a head cut off by its deadline gets this long to go */
-#define REFUSAL_MS 1000
-/* a closing connection reads what's still coming for this long, at most
- * this much, before it closes (lingering close: see linger()) */
-#define LINGER_MS 2000
-#define LINGER_MAX (256 * 1024)
-
-enum { S_HANDSHAKE, S_HEAD, S_BODY, S_WORK, S_PARKED, S_WRITE, S_LINGER };
-
-/* the reply's pieces, in the order they go */
-enum { P_HEAD, P_BODY, P_PULL, P_END };
-
-/* what an event is for: kind, and for a connection its slot and the
- * generation it had when it was registered (a slot is reused; an event
- * still queued for the one that left must not land on the new one) */
-enum { K_LISTEN = 1, K_POOL, K_STOP, K_CONN, K_WATCH };
-#define WATCH_MAX 4
-#define TAG(kind, gen, i)                                                      \
-  ((uint64_t)(kind) << 56 | (uint64_t)((gen) & 0xffffff) << 32 | (uint32_t)(i))
-#define TAG_KIND(t) ((int)((t) >> 56))
-#define TAG_GEN(t) ((unsigned)(((t) >> 32) & 0xffffff))
-#define TAG_INDEX(t) ((int)(uint32_t)(t))
-
-typedef struct {
-  CSERVE_HEAP_NODE timer; /* first: the heap's node is its connection */
-  int slot, fd, state;
-  unsigned gen;
-  uint32_t events; /* what epoll waits for on it now */
-  int dead;        /* closed while the pool had it: freed when it's back */
-  CSERVE_TLS *tls;
-  int family;
-  unsigned char net[16];
-  char peer[64];
-  int requests; /* answered on it so far */
-  long t0;      /* when the request's head was complete */
-  /* reading */
-  char in[IN_CAP];
-  size_t in_len;
-  CSERVE_HTTPD_FRAME frame;
-  char head[CSERVE_HTTPD_HEAD_MAX];
-  CSERVE_HTTPD_REQ req;
-  int understood; /* req parsed: the reply answers it */
-  char *body;
-  size_t body_got;
-  /* writing */
-  CSERVE_HTTPD_REPLY rep;
-  int keep, chunked, has_body, phase;
-  char refusal[320];
-  char ohead[5120];
-  const char *seg; /* the piece going out, and how far it's got */
-  size_t seg_len, seg_off;
-  char *pull_buf;
-  long long pulled; /* the pulled body's bytes so far */
-  long long sent;   /* the body's bytes the client has taken */
-  size_t lingered;  /* bytes read and dropped while closing */
-} CONN;
-
-struct CSERVE_LOOP {
-  CSERVE_LOOP_CONFIG cfg;
-  int ep;
-  CSERVE_POOL *pool;
-  CSERVE_HEAP heap;
-  CONN **conns;
-  int *free_slots, nfree, parked;
-  atomic_int live; /* read by cserve_loop_conns() from any thread */
-  unsigned gen;
-  struct {
-    int fd;
-    CSERVE_TLS_SERVER *tls;
-  } ls[LISTEN_MAX];
-  int nls;
-  struct {
-    void (*fn)(void *ud);
-    void *ud;
-  } ws[WATCH_MAX];
-  int nws;
-  int stopping;
-};
+#include "loop_conn.h"
 
 static void work(void *job, void *ud) {
   const CSERVE_LOOP *l = ud;
@@ -125,7 +44,7 @@ static void work(void *job, void *ud) {
 
 /* --- a connection's bookkeeping --- */
 
-static void wait_for(CSERVE_LOOP *l, CONN *c, uint32_t events) {
+void cserve_loop_wait_for(CSERVE_LOOP *l, CONN *c, uint32_t events) {
   if (c->events == events || c->fd < 0) {
     return;
   }
@@ -140,12 +59,14 @@ static uint32_t wanted(long r) {
   return r == CSERVE_TLS_WANT_WRITE ? EPOLLOUT : EPOLLIN;
 }
 
-static void due(CSERVE_LOOP *l, CONN *c, long ms) {
+void cserve_loop_due(CSERVE_LOOP *l, CONN *c, long ms) {
   (void)cserve_heap_set(&l->heap, &c->timer, cserve_net_now() + ms);
 }
 
-static void conn_close(CSERVE_LOOP *l, CONN *c) {
+void cserve_loop_close(CSERVE_LOOP *l, CONN *c) {
   cserve_heap_remove(&l->heap, &c->timer);
+  l->streams -= c->streaming;
+  c->streaming = 0;
   if (c->fd >= 0) {
     epoll_ctl(l->ep, EPOLL_CTL_DEL, c->fd, NULL);
     cserve_tls_close(c->tls);
@@ -173,7 +94,7 @@ static const char *family_text(int family) {
   return family == 4 ? "v4" : family == 6 ? "v6" : "?";
 }
 
-static long io_recv(CONN *c, char *buf, size_t n) {
+long cserve_loop_recv(CONN *c, char *buf, size_t n) {
   if (c->tls) {
     char err[200];
     long r = cserve_tls_recv(c->tls, buf, n, err, sizeof err);
@@ -221,8 +142,8 @@ static void linger(CSERVE_LOOP *l, CONN *c) {
   c->tls = NULL;
   shutdown(c->fd, SHUT_WR);
   c->state = S_LINGER;
-  due(l, c, LINGER_MS);
-  wait_for(l, c, EPOLLIN);
+  cserve_loop_due(l, c, LINGER_MS);
+  cserve_loop_wait_for(l, c, EPOLLIN);
 }
 
 static void do_linger(CSERVE_LOOP *l, CONN *c) {
@@ -238,7 +159,7 @@ static void do_linger(CSERVE_LOOP *l, CONN *c) {
     if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       return;
     }
-    conn_close(l, c); /* the client's end, an error, or enough of it */
+    cserve_loop_close(l, c); /* the client's end, an error, or enough of it */
     return;
   }
 }
@@ -267,8 +188,8 @@ static void start_reply(CSERVE_LOOP *l, CONN *c, const CSERVE_HTTPD_REQ *r,
   c->seg_off = 0;
   c->pulled = c->sent = 0;
   c->state = S_WRITE;
-  due(l, c, l->cfg.timeout_ms);
-  wait_for(l, c, EPOLLOUT);
+  cserve_loop_due(l, c, l->cfg.timeout_ms);
+  cserve_loop_wait_for(l, c, EPOLLOUT);
 }
 
 static void refuse(CSERVE_LOOP *l, CONN *c, int status, const char *why,
@@ -290,16 +211,36 @@ static void refuse(CSERVE_LOOP *l, CONN *c, int status, const char *why,
   start_reply(l, c, r, 0);
 }
 
+/* the slow lane's room: half the workers, at least one */
+static int slow_max(const CSERVE_LOOP *l) {
+  return l->cfg.workers / 2 > 0 ? l->cfg.workers / 2 : 1;
+}
+
 static void dispatch(CSERVE_LOOP *l, CONN *c) {
   c->state = S_WORK;
   cserve_heap_remove(&l->heap, &c->timer);
-  wait_for(l, c, 0);
+  cserve_loop_wait_for(l, c, 0);
+  /* a request the handler will spend long on (a password checked) may
+   * hold at most half the workers, queued or running: past that it's told
+   * to come back, so the rest -- the pages -- never wait behind a flood */
+  c->slow = l->cfg.slow && l->cfg.slow(&c->req, l->cfg.ud);
+  if (c->slow && l->slow_out >= slow_max(l)) {
+    c->state = S_WRITE;
+    c->slow = 0;
+    free(c->body);
+    c->body = NULL;
+    refuse(l, c, 503, "busy with logins", &c->req);
+    return;
+  }
   if (cserve_pool_submit(l->pool, c) != 0) {
     c->state = S_WRITE; /* never was the pool's */
+    c->slow = 0;
     free(c->body);
     c->body = NULL;
     refuse(l, c, 503, "the server is busy", &c->req);
+    return;
   }
+  l->slow_out += c->slow;
 }
 
 /* c->head holds a whole head: parsed, its body (some of it, maybe all)
@@ -341,8 +282,8 @@ static void got_head(CSERVE_LOOP *l, CONN *c) {
   c->in_len -= used;
   if (c->req.length > 0 && c->body_got < (size_t)c->req.length) {
     c->state = S_BODY;
-    due(l, c, l->cfg.timeout_ms);
-    wait_for(l, c, EPOLLIN);
+    cserve_loop_due(l, c, l->cfg.timeout_ms);
+    cserve_loop_wait_for(l, c, EPOLLIN);
     return;
   }
   dispatch(l, c);
@@ -366,7 +307,7 @@ static void do_read(CSERVE_LOOP *l, CONN *c) {
         if (status) {
           refuse(l, c, status, err, NULL);
         } else {
-          conn_close(l, c);
+          cserve_loop_close(l, c);
         }
         return;
       }
@@ -374,7 +315,7 @@ static void do_read(CSERVE_LOOP *l, CONN *c) {
         refuse(l, c, 431, "the head is too long", NULL);
         return;
       }
-      n = io_recv(c, c->in + c->in_len, sizeof c->in - c->in_len);
+      n = cserve_loop_recv(c, c->in + c->in_len, sizeof c->in - c->in_len);
       if (n > 0) {
         c->in_len += (size_t)n;
         continue;
@@ -387,7 +328,7 @@ static void do_read(CSERVE_LOOP *l, CONN *c) {
       }
     } else {
       size_t need = (size_t)c->req.length - c->body_got;
-      n = io_recv(c, c->body + c->body_got, need);
+      n = cserve_loop_recv(c, c->body + c->body_got, need);
       if (n > 0) {
         c->body_got += (size_t)n;
         if (c->body_got == (size_t)c->req.length) {
@@ -397,16 +338,16 @@ static void do_read(CSERVE_LOOP *l, CONN *c) {
       }
     }
     if (n == 0 || n == -1) {
-      conn_close(l, c);
+      cserve_loop_close(l, c);
       return;
     }
-    wait_for(l, c, wanted(n));
+    cserve_loop_wait_for(l, c, wanted(n));
     return;
   }
 }
 
 /* the next piece of the reply set going: 1, or 0 when the reply is all
- * out, -1 when its pulled body failed */
+ * out, 2 when a stream has nothing now, -1 when its pulled body failed */
 static int next_piece(CONN *c) {
   long long length = c->rep.stream_length;
   switch (c->phase) {
@@ -429,6 +370,9 @@ static int next_piece(CONN *c) {
     }
     char *data = c->pull_buf + PULL_ROOM;
     long got = c->rep.pull(c->rep.pull_ud, data, PULL_CAP);
+    if (got == CSERVE_PULL_WAIT && c->streaming) {
+      return 2; /* nothing now: the stream waits */
+    }
     if (got < 0 || (length > 0 && c->pulled + got > length) ||
         (got == 0 && length > 0 && c->pulled != length)) {
       return -1;
@@ -470,34 +414,41 @@ static void access_line(const CONN *c) {
               c->sent, cserve_net_now() - c->t0, family_text(c->family));
 }
 
-static void do_write(CSERVE_LOOP *l, CONN *c) {
+void cserve_loop_write(CSERVE_LOOP *l, CONN *c) {
   for (;;) {
     if (c->seg_off == c->seg_len) {
       int more = next_piece(c);
       if (more < 0) {
         cserve_logf(CSERVE_LOG_WARN, "a pulled body failed part-way");
-        conn_close(l, c);
+        cserve_loop_close(l, c);
         return;
       }
       if (more == 0) {
         break;
       }
+      if (more == 2) {
+        /* all it had is out: it waits for news, or the heartbeat */
+        c->state = S_STREAM;
+        cserve_loop_due(l, c, l->cfg.heartbeat_ms);
+        cserve_loop_wait_for(l, c, EPOLLIN);
+        return;
+      }
       continue; /* a piece may be empty: a body of length 0 */
     }
     long n = io_send(c, c->seg + c->seg_off, c->seg_len - c->seg_off);
     if (n == -1) {
-      conn_close(l, c);
+      cserve_loop_close(l, c);
       return;
     }
     if (n < 0) {
-      wait_for(l, c, wanted(n));
+      cserve_loop_wait_for(l, c, wanted(n));
       return;
     }
     c->seg_off += (size_t)n;
     if (c->phase != P_HEAD) {
       c->sent += n;
     }
-    due(l, c, l->cfg.timeout_ms);
+    cserve_loop_due(l, c, l->cfg.timeout_ms);
   }
   /* all of it out */
   access_line(c);
@@ -511,8 +462,8 @@ static void do_write(CSERVE_LOOP *l, CONN *c) {
   c->understood = 0;
   c->t0 = cserve_net_now();
   c->state = S_HEAD;
-  due(l, c, l->cfg.idle_ms);
-  wait_for(l, c, EPOLLIN);
+  cserve_loop_due(l, c, l->cfg.idle_ms);
+  cserve_loop_wait_for(l, c, EPOLLIN);
   do_read(l, c); /* a request may be waiting already (pipelined) */
 }
 
@@ -522,23 +473,24 @@ static void do_handshake(CSERVE_LOOP *l, CONN *c) {
   if (r == -1) {
     cserve_logf(CSERVE_LOG_WARN, "a TLS handshake (%s) refused: %s",
                 family_text(c->family), err);
-    conn_close(l, c);
+    cserve_loop_close(l, c);
     return;
   }
   if (r != 0) {
-    wait_for(l, c, wanted(r));
+    cserve_loop_wait_for(l, c, wanted(r));
     return;
   }
   c->state = S_HEAD;
-  wait_for(l, c, EPOLLIN);
+  cserve_loop_wait_for(l, c, EPOLLIN);
   do_read(l, c);
 }
 
 static void on_conn(CSERVE_LOOP *l, CONN *c, uint32_t ev) {
   /* a hang-up while nothing is read or written: no one to answer */
   if ((ev & EPOLLERR) ||
-      ((ev & EPOLLHUP) && (c->state == S_WORK || c->state == S_PARKED))) {
-    conn_close(l, c);
+      ((ev & EPOLLHUP) &&
+       (c->state == S_WORK || c->state == S_PARKED || c->state == S_STREAM))) {
+    cserve_loop_close(l, c);
     return;
   }
   switch (c->state) {
@@ -550,7 +502,10 @@ static void on_conn(CSERVE_LOOP *l, CONN *c, uint32_t ev) {
     do_read(l, c);
     break;
   case S_WRITE:
-    do_write(l, c);
+    cserve_loop_write(l, c);
+    break;
+  case S_STREAM:
+    cserve_loop_stream_read(l, c);
     break;
   case S_LINGER:
     do_linger(l, c);
@@ -562,32 +517,47 @@ static void on_conn(CSERVE_LOOP *l, CONN *c, uint32_t ev) {
 
 /* the handler's reply on its way */
 static void send_reply(CSERVE_LOOP *l, CONN *c) {
-  int keep =
-      !l->stopping && cserve_httpd_keep(&c->req, &c->rep,
-                                        c->requests + 1 < l->cfg.max_requests);
+  int keep = !l->stopping && !c->streaming &&
+             cserve_httpd_keep(&c->req, &c->rep,
+                               c->requests + 1 < l->cfg.max_requests);
   start_reply(l, c, &c->req, keep);
 }
 
 static void on_pool(CSERVE_LOOP *l) {
   for (CONN *c; (c = cserve_pool_take(l->pool));) {
+    l->slow_out -= c->slow;
+    c->slow = 0;
     free(c->body);
     c->body = NULL;
     c->state = S_WRITE; /* the pool's no longer */
     if (c->dead) {
-      conn_close(l, c);
+      cserve_loop_close(l, c);
       continue;
     }
     c->understood = 1;
+    if (c->rep.stream) {
+      if (!c->rep.pull || l->stopping || l->streams >= l->cfg.streams_max) {
+        refuse(l, c, 503, "no room for another stream", &c->req);
+        continue;
+      }
+      c->streaming = 1;
+      l->streams++;
+      if (c->rep.opened) {
+        c->rep.opened(
+            c->rep.pull_ud,
+            (CSERVE_STREAM){.loop = l, .slot = c->slot, .gen = c->gen});
+      }
+    }
     if (c->rep.delay_ms > 0 && !l->stopping) {
       if (l->parked >= l->cfg.parked_max) {
-        conn_close(l, c);
+        cserve_loop_close(l, c);
         continue;
       }
       /* held back: the connection waits, nothing else does */
       c->state = S_PARKED;
       l->parked++;
-      due(l, c, c->rep.delay_ms);
-      wait_for(l, c, 0);
+      cserve_loop_due(l, c, c->rep.delay_ms);
+      cserve_loop_wait_for(l, c, 0);
       continue;
     }
     send_reply(l, c);
@@ -595,6 +565,11 @@ static void on_pool(CSERVE_LOOP *l) {
 }
 
 static void on_deadline(CSERVE_LOOP *l, CONN *c) {
+  if (c->state == S_STREAM) {
+    cserve_loop_resume(
+        l, c); /* the heartbeat: the pull says something, or nothing */
+    return;
+  }
   if (c->state == S_PARKED) {
     l->parked--;
     c->state = S_WRITE;
@@ -603,10 +578,10 @@ static void on_deadline(CSERVE_LOOP *l, CONN *c) {
   }
   if (c->state == S_HEAD && c->frame.len > 0) {
     refuse(l, c, 400, "the head took too long", NULL);
-    due(l, c, REFUSAL_MS);
+    cserve_loop_due(l, c, REFUSAL_MS);
     return;
   }
-  conn_close(l, c);
+  cserve_loop_close(l, c);
 }
 
 /* the address's network (an IPv4 address, an IPv6 /64) into net: its
@@ -680,13 +655,13 @@ static void on_accept(CSERVE_LOOP *l, int i) {
     if (epoll_ctl(l->ep, EPOLL_CTL_ADD, fd, &ev) != 0 ||
         (l->ls[i].tls && !(c->tls = cserve_tls_server_start(
                                fd, l->ls[i].tls, err, sizeof err)))) {
-      conn_close(l, c);
+      cserve_loop_close(l, c);
       continue;
     }
     if (c->tls) {
       c->state = S_HANDSHAKE;
     }
-    due(l, c, l->cfg.timeout_ms);
+    cserve_loop_due(l, c, l->cfg.timeout_ms);
   }
 }
 
@@ -703,8 +678,8 @@ static void begin_stop(CSERVE_LOOP *l, int stop_fd) {
   for (int i = 0; i < l->cfg.max_conns; i++) {
     CONN *c = l->conns[i];
     if (c && (c->state == S_HANDSHAKE || c->state == S_PARKED ||
-              (c->state == S_HEAD && c->in_len == 0))) {
-      conn_close(l, c);
+              c->state == S_STREAM || (c->state == S_HEAD && c->in_len == 0))) {
+      cserve_loop_close(l, c);
     }
   }
 }
@@ -729,6 +704,8 @@ CSERVE_LOOP *cserve_loop_new(const CSERVE_LOOP_CONFIG *cfg, char *err,
   c->max_conns = c->max_conns > 0 ? c->max_conns : 1024;
   c->per_addr = c->per_addr > 0 ? c->per_addr : 32;
   c->parked_max = c->parked_max > 0 ? c->parked_max : 256;
+  c->streams_max = c->streams_max > 0 ? c->streams_max : 256;
+  c->heartbeat_ms = c->heartbeat_ms > 0 ? c->heartbeat_ms : 25000;
   l->ep = -1;
   /* every connection is an fd, and a listener that can't accept for want
    * of one stays readable: the loop would spin. So there's room for all
@@ -765,6 +742,16 @@ CSERVE_LOOP *cserve_loop_new(const CSERVE_LOOP_CONFIG *cfg, char *err,
   struct epoll_event ev = {.events = EPOLLIN, .data.u64 = TAG(K_POOL, 0, 0)};
   if (epoll_ctl(l->ep, EPOLL_CTL_ADD, cserve_pool_fd(l->pool), &ev) != 0) {
     snprintf(err, err_cap, "epoll: %s", strerror(errno));
+    cserve_loop_free(l);
+    return NULL;
+  }
+  /* a wake per connection twice over before the ring says it overflowed */
+  struct epoll_event wev = {.events = EPOLLIN, .data.u64 = TAG(K_WAKE, 0, 0)};
+  if (!(l->wake = cserve_wake_new((size_t)c->max_conns * 2, err, err_cap)) ||
+      epoll_ctl(l->ep, EPOLL_CTL_ADD, cserve_wake_fd(l->wake), &wev) != 0) {
+    if (l->wake) {
+      snprintf(err, err_cap, "epoll: %s", strerror(errno));
+    }
     cserve_loop_free(l);
     return NULL;
   }
@@ -851,6 +838,8 @@ int cserve_loop_run(CSERVE_LOOP *l, int stop_fd, int grace_ms, char *err,
         on_accept(l, k);
       } else if (kind == K_POOL) {
         on_pool(l);
+      } else if (kind == K_WAKE) {
+        cserve_loop_on_wake(l);
       } else if (kind == K_WATCH && k < l->nws) {
         l->ws[k].fn(l->ws[k].ud);
       } else if (kind == K_CONN && k < l->cfg.max_conns) {
@@ -870,7 +859,7 @@ int cserve_loop_run(CSERVE_LOOP *l, int stop_fd, int grace_ms, char *err,
   /* the grace is over: whatever's left is cut */
   for (int i = 0; i < l->cfg.max_conns; i++) {
     if (l->conns[i] && l->conns[i]->fd >= 0) {
-      conn_close(l, l->conns[i]);
+      cserve_loop_close(l, l->conns[i]);
     }
   }
   return ret;
@@ -888,7 +877,7 @@ void cserve_loop_free(CSERVE_LOOP *l) {
     CONN *c = l->conns[i];
     if (c) {
       c->state = S_WRITE;
-      conn_close(l, c);
+      cserve_loop_close(l, c);
     }
   }
   for (int i = 0; i < l->nls; i++) {
@@ -897,6 +886,7 @@ void cserve_loop_free(CSERVE_LOOP *l) {
     }
   }
   cserve_heap_free(&l->heap);
+  cserve_wake_free(l->wake);
   free(l->conns);
   free(l->free_slots);
   if (l->ep >= 0) {

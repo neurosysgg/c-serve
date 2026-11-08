@@ -41,6 +41,9 @@ typedef struct {
   unsigned methods;    /* CSERVE_GET | ... */
   const char *pattern; /* "/releases/{slug}/{format}" */
   CSERVE_ROUTE_FN fn;
+  /* its handler is slow -- it checks a password -- so the loop keeps it
+   * to the slow lane (loop.h's slow) */
+  int slow;
 } CSERVE_ROUTE;
 
 /* a method's bit ("GET": CSERVE_GET), 0 for one that isn't listed */

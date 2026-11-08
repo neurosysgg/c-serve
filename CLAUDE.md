@@ -65,6 +65,18 @@ ctui-remote's and `cserve-front`'s alone, and the box's binary never calls it.
   either side changes.
 - **mbedtls 4 parses an EC certificate through PSA**: `psa_crypto_init()` before the first
   `mbedtls_x509_crt_parse*()`, or a good certificate reads as none.
+- **A route that checks a password is `slow`.** The loop keeps slow requests to half the
+  workers, and past that answers 503 at once. A password route left unmarked would let a flood
+  of them make every page wait.
+- **A stream's pull runs on the loop and never waits.** It reads what is new, says it, and
+  returns `CSERVE_PULL_WAIT` when there is nothing. A wake (`cserve_stream_wake()`, any thread)
+  carries no data, only "look again", so a wake that is lost or doubled is harmless. The handle
+  holds the slot's generation, so a wake for a stream that has gone lands on nothing.
+- **Key slots and the RNG are taken under `cserve_crypto_lock()`.** mbedtls here has no
+  `MBEDTLS_THREADING_C`, so anything outside `tls.c` that imports, signs, verifies or draws random
+  bytes holds the lock that every TLS call holds. Keyless hashing and PBKDF2 over bytes don't,
+  so a password check never holds up a handshake. A host calls `cserve_crypto_start()` before any
+  thread exists.
 - **`make abuse` when the loop, the pool or the tarpit change**: every attack in
   `tools/abuse.py` must leave a page prompt and the stop clean, under both sanitizers.
 - **A test that races a password check times one first.** PBKDF2 under a sanitizer is several

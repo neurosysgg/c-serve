@@ -55,6 +55,15 @@ typedef struct {
   int per_addr;       /* from one network at once (32) */
   int parked_max;     /* replies held back at once (httpd.h's delay_ms;
                          256): past it, the connection is closed instead */
+  /* on the loop's thread, before a request is queued: non-zero for one
+   * whose handler is slow (a password checked). Those hold at most half
+   * the workers, queued or running; past that a 503 with Retry-After at
+   * once, so a flood of them never makes a page wait. NULL: none is */
+  int (*slow)(const CSERVE_HTTPD_REQ *r, void *ud);
+  int streams_max;  /* streams open at once (httpd.h's stream; 256): past
+                       it a stream is refused with a 503 before its head */
+  int heartbeat_ms; /* a waiting stream is pulled at least this often, so
+                       it can say something to keep the line (25 s) */
 } CSERVE_LOOP_CONFIG;
 
 typedef struct CSERVE_LOOP CSERVE_LOOP;
@@ -68,6 +77,12 @@ CSERVE_LOOP *cserve_loop_new(const CSERVE_LOOP_CONFIG *cfg, char *err,
  * loop closes fd when it's freed. */
 int cserve_loop_listen(CSERVE_LOOP *l, int fd, CSERVE_TLS_SERVER *tls,
                        char *err, size_t err_cap);
+/* A stream (httpd.h) told there's news: its pull is called again soon,
+ * on the loop's thread. Any thread may call it while the loop runs -- a
+ * handler on a worker, typically -- and a wake for a stream that has
+ * ended lands on nothing. */
+void cserve_stream_wake(CSERVE_STREAM s);
+
 /* Before cserve_loop_run(): fd (the caller's, never closed here) watched:
  * whenever it's readable,
  * fn(ud) runs on the loop's thread, between its events -- so it may

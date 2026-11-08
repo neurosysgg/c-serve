@@ -78,4 +78,10 @@ CSERVE_RANGE cserve_range(const char *header, long long size, long long *first,
 int cserve_basic_credentials(const char *authorization, char *user,
                              size_t user_cap, char *pass, size_t pass_cap);
 
+/* s, base64url without padding (RFC 4648 5) and canonical -- the bits
+ * past the last byte zero, no length of 4k+1 -- decoded into out: its
+ * bytes, or -1 for anything else or when it doesn't fit in cap. How a
+ * browser's binary arrives (WebAuthn's fields, a token). */
+long cserve_b64url_decode(const char *s, unsigned char *out, size_t cap);
+
 #endif

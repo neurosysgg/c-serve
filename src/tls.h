@@ -39,6 +39,20 @@ CSERVE_TLS_SERVER *cserve_tls_server_new(const char *cert, const char *key,
                                          size_t err_cap);
 void cserve_tls_server_free(CSERVE_TLS_SERVER *s);
 
+/* The crypto's one lock. mbedtls is built here without
+ * MBEDTLS_THREADING_C, so PSA's key slots and its RNG are guarded by
+ * nothing of their own: every TLS call holds this lock, and so must any
+ * other use of a key slot or the RNG on any thread -- a key imported, a
+ * signature made or checked, psa_generate_random(). Keyless work
+ * (psa_hash_compute(), PBKDF2 over bytes: kit/password.c) touches
+ * neither and runs without it, so a slow password check never holds up
+ * a handshake. Never held across a wait. */
+void cserve_crypto_lock(void);
+void cserve_crypto_unlock(void);
+/* PSA started, once, before any thread could race to start it (a host's
+ * first act): 0, or -1 */
+int cserve_crypto_start(void);
+
 /* Every server speaks TLS 1.3 and nothing older (a client's config keeps
  * 1.2 too: it talks to servers this side doesn't choose).
  *

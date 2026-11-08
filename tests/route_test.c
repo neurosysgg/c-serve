@@ -92,9 +92,9 @@ static void on_write(const CSERVE_HTTPD_REQ *r, const char *body,
 }
 
 static const CSERVE_ROUTE ROUTES[] = {
-    {CSERVE_GET, "/releases/{slug}", on_show},
-    {CSERVE_POST | CSERVE_DELETE, "/releases/{slug}", on_write},
-    {CSERVE_GET, "/about", on_show},
+    {CSERVE_GET, "/releases/{slug}", on_show, 0},
+    {CSERVE_POST | CSERVE_DELETE, "/releases/{slug}", on_write, 0},
+    {CSERVE_GET, "/about", on_show, 0},
 };
 
 /* method target against ROUTES: dispatch's answer, the reply in rep */

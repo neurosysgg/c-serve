@@ -3,7 +3,8 @@
  * pages in a shell, in two languages, as a document or as the SPA's
  * fragment, validated; a phrase; the language switch's cookie; its own
  * 404, 405 and OPTIONS, and its security headers; a file from its data
- * behind a password, in ranges */
+ * behind a password, in ranges; a stream (loop.h) that greets, then
+ * says a comment each time it's pulled */
 #include "app.h"
 #include "file.h"
 #include "headers.h"
@@ -14,6 +15,7 @@
 #include "password.h"
 #include "reading.h"
 #include "text.h"
+#include <stdlib.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -215,11 +217,51 @@ static void not_found(const CSERVE_HTTPD_REQ *r, const char *body,
   cserve_arena_free(a);
 }
 
+/* /hello-stream: one event, then a comment at each pull (the heartbeat)
+ * -- nothing ever wakes it, so it's what a held-open stream costs */
+typedef struct {
+  int greeted, said; /* said: this pull's piece went, the next waits */
+} HELLO_STREAM;
+
+static long stream_pull(void *ud, char *buf, size_t cap) {
+  HELLO_STREAM *s = ud;
+  const char *say = s->greeted ? ":\n\n" : "data: hello\n\n";
+  size_t n = strlen(say);
+  if (s->said || n > cap) {
+    s->said = 0;
+    return CSERVE_PULL_WAIT;
+  }
+  memcpy(buf, say, n);
+  s->greeted = s->said = 1;
+  return (long)n;
+}
+
+static void stream_done(void *ud) { free(ud); }
+
+static void hello_stream(const CSERVE_HTTPD_REQ *r, const char *body,
+                         const CSERVE_ROUTE_MATCH *m, CSERVE_HTTPD_REPLY *rep) {
+  (void)r;
+  (void)body;
+  (void)m;
+  HELLO_STREAM *s = calloc(1, sizeof *s);
+  if (!s) {
+    return; /* no answer: the host's 500 */
+  }
+  rep->status = 200;
+  rep->type = "text/event-stream";
+  rep->pull = stream_pull;
+  rep->done = stream_done;
+  rep->pull_ud = s;
+  rep->stream = 1;
+}
+
 static const CSERVE_ROUTE ROUTES[] = {
-    {CSERVE_GET, "/hello", hello},
-    {CSERVE_GET, "/hello/{name}", hello},
-    {CSERVE_GET, "/language/{language}", language},
-    {CSERVE_GET, "/hello-file/{name}", hello_file},
+    {CSERVE_GET, "/hello", hello, 0},
+    {CSERVE_GET, "/hello/{name}", hello, 0},
+    {CSERVE_GET, "/language/{language}", language, 0},
+    /* behind a password: the slow lane's */
+    {CSERVE_GET, "/hello-file/{name}", hello_file, 1},
+    {CSERVE_GET, "/hello-stream", hello_stream, 0},
 };
 
 static const char *const IMAGES[] = {"https://images.example", NULL};

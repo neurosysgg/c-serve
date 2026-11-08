@@ -20,10 +20,6 @@ int cserve_acme_token_ok(const char *token, size_t n);
  * its length, or -1 when it doesn't fit in cap */
 long cserve_b64url(const unsigned char *in, size_t n, char *out, size_t cap);
 
-/* s as a JSON string, quotes and all, into out (NUL-terminated): its
- * length, or -1 when it doesn't fit; control bytes as \u00XX */
-long cserve_json_quote(const char *s, char *out, size_t cap);
-
 /* A P-256 key, held by PSA for signing, with its public half as a JWK
  * (RFC 7517: crv, kty, x, y -- in that order, which is RFC 7638's for the
  * thumbprint) and that thumbprint (base64url of its SHA-256). */

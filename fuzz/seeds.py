@@ -117,7 +117,13 @@ def kit():
             b"\x07basic  ZG Vt bzp wdw",
             b"\x08$pbkdf2-sha256$600000$jWXwxWGgMNM2dKmTGRBisg==$"
             b"bDb5fZLtrtLDo8Z4gNiC4h5z6lYAShkliLFKEZ/JmOU=",
-            b"\x09wna-bootleg \xc3\xbc\"%"]
+            b"\x09wna-bootleg \xc3\xbc\"%",
+            b'\x0a{"type":"webauthn.get","challenge":"Y2hhbGxlbmdl",'
+            b'"origin":"https://chat.test","crossOrigin":false}',
+            b"\x0b\x04abcd" + bytes(37),
+            b"\x0cline one\nline two\r\nid: 9\revent: x",
+            b"\x0dZm9vYmFy",
+            b"\x0d__Host-s=abc"]
 
 
 SEEDS = {"http": http, "kit": kit}

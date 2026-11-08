@@ -12,6 +12,8 @@ and carries a small web host, `cserve`, whose sites are compiled in as first-cla
 | `src/loop.{c,h}` | the server for the open internet: one epoll loop owns every socket, every wait a deadline, every handler on the pool; caps per connection count and per network, a lingering close, the access log (never an address) |
 | `src/heap.{c,h}` | the loop's timers: a min-heap of deadlines, each node inside what it times |
 | `src/pool.{c,h}` | the loop's workers: a fixed set of threads, a bounded queue (past it, a 503), finished jobs handed back through an eventfd |
+| `src/wake.{c,h}` | tags from any thread to the loop's: a locked ring and an eventfd, how a stream is woken |
+| `src/stream.c` + `src/loop_conn.h` | a loop's streams: parked while they've nothing to say, woken and pulled again; the loop's insides that loop.c and stream.c share |
 | `src/tarpit.{c,h}` | the brake on guessing: a failed login's wait doubling to a cap, keyed on network and account, in a fixed table a flood can't wash out |
 | `src/listen.{c,h}` | listening sockets; the threaded server's thread per connection (ctui-remote's, and `cserve-front`'s) |
 | `src/conn.{c,h}` | a TCP connection with a monotonic deadline, TLS on top; lines and bytes for IMAP / SMTP |
@@ -33,7 +35,10 @@ and carries a small web host, `cserve`, whose sites are compiled in as first-cla
 | `kit/file.{c,h}` | a file answered, whole or the one range a GET asks for, read as it is sent |
 | `kit/login.{c,h}` | a password gate's brake, as an app calls it: a 429 while its key waits, a wrong try's 401 held back |
 | `kit/password.{c,h}` | a password against a `$pbkdf2-sha256$` digest (mbedtls), the time a wrong one or none costs the same |
-| `kit/json.{c,h}` | a file an app reads at start-up, as a tree: ctui's parser, made strict |
+| `kit/json.{c,h}` | a file an app reads at start-up, as a tree: ctui's parser, made strict; a JSON string written |
+| `kit/cookie.{c,h}` | Set-Cookie one way: Secure, Path=/, no Domain, HttpOnly, SameSite; a bad name or value refused |
+| `kit/sse.{c,h}` | server-sent events on a loop stream: an event no data can add a field to, the heartbeat, Last-Event-ID |
+| `kit/passkey.{c,h}` | a passkey checked (ES256, SPKI, no CBOR): the client data, the authenticator data, the attested credential, the signature and its count |
 | `kit/page.{c,h}` | a view answered: the shell or the fragment, the language, ETag / 304, Vary |
 | `host/main.c` | `cserve`: listeners (plain or TLS) on the loop, then a file, an app's route, the app's 404, or 404; with certificates, plain HTTP is an ACME answer or a 308 |
 | `host/acme.c` | `cserve-acme`: certificates from an ACME server by HTTP-01, a process of its own so the account key never shares one with the server |
@@ -89,6 +94,13 @@ guessing off, and says so at start; it exists for a diff against a server that h
 `STATIC_APPS` (`make STATIC_APPS="hello"`) and loads nothing — `--app hello` picks it from the
 table. A PHP site with its front controller as CGI is `cserve-front`'s (`--cgi php-cgi [--front
 FILE] [--env K=V]... [--climb 400|front]`), kept as the reference to diff a native app against.
+
+`--app NAME --for HOST...` binds an app to names: it answers those alone, and an app given none
+answers every name no app claims. `--app-root DIR` gives an app a web root of its own, so one host
+serves two sites by name. A route marked `slow` (one that checks a password) holds at most half the
+workers, so a flood of logins gets quick 503s and never makes a page wait. A reply marked `stream`
+stays open: its pull may say "nothing now", and `cserve_stream_wake()` from any thread, or the
+heartbeat, has it pulled again. That is how `kit/sse` serves an event stream.
 
 ```bash
 make            # build/O2/: libcserve.a, bin/cserve, bin/cserve-static, bin/apps/*.so

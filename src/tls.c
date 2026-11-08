@@ -238,6 +238,16 @@ static int setup_once(char *err, size_t err_cap) {
 static void lock(void) { pthread_mutex_lock(&g_lock); }
 static void unlock(void) { pthread_mutex_unlock(&g_lock); }
 
+void cserve_crypto_lock(void) { lock(); }
+void cserve_crypto_unlock(void) { unlock(); }
+
+int cserve_crypto_start(void) {
+  lock();
+  int ok = psa_crypto_init() == PSA_SUCCESS;
+  unlock();
+  return ok ? 0 : -1;
+}
+
 static void setup_run(void) { g_ready = setup_once(g_err, sizeof g_err) == 0; }
 
 static int setup(char *err, size_t err_cap) {

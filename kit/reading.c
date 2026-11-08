@@ -455,3 +455,38 @@ int cserve_basic_credentials(const char *authorization, char *user,
   pass[pl] = '\0';
   return 0;
 }
+
+long cserve_b64url_decode(const char *s, unsigned char *out, size_t cap) {
+  size_t n = strlen(s), o = 0;
+  if (n % 4 == 1) {
+    return -1;
+  }
+  unsigned acc = 0;
+  int bits = 0;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    int v = c >= 'A' && c <= 'Z'   ? c - 'A'
+            : c >= 'a' && c <= 'z' ? c - 'a' + 26
+            : c >= '0' && c <= '9' ? c - '0' + 52
+            : c == '-'             ? 62
+            : c == '_'             ? 63
+                                   : -1;
+    if (v < 0) {
+      return -1;
+    }
+    acc = (acc << 6 | (unsigned)v) & 0xffffff;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (o == cap) {
+        return -1;
+      }
+      out[o++] = (unsigned char)(acc >> bits);
+    }
+  }
+  /* what's left over must be zero bits: one spelling per value */
+  if (bits && (acc & ((1u << bits) - 1))) {
+    return -1;
+  }
+  return (long)o;
+}

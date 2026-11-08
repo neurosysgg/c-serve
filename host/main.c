@@ -6,7 +6,10 @@
  * --acme-dir, a plain listener answers only an ACME challenge's answer
  * (from --acme-dir, for any Host: it's public, and its token is the
  * gate) or a 308 to the https address -- for one of the certificates'
- * names alone -- and a 404 for the rest. A development build dlopen()s apps
+ * names alone -- and a 404 for the rest. An app given --for HOST...
+ * answers only requests for those names, and one without answers every
+ * name no app claims; --app-root gives an app a web root of its own, so
+ * one host serves two sites by name. A development build dlopen()s apps
  * given as a path (--app apps/hello.so); a production one is linked with its
  * apps (the Makefile's STATIC_APPS) and loads none. */
 /* realpath, sigaction, dlopen: POSIX, not C11 */
@@ -30,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #ifdef CSERVE_DLOPEN
 #include <dlfcn.h>
@@ -40,6 +44,7 @@ extern const CSERVE_APP *const cserve_apps[];
 
 #define LISTEN_MAX 8
 #define APPS_MAX 16
+#define FOR_MAX 8
 
 typedef struct {
   char root[PATH_MAX];
@@ -47,6 +52,13 @@ typedef struct {
   const CSERVE_APP *apps[APPS_MAX];
   char *security[APPS_MAX]; /* each app's security header lines, or NULL */
   int napps;
+  /* --for: the names each app answers alone (none: every name no app
+   * claims); --app-root: its own web root (has_root) */
+  const char *names[APPS_MAX][FOR_MAX];
+  int nnames[APPS_MAX];
+  char roots[APPS_MAX][PATH_MAX];
+  CSERVE_STATIC sts[APPS_MAX];
+  int has_root[APPS_MAX];
   CSERVE_TLS_SERVER *tls; /* --certs: the names' certificates */
   const char *acme;       /* --acme-dir: HTTP-01 answers, by token */
   int verbose;
@@ -61,6 +73,39 @@ static CSERVE_TARPIT *g_pit;
 static int bail(void) {
   cserve_tarpit_free(g_pit);
   g_pit = NULL;
+  return 1;
+}
+
+/* r's Host without its port (n bytes), or NULL */
+static const char *host_of(const CSERVE_HTTPD_REQ *r, size_t *n) {
+  const char *h = cserve_httpd_header(r, "Host");
+  *n = h ? strcspn(h, ":") : 0;
+  return h;
+}
+
+/* whether app i's names include host (n bytes, any case) */
+static int names_it(int i, const char *host, size_t n) {
+  for (int k = 0; host && k < H.nnames[i]; k++) {
+    if (strlen(H.names[i][k]) == n && !strncasecmp(H.names[i][k], host, n)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* whether app i answers r: its own names, or -- with none -- any name no
+ * app has */
+static int serves(int i, const CSERVE_HTTPD_REQ *r) {
+  size_t n;
+  const char *host = host_of(r, &n);
+  if (H.nnames[i]) {
+    return names_it(i, host, n);
+  }
+  for (int k = 0; k < H.napps; k++) {
+    if (names_it(k, host, n)) {
+      return 0;
+    }
+  }
   return 1;
 }
 
@@ -171,6 +216,28 @@ static void plain(const CSERVE_HTTPD_REQ *r, CSERVE_HTTPD_REPLY *rep) {
   }
 }
 
+/* on the loop's thread, before r is queued: whether the route it would
+ * reach is a slow one (route.h), from the routes alone -- pure, nothing
+ * read from disk */
+static int slow(const CSERVE_HTTPD_REQ *r, void *ud) {
+  (void)ud;
+  for (int i = 0; i < H.napps; i++) {
+    if (!serves(i, r)) {
+      continue;
+    }
+    const CSERVE_ROUTE *routes = CSERVE_APP_SLOT(H.apps[i], routes);
+    CSERVE_ROUTE_MATCH m;
+    unsigned allow;
+    int k = routes
+                ? cserve_route_find(routes, H.apps[i]->nroutes, r, &m, &allow)
+                : -1;
+    if (k >= 0) {
+      return routes[k].slow;
+    }
+  }
+  return 0;
+}
+
 static void handle(const CSERVE_HTTPD_REQ *r, const char *body,
                    CSERVE_HTTPD_REPLY *rep, void *ud) {
   (void)ud;
@@ -178,19 +245,31 @@ static void handle(const CSERVE_HTTPD_REQ *r, const char *body,
     plain(r, rep);
     return;
   }
+  /* the web root: the first app answering r that has one of its own,
+   * else the host's */
+  const CSERVE_STATIC *st = &H.st;
+  for (int i = 0; i < H.napps; i++) {
+    if (H.has_root[i] && serves(i, r)) {
+      st = &H.sts[i];
+      break;
+    }
+  }
   CSERVE_STATIC_ROUTE rt;
-  cserve_static_route(&H.st, r->path, &rt);
+  cserve_static_route(st, r->path, &rt);
   if (rt.kind == CSERVE_STATIC_FILE) {
     cserve_static_serve(r, &rt, rep);
   } else if (rt.kind == CSERVE_STATIC_BAD) {
     text(rep, 400, "a path that climbs out\n");
   } else {
     for (int i = 0; i < H.napps && !rep->status; i++) {
-      if (route(i, r, body, rep)) {
+      if (serves(i, r) && route(i, r, body, rep)) {
         secure(rep, i);
       }
     }
     for (int i = 0; i < H.napps && !rep->status; i++) {
+      if (!serves(i, r)) {
+        continue;
+      }
       void (*not_found)(const CSERVE_HTTPD_REQ *, const char *,
                         CSERVE_HTTPD_REPLY *) =
           CSERVE_APP_SLOT(H.apps[i], not_found);
@@ -242,7 +321,8 @@ static int usage(void) {
   fprintf(stderr,
           "usage: cserve --listen HOST:PORT... --root DIR\n"
           "       [--certs DIR --listen-tls HOST:PORT...] [--acme-dir DIR]\n"
-          "       [--app NAME|PATH.so]... [--data DIR] [--workers N]\n"
+          "       [--app NAME|PATH.so [--for HOST]... [--app-root DIR]]...\n"
+          "       [--data DIR] [--workers N]\n"
           "       [--max-conns N] [--per-addr N] [--no-tarpit] [-v]\n");
   return 2;
 }
@@ -326,9 +406,11 @@ static const CSERVE_APP *find_app(const char *name, char *err, size_t cap) {
 int main(int argc, char **argv) {
   const char *listen[LISTEN_MAX], *root = NULL, *certs = NULL;
   const char *app_names[APPS_MAX], *data = NULL;
+  const char *app_roots[APPS_MAX] = {0};
   int nlisten = 0, napp = 0, tarpit = 1, secure_from = 0;
   int is_tls[LISTEN_MAX] = {0};
-  CSERVE_LOOP_CONFIG cfg = {.handler = handle, .server = "c-serve"};
+  CSERVE_LOOP_CONFIG cfg = {
+      .handler = handle, .slow = slow, .server = "c-serve"};
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
     int more = i + 1 < argc;
@@ -345,6 +427,13 @@ int main(int argc, char **argv) {
       H.acme = argv[++i];
     } else if (!strcmp(a, "--app") && more && napp < APPS_MAX) {
       app_names[napp++] = argv[++i];
+    } else if (!strcmp(a, "--for") && more && napp > 0 &&
+               H.nnames[napp - 1] < FOR_MAX &&
+               cserve_tls_name_ok(argv[i + 1], strlen(argv[i + 1]))) {
+      H.names[napp - 1][H.nnames[napp - 1]++] = argv[++i];
+    } else if (!strcmp(a, "--app-root") && more && napp > 0 &&
+               !app_roots[napp - 1]) {
+      app_roots[napp - 1] = argv[++i];
     } else if (!strcmp(a, "--data") && more) {
       data = argv[++i];
     } else if (!strcmp(a, "--workers") && more &&
@@ -367,6 +456,11 @@ int main(int argc, char **argv) {
   /* certificates and a TLS listener come together */
   if (!nlisten || !root || !certs != !secure_from) {
     return usage();
+  }
+  /* before any thread: PSA's start isn't safe to race (tls.h) */
+  if (cserve_crypto_start() != 0) {
+    fprintf(stderr, "cserve: the crypto library didn't start\n");
+    return 1;
   }
   if (!realpath(root, H.root)) {
     fprintf(stderr, "cserve: %s: %s\n", root, strerror(errno));
@@ -392,9 +486,19 @@ int main(int argc, char **argv) {
     cserve_logf(CSERVE_LOG_WARN,
                 "--no-tarpit: failed logins are not slowed down");
   }
-  CSERVE_APP_ENV env = {
-      .root = H.root, .data = data, .tarpit = g_pit ? &pit_api : NULL};
   for (int i = 0; i < napp; i++) {
+    if (app_roots[i] && !realpath(app_roots[i], H.roots[i])) {
+      fprintf(stderr, "cserve: %s: %s\n", app_roots[i], strerror(errno));
+      return bail();
+    }
+    H.has_root[i] = app_roots[i] != NULL;
+    H.sts[i].root = H.roots[i];
+    H.sts[i].climb_front = 1;
+  }
+  for (int i = 0; i < napp; i++) {
+    CSERVE_APP_ENV env = {.root = H.has_root[i] ? H.roots[i] : H.root,
+                          .data = data,
+                          .tarpit = g_pit ? &pit_api : NULL};
     const CSERVE_APP *a = find_app(app_names[i], err, sizeof err);
     int (*init)(const CSERVE_APP_ENV *, char *, size_t) =
         a ? CSERVE_APP_SLOT(a, init) : NULL;

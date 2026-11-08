@@ -44,4 +44,17 @@ const char *cserve_json_str(const CSERVE_JSON *v);
 int cserve_json_whole(const CSERVE_JSON *v, long long lo, long long hi,
                       long long *out);
 
+/* --- writing: what a reply says in JSON --- */
+
+/* s as a JSON string, quotes and all, into out (NUL-terminated): its
+ * length, or -1 when it doesn't fit; '"', '\\' and control bytes
+ * escaped (the last as \u00XX), the rest as it is -- s is the caller's
+ * UTF-8 */
+long cserve_json_quote(const char *s, char *out, size_t cap);
+
+typedef struct CSERVE_ARENA CSERVE_ARENA;
+/* s quoted (as above) into a's memory, to splice into a printf of the
+ * rest; "\"\"" when memory ran out, and a has failed then */
+const char *cserve_json_string(CSERVE_ARENA *a, const char *s);
+
 #endif

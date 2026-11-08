@@ -551,6 +551,43 @@ static void certs(const char *bin) {
   }
 }
 
+/* --for and --app-root: an app answers its names alone, with files of
+ * its own; any other name gets the host's own 404 */
+static void bound(const char *bin) {
+  char root2[PATH_MAX], file[PATH_MAX + 16];
+  snprintf(root2, sizeof root2, "%s/root2", g_dir);
+  mkdir(root2, 0700);
+  snprintf(file, sizeof file, "%s/own.txt", root2);
+  put(file, "its own file\n", 0600);
+  const char *args[] = {"--listen",   "127.0.0.1:0", "--root", g_root,
+                        "--app",      "hello",       "--for",  "a.test",
+                        "--app-root", root2,         NULL};
+  HOST h;
+  int status;
+  if (start(&h, bin, args, &status) != 0) {
+    CSERVE_TEST_ASSERT(0, "--for started (%d)", status);
+    return;
+  }
+  CSERVE_TEST_ASSERT(
+      plain_says(&h, "a.test", "/hello", " 200 ", "hello") &&
+          plain_says(&h, "A.test:8080", "/own.txt", " 200 ", "its own file") &&
+          plain_says(&h, "a.test", "/hello.txt", " 404 ", NULL),
+      "--for a.test: its routes and its own root's files, not "
+      "the host's");
+  CSERVE_TEST_ASSERT(
+      plain_says(&h, "b.test", "/hello", " 404 ", "not found") &&
+          plain_says(&h, "b.test", "/hello.txt", " 200 ", "a file"),
+      "another name: no app answers it, the host's root does");
+  CSERVE_TEST_ASSERT(stop(&h) == 0, "and stopped");
+  const char *early[] = {"--listen", "127.0.0.1:0", "--root", g_root,
+                         "--for",    "a.test",      NULL};
+  const char *bad[] = {"--listen", "127.0.0.1:0", "--root", g_root, "--app",
+                       "hello",    "--for",       "A.Test", NULL};
+  CSERVE_TEST_ASSERT(start(&h, bin, early, &status) != 0 && status == 2 &&
+                         start(&h, bin, bad, &status) != 0 && status == 2,
+                     "--for before any --app, or not a lowercase name: usage");
+}
+
 static void test_hosts(void) {
   char dev[PATH_MAX], stat_bin[PATH_MAX], so[PATH_MAX];
   snprintf(dev, sizeof dev, "%s/cserve", CSERVE_BIN);
@@ -560,6 +597,7 @@ static void test_hosts(void) {
   serve_through(stat_bin, "hello");
   tarpit(stat_bin, "hello");
   certs(stat_bin);
+  bound(stat_bin);
 
   HOST h;
   int status;
