@@ -201,6 +201,55 @@ int cserve_httpd_parse(char *buf, CSERVE_HTTPD_REQ *r, char *err,
   return 0;
 }
 
+int cserve_httpd_frame(CSERVE_HTTPD_FRAME *f, const char *buf, size_t n,
+                       char *out, size_t cap, int *status, char *err,
+                       size_t err_cap) {
+  while (f->pos < n) {
+    const char *start = buf + f->pos;
+    const char *lf = memchr(start, '\n', n - f->pos);
+    /* a line over cap (read_head()'s line reader's limit), decided on
+     * its length alone -- whether its end has come yet or not -- so the
+     * answer doesn't hang on how the bytes arrived; the first one is not
+     * a request at all */
+    size_t raw = lf ? (size_t)(lf - start) : n - f->pos;
+    if (raw > cap) {
+      snprintf(err, err_cap, "a line over %zu bytes", cap);
+      *status = f->len == 0 ? 0 : 431;
+      return -1;
+    }
+    if (!lf) {
+      return 0;
+    }
+    size_t k = raw;
+    f->pos += k + 1;
+    if (k > 0 && start[k - 1] == '\r') {
+      k--;
+    }
+    if (k == 0 && f->lines == 0) {
+      if (++f->blanks > 4) {
+        snprintf(err, err_cap, "blank lines only");
+        *status = 400;
+        return -1;
+      }
+      continue;
+    }
+    if (k == 0) {
+      out[f->len] = '\0';
+      return 1;
+    }
+    if (f->len + k + 2 > cap) {
+      snprintf(err, err_cap, "the head is too long");
+      *status = 431;
+      return -1;
+    }
+    memcpy(out + f->len, start, k);
+    f->len += k;
+    out[f->len++] = '\n';
+    f->lines++;
+  }
+  return 0;
+}
+
 const char *cserve_httpd_header(const CSERVE_HTTPD_REQ *r, const char *name) {
   for (int i = 0; i < r->n; i++) {
     if (strcasecmp(r->h[i].name, name) == 0) {
@@ -229,6 +278,7 @@ const char *cserve_httpd_reason(int status) {
            {408, "Request Timeout"},
            {411, "Length Required"},
            {413, "Content Too Large"},
+           {429, "Too Many Requests"},
            {414, "URI Too Long"},
            {431, "Request Header Fields Too Large"},
            {500, "Internal Server Error"},
@@ -345,88 +395,121 @@ static long read_head(CSERVE_CONN *c, char *buf, size_t cap, int *status,
   }
 }
 
-struct CSERVE_HTTPD_OUT {
-  CSERVE_CONN *c;
-  int chunked;
-  int drop; /* no body to send (HEAD, 204, 304): writes do nothing */
-  int failed;
-};
-
-int cserve_httpd_out(CSERVE_HTTPD_OUT *o, const char *buf, size_t n) {
-  if (o->failed) {
-    return -1;
+void cserve_httpd_release(CSERVE_HTTPD_REPLY *rep) {
+  if (rep->owned) {
+    free(rep->body);
+    rep->owned = 0;
   }
-  if (o->drop || n == 0) {
-    return 0;
+  rep->body = NULL;
+  rep->len = 0;
+  if (rep->pull) {
+    rep->pull = NULL;
+    if (rep->done) {
+      rep->done(rep->pull_ud);
+    }
   }
-  char err[200], size[24];
-  int k = o->chunked ? snprintf(size, sizeof size, "%zx\r\n", n) : 0;
-  if ((k > 0 && cserve_conn_write(o->c, size, (size_t)k, err, sizeof err)) ||
-      cserve_conn_write(o->c, buf, n, err, sizeof err) ||
-      (o->chunked && cserve_conn_write(o->c, "\r\n", 2, err, sizeof err))) {
-    o->failed = 1;
-    return -1;
-  }
-  return 0;
+  rep->done = NULL;
+  rep->pull_ud = NULL;
 }
 
-/* the reply's head, then its body: 0, or -1 with why in err. A streamed
- * one's stream() runs here, whatever happens to the head. */
-static int send_reply(CSERVE_CONN *c, const CSERVE_HTTPD *h,
-                      const CSERVE_HTTPD_REQ *r, const CSERVE_HTTPD_REPLY *rep,
-                      int keep, char *err, size_t err_cap) {
-  char head[5120], length[48];
-  int body = rep->status >= 200 && rep->status != 204 && rep->status != 304;
+int cserve_httpd_head(const char *server, const CSERVE_HTTPD_REQ *r,
+                      const CSERVE_HTTPD_REPLY *rep, int keep, char *buf,
+                      size_t cap, int *chunked, int *body) {
+  char length[48];
+  int has_body = rep->status >= 200 && rep->status != 204 && rep->status != 304;
   int head_only = r && strcmp(r->method, "HEAD") == 0;
-  /* HEAD of a streamed body: no framing at all (none of it follows) and
-   * the connection closed after (httpd_serve()), so a client that reads
-   * the reply as a GET's -- curl -X HEAD -- isn't left waiting for one */
-  int sized = rep->stream && rep->stream_length > 0;
-  int chunked = rep->stream && !sized && r && r->minor >= 1 && !head_only;
-  if (!rep->stream) {
+  /* HEAD of a pulled body: no framing at all (none of it follows) and
+   * the connection closed after (cserve_httpd_keep()), so a client that
+   * reads the reply as a GET's -- curl -X HEAD -- isn't left waiting */
+  int sized = rep->pull && rep->stream_length > 0;
+  int chunks = rep->pull && !sized && r && r->minor >= 1 && !head_only;
+  if (!rep->pull) {
     snprintf(length, sizeof length, "Content-Length: %zu\r\n",
-             body ? rep->len : 0);
+             has_body ? rep->len : 0);
   } else if (sized) {
     snprintf(length, sizeof length, "Content-Length: %lld\r\n",
-             body ? rep->stream_length : 0);
+             has_body ? rep->stream_length : 0);
   } else {
     snprintf(length, sizeof length, "%s",
-             chunked && body ? "Transfer-Encoding: chunked\r\n" : "");
+             chunks && has_body ? "Transfer-Encoding: chunked\r\n" : "");
   }
-  int n = snprintf(head, sizeof head,
+  int named = server && *server, typed = rep->type && has_body;
+  int n = snprintf(buf, cap,
                    "HTTP/1.1 %d %s\r\n%s%s%s"
                    "%s%s%s%sConnection: %s\r\n%s\r\n",
                    rep->status, cserve_httpd_reason(rep->status),
-                   h->server && *h->server ? "Server: " : "",
-                   h->server && *h->server ? h->server : "",
-                   h->server && *h->server ? "\r\n" : "", length,
-                   rep->type && body ? "Content-Type: " : "",
-                   rep->type && body ? rep->type : "",
-                   rep->type && body ? "\r\n" : "",
+                   named ? "Server: " : "", named ? server : "",
+                   named ? "\r\n" : "", length, typed ? "Content-Type: " : "",
+                   typed ? rep->type : "", typed ? "\r\n" : "",
                    keep ? "keep-alive" : "close", rep->headers);
+  *chunked = chunks && has_body;
+  *body = has_body && !head_only;
+  return n < 0 || (size_t)n >= cap ? -1 : n;
+}
+
+int cserve_httpd_keep(const CSERVE_HTTPD_REQ *r, const CSERVE_HTTPD_REPLY *rep,
+                      int more) {
+  return r->keep_alive && more &&
+         !(rep->pull && rep->stream_length <= 0 &&
+           (r->minor < 1 || !strcmp(r->method, "HEAD")));
+}
+
+/* the reply's head, then its body: 0, or -1 with why in err. A pulled
+ * body's done() runs here (release()), whatever happens to the head. */
+static int send_reply(CSERVE_CONN *c, const CSERVE_HTTPD *h,
+                      const CSERVE_HTTPD_REQ *r, CSERVE_HTTPD_REPLY *rep,
+                      int keep, char *err, size_t err_cap) {
+  char head[5120];
+  int chunked, body;
+  int n = cserve_httpd_head(h->server, r, rep, keep, head, sizeof head,
+                            &chunked, &body);
   int ret = 0;
-  if (n < 0 || (size_t)n >= sizeof head) {
+  if (n < 0) {
     snprintf(err, err_cap, "the reply's head is too long");
     ret = -1;
   } else if (cserve_conn_write(c, head, (size_t)n, err, err_cap) != 0) {
     ret = -1;
   }
-  if (rep->stream) {
-    CSERVE_HTTPD_OUT o = {.c = c,
-                          .chunked = chunked,
-                          .drop = !body || head_only,
-                          .failed = ret != 0};
-    int done = rep->stream(&o, rep->stream_ud);
-    if (ret == 0 && (done != 0 || o.failed)) {
-      snprintf(err, err_cap, "the streamed body was cut short");
+  if (rep->pull) {
+    char *buf = ret == 0 && body ? malloc(65536) : NULL;
+    long long sent = 0;
+    if (ret == 0 && body && !buf) {
+      snprintf(err, err_cap, "out of memory");
       ret = -1;
     }
-    if (ret == 0 && chunked && body && !head_only) {
+    while (buf && ret == 0) {
+      long got = rep->pull(rep->pull_ud, buf, 65536);
+      char size[24];
+      int k = chunked && got > 0
+                  ? snprintf(size, sizeof size, "%lx\r\n", (unsigned long)got)
+                  : 0;
+      if (got == 0) {
+        break;
+      }
+      sent += got;
+      if (got < 0 || (rep->stream_length > 0 && sent > rep->stream_length)) {
+        snprintf(err, err_cap, "the pulled body failed");
+        ret = -1;
+      } else if ((k > 0 &&
+                  cserve_conn_write(c, size, (size_t)k, err, err_cap)) ||
+                 cserve_conn_write(c, buf, (size_t)got, err, err_cap) ||
+                 (chunked && cserve_conn_write(c, "\r\n", 2, err, err_cap))) {
+        ret = -1;
+      }
+    }
+    free(buf);
+    if (ret == 0 && body && rep->stream_length > 0 &&
+        sent != rep->stream_length) {
+      snprintf(err, err_cap, "the pulled body came out short");
+      ret = -1;
+    }
+    if (ret == 0 && chunked) {
       ret = cserve_conn_write(c, "0\r\n\r\n", 5, err, err_cap);
     }
+    cserve_httpd_release(rep);
     return ret;
   }
-  if (ret == 0 && body && rep->len && !head_only) {
+  if (ret == 0 && body && rep->len) {
     return cserve_conn_write(c, rep->body, rep->len, err, err_cap);
   }
   return ret;
@@ -488,27 +571,13 @@ void cserve_httpd_serve(const CSERVE_HTTPD *h, CSERVE_CONN *c,
     h->handler(r, body, &rep, h->ud);
     free(body);
     if (rep.status == 0) {
-      if (rep.owned) {
-        free(rep.body);
-      }
-      if (rep.stream) {
-        CSERVE_HTTPD_OUT gone = {.c = c, .failed = 1};
-        rep.stream(&gone, rep.stream_ud);
-        rep.stream = NULL;
-      }
+      cserve_httpd_release(&rep);
       cserve_httpd_text(&rep, 500, "text/plain; charset=utf-8", "no answer\n",
                         10);
     }
-    /* HTTP/1.0 has no chunks: a streamed body of unknown length ends with
-     * the connection; so does HEAD's, which is said without framing
-     * (send_reply()) */
-    int keep = r->keep_alive && k + 1 < max_req &&
-               !(rep.stream && rep.stream_length <= 0 &&
-                 (r->minor < 1 || !strcmp(r->method, "HEAD")));
+    int keep = cserve_httpd_keep(r, &rep, k + 1 < max_req);
     int sent = send_reply(c, h, r, &rep, keep, err, sizeof err);
-    if (rep.owned) {
-      free(rep.body);
-    }
+    cserve_httpd_release(&rep);
     if (sent != 0 || !keep) {
       break;
     }

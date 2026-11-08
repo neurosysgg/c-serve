@@ -34,9 +34,34 @@ repo's log and in ctui-wm's HISTORY.md.
   regenerate it, never edit it, and a disagreement is a bug here unless Phpanta's answer is wrong.
 - **The host takes flags, not a config file**: a config parser would be one more parser of
   outside input.
-- **No header is named like a system one.** ctui-wm puts `src/` on every `-I`, and `-I` is
-  searched for `<...>` too: a `spawn.h` here shadowed POSIX's `<spawn.h>` there (hence
-  `process.h`). Check `/usr/include` before naming a new header.
+- **No header is named like a system one, nor like another here.** ctui-wm puts `src/` on every
+  `-I`, and `-I` is searched for `<...>` too: a `spawn.h` here shadowed POSIX's `<spawn.h>` there
+  (hence `process.h`). `src/` and `kit/` are both on it as well, so a kit header named like a
+  `src/` one is never the one included (hence `kit/login.h` beside `src/tarpit.h`). Check
+  `/usr/include` and both trees before naming a new header.
+
+## The loop
+
+`cserve` serves on `src/loop.c`; the threaded server (`listen.c`, `httpd.c`'s `serve()`) is
+ctui-remote's and `cserve-front`'s alone, and the box's binary never calls it.
+
+- **Only an entry point does I/O or closes a connection** — accept, a connection's readiness,
+  the pool's fd, a deadline — and it returns at once after closing one. What moves a connection
+  between states only sets its state, deadline and events; the loop comes back to it. A transition
+  that closed would leave its caller holding a freed connection.
+- **Every handler runs on the pool; nothing an app does runs on the loop** — except a pull,
+  which the loop calls as the socket takes bytes. So a pull returns as soon as a file read does;
+  one that waits (cgi.c's) is the threaded server's alone.
+- **A connection that closes after its last reply lingers**: write side shut, what still comes
+  read and dropped. A plain `close()` with unread bytes makes the kernel reset the connection,
+  and the reset throws away the reply's unsent tail.
+- **`tls.h`'s client wants a non-blocking socket.** Handed a blocking one it waits in `recv()`
+  inside mbedtls, holding the process's TLS lock, and the loop's next handshake waits on that lock.
+- **`make abuse` when the loop, the pool or the tarpit change**: every attack in
+  `tools/abuse.py` must leave a page prompt and the stop clean, under both sanitizers.
+- **A test that races a password check times one first.** PBKDF2 under a sanitizer is several
+  times slower, so a fixed sleep that works at -O2 lets the second guess in before the first
+  has failed.
 - Names are `cserve_*` / `CSERVE_*`. Functions return 0 or -1 with why in `err` (`err_cap`
   bytes); reject and say why rather than crash.
 - `-std=c11`. Split a file past ~1000 lines. ctui's style (`.clang-format`, a copy); `make

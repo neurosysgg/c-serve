@@ -29,6 +29,19 @@ struct CSERVE_LISTEN {
   int port; /* the bound one (asked for 0: the kernel's pick) */
 };
 
+/* a non-blocking socket listening on host ("127.0.0.1", "::",
+ * "localhost") and port, the port it's bound to in *bound (asked for 0:
+ * the kernel's pick): its fd, or -1 with why in err. What new() listens
+ * on, and what a loop (loop.h) is handed. */
+int cserve_listen_socket(const char *host, int port, int *bound, char *err,
+                         size_t err_cap);
+
+/* an accepted peer's address as text ("127.0.0.1:50412",
+ * "[::1]:50412") */
+struct sockaddr_storage;
+void cserve_listen_peer(const struct sockaddr_storage *sa, char *out,
+                        size_t cap);
+
 /* a socket listening on host ("127.0.0.1", "::", "localhost") and port,
  * or NULL with why in err */
 CSERVE_LISTEN *cserve_listen_new(const char *host, int port,

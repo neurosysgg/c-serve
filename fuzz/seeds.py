@@ -64,7 +64,18 @@ def http():
             b"\x07\x03/assets/js/v-00000000/../../index.php",
             b"\x07\x00//sub//page.html",
             b"\x07\x04/x/y/z/rest/of/it",
-            b"\x07\x00/releases/.user.ini"]
+            b"\x07\x00/releases/.user.ini",
+            # a head framed whole and in pieces: blank lines first, LF and
+            # CRLF, a pipelined second request, a line past the cap
+            b"\x08\x05\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\r\n",
+            b"\x08\x09POST /p HTTP/1.0\nContent-Length: 3\n\nabc",
+            b"\x08\x11GET / HTTP/1.1\r\nX: " + b"a" * 600 + b"\r\n\r\n",
+            b"\x08\x01\n\n\n\n\nGET / HTTP/1.1\r\n\r\n",
+            # an Accept-Encoding: lists, q values, the wildcard
+            b"\x09gzip, deflate, br",
+            b"\x09br;q=1.0, gzip;q=0.8, *;q=0.1",
+            b"\x09*;q=0, x-gzip; q=0.000",
+            b"\x09identity"]
 
 
 def kit():

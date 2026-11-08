@@ -42,9 +42,18 @@ const char *cserve_static_mime(const char *file);
 /* its Cache-Control ("" for none): .htaccess's tiers */
 const char *cserve_static_cache(const char *file, int immutable);
 
+/* whether an Accept-Encoding takes gzip: "gzip" or "x-gzip" (or "*")
+ * listed with a q above 0, "identity" and the rest aside; NULL: no */
+int cserve_static_accepts_gzip(const char *accept_encoding);
+
 /* rt (a FILE) as the reply to r: GET and HEAD only (else 405), a weak
  * ETag (If-None-Match: 304), nosniff; read whole up to 8 MiB, streamed
- * past it */
+ * past it. A file with a compressed copy beside it (FILE.gz, a regular
+ * file and no symlink, no older than FILE: cserve-precompress makes
+ * them) varies on Accept-Encoding, and a client that takes gzip gets the
+ * copy -- Content-Encoding: gzip, the copy's own ETag. Nothing is ever
+ * compressed per request: what a reply holds can't leak through its
+ * size (BREACH), and no encoder runs on the server. */
 void cserve_static_serve(const CSERVE_HTTPD_REQ *r,
                          const CSERVE_STATIC_ROUTE *rt,
                          CSERVE_HTTPD_REPLY *rep);

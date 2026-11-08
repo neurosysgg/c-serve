@@ -17,25 +17,26 @@ typedef struct {
 } PART;
 
 /* the range out, a block at a time: -1 when the file gives fewer bytes
- * than were promised (it shrank) or the client went */
-static int send_part(CSERVE_HTTPD_OUT *o, void *ud) {
+ * than were promised (it shrank) */
+static long part_pull(void *ud, char *buf, size_t cap) {
   PART *p = ud;
-  char buf[65536];
-  int ret = 0;
-  while (p->left > 0) {
-    size_t want =
-        p->left < (long long)sizeof buf ? (size_t)p->left : sizeof buf;
-    ssize_t got = pread(p->fd, buf, want, (off_t)p->at);
-    if (got <= 0 || cserve_httpd_out(o, buf, (size_t)got) != 0) {
-      ret = -1;
-      break;
-    }
-    p->at += got;
-    p->left -= got;
+  if (p->left <= 0) {
+    return 0;
   }
+  size_t want = p->left < (long long)cap ? (size_t)p->left : cap;
+  ssize_t got = pread(p->fd, buf, want, (off_t)p->at);
+  if (got <= 0) {
+    return -1;
+  }
+  p->at += got;
+  p->left -= got;
+  return (long)got;
+}
+
+static void part_done(void *ud) {
+  PART *p = ud;
   close(p->fd);
   free(p);
-  return ret;
 }
 
 int cserve_file_reply(const CSERVE_HTTPD_REQ *r, const char *path,
@@ -91,8 +92,9 @@ int cserve_file_reply(const CSERVE_HTTPD_REQ *r, const char *path,
   *p = (PART){fd, first, length};
   rep->status = status;
   rep->type = type;
-  rep->stream = send_part;
-  rep->stream_ud = p;
+  rep->pull = part_pull;
+  rep->done = part_done;
+  rep->pull_ud = p;
   rep->stream_length = length;
   return 0;
 }

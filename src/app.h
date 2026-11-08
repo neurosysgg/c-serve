@@ -3,6 +3,7 @@
 
 #include "policy.h"
 #include "route.h"
+#include "tarpit.h"
 
 #include <stddef.h>
 
@@ -16,12 +17,15 @@
  * older app) and refuses an app whose abi isn't its own. NULL in any slot
  * means not implemented. */
 
-#define CSERVE_APP_ABI 1
+#define CSERVE_APP_ABI 2
 
 /* what the host hands an app's init() */
 typedef struct {
   const char *root; /* the web root (realpath()'d) */
   const char *data; /* the app's data directory (--data); NULL: none */
+  /* the host's tarpit (tarpit.h; kit/tarpit.h takes it); NULL: off
+   * (--no-tarpit, or a host without one) */
+  const CSERVE_TARPIT_API *tarpit;
 } CSERVE_APP_ENV;
 
 typedef struct CSERVE_APP {

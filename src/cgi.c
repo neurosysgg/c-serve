@@ -308,6 +308,7 @@ typedef struct {
   char buf[CGI_HEAD_MAX + 4096];
   size_t len;
   long head;
+  int ended; /* its output ended: it's waited for, not killed */
 } CGI;
 
 static long now_ms(void) {
@@ -370,21 +371,29 @@ static void cgi_end(CGI *g, int kill_now) {
   free(g);
 }
 
-static int stream(CSERVE_HTTPD_OUT *o, void *ud) {
+/* the body: what came in with the head, then the CGI's output as it
+ * comes (a pull waits for it: this is the threaded server's alone) */
+static long cgi_pull(void *ud, char *buf, size_t cap) {
   CGI *g = ud;
-  int ok = cserve_httpd_out(o, g->buf + g->head, g->len - (size_t)g->head) == 0;
-  char chunk[16384];
-  while (ok) {
-    ssize_t n = pump(g, chunk, sizeof chunk, now_ms() + g->idle_ms);
-    if (n == 0) {
-      cgi_end(g, 0);
-      return 0;
-    }
-    ok = n > 0 && cserve_httpd_out(o, chunk, (size_t)n) == 0;
+  if ((size_t)g->head < g->len) {
+    size_t k = g->len - (size_t)g->head;
+    k = k < cap ? k : cap;
+    memcpy(buf, g->buf + g->head, k);
+    g->head += (long)k;
+    return (long)k;
   }
-  /* the client gone, or the CGI quiet too long: it goes */
-  cgi_end(g, 1);
-  return -1;
+  ssize_t n = pump(g, buf, cap, now_ms() + g->idle_ms);
+  if (n == 0) {
+    g->ended = 1;
+  }
+  return n < 0 ? -1 : (long)n;
+}
+
+/* the CGI waited for when it ended, killed when it hasn't (the client
+ * gone, the CGI quiet too long, or no body asked for) */
+static void cgi_done(void *ud) {
+  CGI *g = ud;
+  cgi_end(g, !g->ended);
 }
 
 static void fail(CSERVE_HTTPD_REPLY *rep, int status, const char *fmt, ...) {
@@ -466,6 +475,7 @@ void cserve_cgi(const CSERVE_CGI *c, const CSERVE_HTTPD_REQ *r,
     }
   }
   rep->type = g->type[0] ? g->type : NULL;
-  rep->stream = stream;
-  rep->stream_ud = g;
+  rep->pull = cgi_pull;
+  rep->done = cgi_done;
+  rep->pull_ud = g;
 }

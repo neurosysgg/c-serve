@@ -1,19 +1,20 @@
-/* cserve: the host. Listens (plain, TLS, or mutual TLS), then per
- * request: a static file from the root, else the first app whose routes
- * fit, else the front controller as CGI, else 404. A development build
- * dlopen()s apps given as a path (--app apps/hello.so); a production one
- * is linked with its apps (the Makefile's STATIC_APPS) and loads none. */
+/* cserve: the host. Listens (plain or TLS) on one loop (loop.h), then
+ * per request, on a worker: a static file from the root, else the first
+ * app whose routes fit, else the first app's own 404 (a climbing path
+ * too), else a plain 404. A development build dlopen()s apps given as a
+ * path (--app apps/hello.so); a production one is linked with its apps
+ * (the Makefile's STATIC_APPS) and loads none. */
 /* realpath, sigaction, dlopen: POSIX, not C11 */
 #define _GNU_SOURCE
 #include "app.h"
-#include "cgi.h"
-#include "conn.h"
 #include "httpd.h"
 #include "listen.h"
 #include "log.h"
+#include "loop.h"
 #include "policy.h"
 #include "route.h"
 #include "static.h"
+#include "tarpit.h"
 #include "tls.h"
 
 #include <errno.h>
@@ -33,15 +34,10 @@ extern const CSERVE_APP *const cserve_apps[];
 
 #define LISTEN_MAX 8
 #define APPS_MAX 16
-#define ENV_MAX 32
 
 typedef struct {
   char root[PATH_MAX];
   CSERVE_STATIC st;
-  const char *cgi_argv[2];
-  CSERVE_CGI cgi; /* port and https set per request */
-  int have_cgi;
-  const char *env[ENV_MAX + 1];
   const CSERVE_APP *apps[APPS_MAX];
   char *security[APPS_MAX]; /* each app's security header lines, or NULL */
   int napps;
@@ -51,11 +47,15 @@ typedef struct {
 
 static HOST H;
 
-/* a connection's: which listener it came in on, whether it's TLS */
-typedef struct {
-  int port;
-  int https;
-} CONN_CTX;
+/* the tarpit (tarpit.h), made before the apps' init() and freed on every
+ * way out, an early one too */
+static CSERVE_TARPIT *g_pit;
+
+static int bail(void) {
+  cserve_tarpit_free(g_pit);
+  g_pit = NULL;
+  return 1;
+}
 
 static void text(CSERVE_HTTPD_REPLY *rep, int status, const char *t) {
   cserve_httpd_text(rep, status, "text/plain; charset=utf-8", t, strlen(t));
@@ -63,7 +63,8 @@ static void text(CSERVE_HTTPD_REPLY *rep, int status, const char *t) {
 
 /* app i's security headers put before what it answered with. Headers
  * that won't fit with them are a 500: a reply never goes out without
- * them (a streamed one keeps its stream, whose bytes become the 500's) */
+ * them (a pulled body is let go: done() called, the 500's own body
+ * sent) */
 static void secure(CSERVE_HTTPD_REPLY *rep, int i) {
   const char *lines = H.security[i];
   if (!lines) {
@@ -75,10 +76,8 @@ static void secure(CSERVE_HTTPD_REPLY *rep, int i) {
                 "%s: a reply whose headers leave no room "
                 "for its security headers",
                 H.apps[i]->name);
-    if (rep->owned) {
-      free(rep->body);
-      rep->owned = 0;
-    }
+    cserve_httpd_release(rep);
+    rep->stream_length = 0;
     rep->status = 500;
     rep->type = "text/plain; charset=utf-8";
     rep->body = (char *)"500 Internal Server Error\n";
@@ -122,24 +121,20 @@ static int route(int i, const CSERVE_HTTPD_REQ *r, const char *body,
 
 static void handle(const CSERVE_HTTPD_REQ *r, const char *body,
                    CSERVE_HTTPD_REPLY *rep, void *ud) {
-  const CONN_CTX *cc = ud;
+  (void)ud;
   CSERVE_STATIC_ROUTE rt;
   cserve_static_route(&H.st, r->path, &rt);
-  const char *by = "404";
   if (rt.kind == CSERVE_STATIC_FILE) {
     cserve_static_serve(r, &rt, rep);
-    by = "file";
   } else if (rt.kind == CSERVE_STATIC_BAD) {
     text(rep, 400, "a path that climbs out\n");
-    by = "refused";
   } else {
     for (int i = 0; i < H.napps && !rep->status; i++) {
       if (route(i, r, body, rep)) {
-        by = H.apps[i]->name;
         secure(rep, i);
       }
     }
-    for (int i = 0; i < H.napps && !rep->status && !H.have_cgi; i++) {
+    for (int i = 0; i < H.napps && !rep->status; i++) {
       void (*not_found)(const CSERVE_HTTPD_REQ *, const char *,
                         CSERVE_HTTPD_REPLY *) =
           CSERVE_APP_SLOT(H.apps[i], not_found);
@@ -148,37 +143,13 @@ static void handle(const CSERVE_HTTPD_REQ *r, const char *body,
         if (!rep->status) {
           text(rep, 500, "an app's not_found answered nothing\n");
         }
-        by = H.apps[i]->name;
         secure(rep, i);
       }
     }
-    if (!rep->status && H.have_cgi) {
-      CSERVE_CGI c = H.cgi;
-      c.port = cc->port;
-      c.https = cc->https;
-      cserve_cgi(&c, r, body, NULL, rep);
-      by = "cgi";
-    } else if (!rep->status) {
+    if (!rep->status) {
       text(rep, 404, "not found\n");
     }
   }
-  cserve_logf(CSERVE_LOG_INFO, "%s %s %s -> %d (%s)", r->peer ? r->peer : "?",
-              r->method, r->target, rep->status, by);
-}
-
-static void on_conn(CSERVE_CONN *c, const char *peer, void *ud) {
-  CONN_CTX cc = {.port = *(const int *)ud};
-  char err[256];
-  if (H.tls) {
-    if (cserve_conn_accept_tls(c, H.tls, err, sizeof err) != 0) {
-      cserve_logf(CSERVE_LOG_WARN, "%s: handshake refused: %s", peer, err);
-      cserve_conn_close(c);
-      return;
-    }
-    cc.https = 1;
-  }
-  CSERVE_HTTPD h = {.handler = handle, .ud = &cc, .server = "c-serve"};
-  cserve_httpd_serve(&h, c, peer);
 }
 
 static void log_all(CSERVE_LOG_LEVEL level, const char *line, void *ud) {
@@ -197,11 +168,21 @@ static void on_signal(int sig) {
 
 static int usage(void) {
   fprintf(stderr,
-          "usage: cserve --listen HOST:PORT... --root DIR [--front FILE]\n"
-          "       [--cgi PROGRAM] [--env K=V]... [--climb 400|front]\n"
-          "       [--tls CERT KEY [--client-ca CA]] [--app NAME|PATH.so]...\n"
-          "       [--data DIR] [-v]\n");
+          "usage: cserve --listen HOST:PORT... --root DIR [--tls CERT KEY]\n"
+          "       [--app NAME|PATH.so]... [--data DIR] [--workers N]\n"
+          "       [--max-conns N] [--per-addr N] [--no-tarpit] [-v]\n");
   return 2;
+}
+
+/* argv[i] as a count from 1 to max: 0, or -1 */
+static int count(const char *a, int max, int *out) {
+  char *end;
+  long n = strtol(a, &end, 10);
+  if (*end || end == a || n < 1 || n > max) {
+    return -1;
+  }
+  *out = (int)n;
+  return 0;
 }
 
 /* "127.0.0.1:8081", "[::1]:8081" into host and port: 0, or -1 */
@@ -270,10 +251,10 @@ static const CSERVE_APP *find_app(const char *name, char *err, size_t cap) {
 }
 
 int main(int argc, char **argv) {
-  const char *listen[LISTEN_MAX], *root = NULL, *front = "index.php";
-  const char *cgi = NULL, *cert = NULL, *key = NULL, *client_ca = NULL;
+  const char *listen[LISTEN_MAX], *root = NULL, *cert = NULL, *key = NULL;
   const char *app_names[APPS_MAX], *data = NULL;
-  int nlisten = 0, nenv = 0, napp = 0;
+  int nlisten = 0, napp = 0, tarpit = 1;
+  CSERVE_LOOP_CONFIG cfg = {.handler = handle, .server = "c-serve"};
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
     int more = i + 1 < argc;
@@ -281,32 +262,31 @@ int main(int argc, char **argv) {
       listen[nlisten++] = argv[++i];
     } else if (!strcmp(a, "--root") && more) {
       root = argv[++i];
-    } else if (!strcmp(a, "--front") && more) {
-      front = argv[++i];
-    } else if (!strcmp(a, "--cgi") && more) {
-      cgi = argv[++i];
-    } else if (!strcmp(a, "--env") && more && nenv < ENV_MAX &&
-               strchr(argv[i + 1], '=')) {
-      H.env[nenv++] = argv[++i];
-    } else if (!strcmp(a, "--climb") && more &&
-               (!strcmp(argv[i + 1], "400") || !strcmp(argv[i + 1], "front"))) {
-      H.st.climb_front = !strcmp(argv[++i], "front");
     } else if (!strcmp(a, "--tls") && i + 2 < argc) {
       cert = argv[++i];
       key = argv[++i];
-    } else if (!strcmp(a, "--client-ca") && more) {
-      client_ca = argv[++i];
     } else if (!strcmp(a, "--app") && more && napp < APPS_MAX) {
       app_names[napp++] = argv[++i];
     } else if (!strcmp(a, "--data") && more) {
       data = argv[++i];
+    } else if (!strcmp(a, "--workers") && more &&
+               count(argv[i + 1], 256, &cfg.workers) == 0) {
+      i++;
+    } else if (!strcmp(a, "--max-conns") && more &&
+               count(argv[i + 1], 1 << 20, &cfg.max_conns) == 0) {
+      i++;
+    } else if (!strcmp(a, "--per-addr") && more &&
+               count(argv[i + 1], 1 << 20, &cfg.per_addr) == 0) {
+      i++;
+    } else if (!strcmp(a, "--no-tarpit")) {
+      tarpit = 0;
     } else if (!strcmp(a, "-v")) {
       H.verbose = 1;
     } else {
       return usage();
     }
   }
-  if (!nlisten || !root || (client_ca && !cert) || strchr(front, '/')) {
+  if (!nlisten || !root) {
     return usage();
   }
   if (!realpath(root, H.root)) {
@@ -317,21 +297,31 @@ int main(int argc, char **argv) {
     cserve_log_set(log_all, NULL);
   }
   H.st.root = H.root;
-  if (cgi) {
-    H.cgi_argv[0] = cgi;
-    H.cgi = (CSERVE_CGI){
-        .argv = H.cgi_argv, .root = H.root, .script = front, .env = H.env};
-    H.have_cgi = 1;
-  }
+  /* with no front behind it, a path that climbs is the app's 404 too: an
+   * address that isn't there, said as every other is */
+  H.st.climb_front = 1;
   char err[512];
-  CSERVE_APP_ENV env = {.root = H.root, .data = data};
+  /* the brake on guessing (tarpit.h): on unless asked otherwise, and said
+   * when it's off, since nothing else would show it */
+  g_pit = tarpit ? cserve_tarpit_new(4096, NULL, err, sizeof err) : NULL;
+  CSERVE_TARPIT_API pit_api = cserve_tarpit_api(g_pit);
+  if (tarpit && !g_pit) {
+    fprintf(stderr, "cserve: %s\n", err);
+    return 1;
+  }
+  if (!tarpit) {
+    cserve_logf(CSERVE_LOG_WARN,
+                "--no-tarpit: failed logins are not slowed down");
+  }
+  CSERVE_APP_ENV env = {
+      .root = H.root, .data = data, .tarpit = g_pit ? &pit_api : NULL};
   for (int i = 0; i < napp; i++) {
     const CSERVE_APP *a = find_app(app_names[i], err, sizeof err);
     int (*init)(const CSERVE_APP_ENV *, char *, size_t) =
         a ? CSERVE_APP_SLOT(a, init) : NULL;
     if (!a || (init && init(&env, err, sizeof err) != 0)) {
       fprintf(stderr, "cserve: app %s: %s\n", app_names[i], err);
-      return 1;
+      return bail();
     }
     const CSERVE_SECURITY *policy = CSERVE_APP_SLOT(a, security);
     char lines[2048];
@@ -340,48 +330,49 @@ int main(int argc, char **argv) {
                    !(H.security[H.napps] = strdup(lines)))) {
       fprintf(stderr, "cserve: app %s: its security headers: %s\n",
               app_names[i], err);
-      return 1;
+      return bail();
     }
     H.apps[H.napps++] = a;
   }
   if (cert &&
-      !(H.tls = cserve_tls_server_new(cert, key, client_ca, err, sizeof err))) {
+      !(H.tls = cserve_tls_server_new(cert, key, NULL, err, sizeof err))) {
     fprintf(stderr, "cserve: TLS: %s\n", err);
-    return 1;
+    return bail();
   }
-  CSERVE_LISTEN *ls[LISTEN_MAX];
-  int ports[LISTEN_MAX];
+  CSERVE_LOOP *loop = cserve_loop_new(&cfg, err, sizeof err);
+  if (!loop) {
+    fprintf(stderr, "cserve: %s\n", err);
+    return bail();
+  }
   for (int i = 0; i < nlisten; i++) {
     char host[256];
-    if (split_addr(listen[i], host, sizeof host, &ports[i]) != 0) {
+    int port, fd;
+    if (split_addr(listen[i], host, sizeof host, &port) != 0) {
       fprintf(stderr, "cserve: --listen %s: not HOST:PORT\n", listen[i]);
-      return 1;
+      return bail();
     }
-    if (!(ls[i] = cserve_listen_new(host, ports[i], on_conn, &ports[i], err,
-                                    sizeof err))) {
+    if ((fd = cserve_listen_socket(host, port, &port, err, sizeof err)) < 0 ||
+        cserve_loop_listen(loop, fd, H.tls, err, sizeof err) != 0) {
       fprintf(stderr, "cserve: %s: %s\n", listen[i], err);
-      return 1;
+      return bail();
     }
-    ports[i] = ls[i]->port; /* asked for 0: the kernel's */
-    /* the line a script waits for */
+    /* the line a script waits for (asked for port 0: the kernel's) */
     printf("listening on %s%s%s:%d\n", strchr(host, ':') ? "[" : "", host,
-           strchr(host, ':') ? "]" : "", ports[i]);
+           strchr(host, ':') ? "]" : "", port);
   }
   fflush(stdout);
   if (pipe2(g_stop, O_CLOEXEC) != 0) {
-    return 1;
+    return bail();
   }
   struct sigaction sa = {.sa_handler = on_signal};
   sigaction(SIGINT, &sa, NULL);
   sigaction(SIGTERM, &sa, NULL);
   signal(SIGPIPE, SIG_IGN);
-  int rc = cserve_listen_serve(ls, nlisten, g_stop[0], err, sizeof err);
+  int rc = cserve_loop_run(loop, g_stop[0], 5000, err, sizeof err);
   if (rc != 0) {
     fprintf(stderr, "cserve: %s\n", err);
   }
-  for (int i = 0; i < nlisten; i++) {
-    cserve_listen_free(ls[i]);
-  }
+  cserve_loop_free(loop);
   for (int i = 0; i < H.napps; i++) {
     void (*fini)(void) = CSERVE_APP_SLOT(H.apps[i], fini);
     if (fini) {
@@ -390,5 +381,6 @@ int main(int argc, char **argv) {
     free(H.security[i]);
   }
   cserve_tls_server_free(H.tls);
+  cserve_tarpit_free(g_pit);
   return rc ? 1 : 0;
 }

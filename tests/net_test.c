@@ -1184,13 +1184,17 @@ typedef struct {
   int conns; /* accepted so far */
 } SRV;
 
-/* a body in three writes, the last empty (skipped, not the end) */
-static int streamed(CSERVE_HTTPD_OUT *o, void *ud) {
-  free(ud);
-  return cserve_httpd_out(o, "one ", 4) || cserve_httpd_out(o, "two", 3) ||
-                 cserve_httpd_out(o, "", 0)
-             ? -1
-             : 0;
+/* a body in two pulls, then its end; ud counts them */
+static long streamed(void *ud, char *buf, size_t cap) {
+  int *k = ud;
+  const char *piece = *k == 0 ? "one " : *k == 1 ? "two" : "";
+  size_t n = strlen(piece);
+  (*k)++;
+  if (n > cap) {
+    return -1;
+  }
+  memcpy(buf, piece, n);
+  return (long)n;
 }
 
 static void on_page(const CSERVE_HTTPD_REQ *r, const char *body,
@@ -1207,8 +1211,9 @@ static void on_page(const CSERVE_HTTPD_REQ *r, const char *body,
   } else if (!strcmp(r->path, "/stream")) {
     rep->status = 200;
     rep->type = "text/plain";
-    rep->stream = streamed;
-    rep->stream_ud = calloc(1, 1); /* freed by streamed(): ASan checks */
+    rep->pull = streamed;
+    rep->done = free;
+    rep->pull_ud = calloc(1, sizeof(int)); /* freed by done(): ASan checks */
   } else if (!strcmp(r->path, "/whoami")) {
     char cn[64], fpr[65], text[200];
     int has = cserve_conn_peer_cert(r->conn, cn, sizeof cn, fpr) == 0;

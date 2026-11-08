@@ -30,9 +30,8 @@ typedef struct {
  * connection outlives its listener's free: cserve_listen_active()) */
 static atomic_int g_active;
 
-CSERVE_LISTEN *cserve_listen_new(const char *host, int port,
-                                 CSERVE_LISTEN_FN handler, void *ud, char *err,
-                                 size_t err_cap) {
+int cserve_listen_socket(const char *host, int port, int *bound, char *err,
+                         size_t err_cap) {
   char service[8];
   snprintf(service, sizeof service, "%d", port);
   struct addrinfo hints = {.ai_family = AF_UNSPEC,
@@ -43,7 +42,7 @@ CSERVE_LISTEN *cserve_listen_new(const char *host, int port,
   if (gai != 0) {
     snprintf(err, err_cap, "resolving %s: %s", host,
              gai == EAI_SYSTEM ? strerror(errno) : gai_strerror(gai));
-    return NULL;
+    return -1;
   }
   int fd = -1;
   for (const struct addrinfo *ai = res; ai && fd < 0; ai = ai->ai_next) {
@@ -55,7 +54,7 @@ CSERVE_LISTEN *cserve_listen_new(const char *host, int port,
     }
     int on = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
-    if (bind(fd, ai->ai_addr, ai->ai_addrlen) != 0 || listen(fd, 64) != 0) {
+    if (bind(fd, ai->ai_addr, ai->ai_addrlen) != 0 || listen(fd, 512) != 0) {
       snprintf(err, err_cap, "listening on %s:%d: %s", host, port,
                strerror(errno));
       close(fd);
@@ -63,6 +62,27 @@ CSERVE_LISTEN *cserve_listen_new(const char *host, int port,
     }
   }
   freeaddrinfo(res);
+  if (fd < 0) {
+    return -1;
+  }
+  struct sockaddr_storage sa = {0};
+  socklen_t len = sizeof sa;
+  if (getsockname(fd, (struct sockaddr *)&sa, &len) != 0) {
+    sa.ss_family = AF_UNSPEC;
+  }
+  *bound = sa.ss_family == AF_UNSPEC
+               ? port
+               : ntohs(sa.ss_family == AF_INET6
+                           ? ((struct sockaddr_in6 *)&sa)->sin6_port
+                           : ((struct sockaddr_in *)&sa)->sin_port);
+  return fd;
+}
+
+CSERVE_LISTEN *cserve_listen_new(const char *host, int port,
+                                 CSERVE_LISTEN_FN handler, void *ud, char *err,
+                                 size_t err_cap) {
+  int bound;
+  int fd = cserve_listen_socket(host, port, &bound, err, err_cap);
   if (fd < 0) {
     return NULL;
   }
@@ -72,16 +92,7 @@ CSERVE_LISTEN *cserve_listen_new(const char *host, int port,
     close(fd);
     return NULL;
   }
-  struct sockaddr_storage sa = {0};
-  socklen_t len = sizeof sa;
-  if (getsockname(fd, (struct sockaddr *)&sa, &len) != 0) {
-    sa.ss_family = AF_UNSPEC;
-  }
-  l->pub.port = sa.ss_family == AF_UNSPEC
-                    ? port
-                    : ntohs(sa.ss_family == AF_INET6
-                                ? ((struct sockaddr_in6 *)&sa)->sin6_port
-                                : ((struct sockaddr_in *)&sa)->sin_port);
+  l->pub.port = bound;
   l->pub.fd = fd;
   l->pub.handler = handler;
   l->pub.ud = ud;
@@ -108,8 +119,8 @@ void cserve_listen_free(CSERVE_LISTEN *l) {
 
 int cserve_listen_active(void) { return atomic_load(&g_active); }
 
-static void peer_text(const struct sockaddr_storage *sa, char *out,
-                      size_t cap) {
+void cserve_listen_peer(const struct sockaddr_storage *sa, char *out,
+                        size_t cap) {
   char ip[INET6_ADDRSTRLEN] = "?";
   if (sa->ss_family == AF_INET6) {
     const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)sa;
@@ -163,7 +174,7 @@ static void accept_all(LISTENER *l) {
     }
     j->l = l;
     j->fd = fd;
-    peer_text(&sa, j->peer, sizeof j->peer);
+    cserve_listen_peer(&sa, j->peer, sizeof j->peer);
     atomic_fetch_add(&l->running, 1);
     atomic_fetch_add(&g_active, 1);
     pthread_attr_t attr;

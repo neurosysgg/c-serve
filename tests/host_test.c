@@ -1,10 +1,10 @@
 /* the host as built (CSERVE_BIN: build/O2/bin): cserve with the hello app
  * dlopen()ed, cserve-static with it linked in -- the order a request
- * goes through (a file, an app's routes, the front controller or the
- * app's own 404), the app's security headers on what it answers and on
- * nothing else, its pages as the toolkit makes them (the language, the
- * fragment, a 304, the switch's cookie), the climb modes, an app it
- * can't have, a clean stop on SIGTERM */
+ * goes through (a file, an app's routes, the app's own 404), the app's
+ * security headers on what it answers and on nothing else, its pages as
+ * the toolkit makes them (the language, the fragment, a 304, the
+ * switch's cookie), a climbing path, an app it can't have, a clean stop
+ * on SIGTERM */
 /* mkdtemp/kill are POSIX, not C11 */
 #define _GNU_SOURCE
 
@@ -23,10 +23,11 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static char g_dir[] = "/tmp/cserve-host-XXXXXX";
-static char g_root[PATH_MAX], g_front[PATH_MAX], g_data[PATH_MAX];
+static char g_root[PATH_MAX], g_data[PATH_MAX], g_front[PATH_MAX];
 
 static void put(const char *path, const char *text, mode_t mode) {
   FILE *f = fopen(path, "w");
@@ -290,13 +291,108 @@ static void files(const HOST *h, const char *bin) {
   free(gone);
 }
 
+/* a raw request sent on a new connection: its fd */
+static int send_raw(const HOST *h, const char *req) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in a = {.sin_family = AF_INET,
+                          .sin_port = htons((uint16_t)h->port),
+                          .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  if (fd >= 0 && connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
+    (void)!send(fd, req, strlen(req), MSG_NOSIGNAL);
+  }
+  return fd;
+}
+
+/* everything on fd until it closes (8 s at most): malloc'd */
+static char *read_all(int fd) {
+  size_t cap = 65536, len = 0;
+  char *got = calloc(1, cap);
+  struct pollfd p = {.fd = fd, .events = POLLIN};
+  ssize_t r;
+  while (got && poll(&p, 1, 8000) > 0 &&
+         (r = recv(fd, got + len, cap - 1 - len, 0)) > 0) {
+    len += (size_t)r;
+  }
+  close(fd);
+  return got;
+}
+
+static long ms_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+#define WRONG "Authorization: Basic aGVsbG86d3Jvbmc=\r\n"
+#define TRY(name)                                                              \
+  "GET /hello-file/" name " HTTP/1.1\r\nHost: x\r\n" WRONG                     \
+  "Connection: close\r\n\r\n"
+
+/* the tarpit through the host: a wrong password's 401 held back, a guess
+ * sent alongside it told to wait; none of it with --no-tarpit */
+static void tarpit(const char *bin, const char *app) {
+  HOST h;
+  int status;
+  const char *on[] = {"--listen", "127.0.0.1:0", "--root", g_root, "--app",
+                      app,        "--data",      g_data,   NULL};
+  if (start(&h, bin, on, &status) != 0) {
+    CSERVE_TEST_ASSERT(0, "%s with its tarpit started", bin);
+    return;
+  }
+  long t = ms_now();
+  char *got = read_all(send_raw(&h, TRY("slow.txt")));
+  long took = ms_now() - t;
+  CSERVE_TEST_ASSERT(got && strstr(got, " 401 ") && took >= 900,
+                     "%s: a wrong password: its 401 held back (%ld ms)", bin,
+                     took);
+  free(got);
+  /* the second guess must come once the first has failed (its PBKDF2
+   * done, its 401 held back): one PBKDF2 is timed with the right
+   * password first, so a sanitizer's slower one is waited for too */
+  t = ms_now();
+  free(read_all(send_raw(&h, "GET /hello-file/f.txt HTTP/1.1\r\nHost: x\r\n"
+                             "Authorization: Basic "
+                             "aGVsbG86b3BlbiBzZXNhbWU=\r\n"
+                             "Connection: close\r\n\r\n")));
+  long check = ms_now() - t;
+  int first = send_raw(&h, TRY("race.txt"));
+  struct timespec pause = {(2 * check + 100) / 1000,
+                           (2 * check + 100) % 1000 * 1000000L};
+  nanosleep(&pause, NULL);
+  got = read_all(send_raw(&h, TRY("race.txt")));
+  char *was = read_all(first);
+  CSERVE_TEST_ASSERT(got && strstr(got, " 429 ") &&
+                         strstr(got, "Retry-After: ") && was &&
+                         strstr(was, " 401 "),
+                     "%s: a guess alongside it: 429, Retry-After", bin);
+  free(got);
+  free(was);
+  CSERVE_TEST_ASSERT(replied(&h, "GET", "/hello-file/slow.txt", " 401 ", NULL),
+                     "%s: no credentials at all: the plain challenge", bin);
+  CSERVE_TEST_ASSERT(stop(&h) == 0, "%s: and stopped", bin);
+
+  const char *off[] = {"--listen",    "127.0.0.1:0", "--root", g_root,
+                       "--app",       app,           "--data", g_data,
+                       "--no-tarpit", NULL};
+  if (start(&h, bin, off, &status) != 0) {
+    CSERVE_TEST_ASSERT(0, "%s --no-tarpit started", bin);
+    return;
+  }
+  t = ms_now();
+  got = read_all(send_raw(&h, TRY("slow.txt")));
+  took = ms_now() - t;
+  CSERVE_TEST_ASSERT(got && strstr(got, " 401 ") && took < 900,
+                     "%s --no-tarpit: the 401 at once (%ld ms)", bin, took);
+  free(got);
+  CSERVE_TEST_ASSERT(stop(&h) == 0, "%s --no-tarpit: and stopped", bin);
+}
+
 /* the same checks for either host, app given as app */
 static void serve_through(const char *bin, const char *app) {
   HOST h;
   int status;
-  const char *args[] = {"--listen", "127.0.0.1:0", "--root", g_root,
-                        "--cgi",    g_front,       "--app",  app,
-                        "--data",   g_data,        NULL};
+  const char *args[] = {"--listen", "127.0.0.1:0", "--root", g_root, "--app",
+                        app,        "--data",      g_data,   NULL};
   if (start(&h, bin, args, &status) != 0) {
     CSERVE_TEST_ASSERT(0, "%s --app %s started (%d)", bin, app, status);
     return;
@@ -311,10 +407,11 @@ static void serve_through(const char *bin, const char *app) {
   CSERVE_TEST_ASSERT(replied(&h, "GET", "/hello.txt", " 200 ", "a file"),
                      "%s: a file comes first", bin);
   CSERVE_TEST_ASSERT(
-      replied(&h, "GET", "/other?x=1", " 200 ", "front /other?x=1"),
-      "%s: the rest to the front", bin);
-  CSERVE_TEST_ASSERT(replied(&h, "GET", "/hello/../x", " 400 ", NULL),
-                     "%s: a climbing path refused by default", bin);
+      replied(&h, "GET", "/other?x=1", " 404 ", "<p>nothing at /other</p>"),
+      "%s: the rest: the app's 404", bin);
+  CSERVE_TEST_ASSERT(
+      replied(&h, "GET", "/a/../.htaccess", " 404 ", "<p>nothing at /a/"),
+      "%s: a climbing path: the app's 404 too", bin);
   CSERVE_TEST_ASSERT(stop(&h) == 0, "%s: SIGTERM: a clean exit", bin);
 }
 
@@ -325,6 +422,7 @@ static void test_hosts(void) {
   snprintf(so, sizeof so, "%s/apps/hello.so", CSERVE_BIN);
   serve_through(dev, so);
   serve_through(stat_bin, "hello");
+  tarpit(stat_bin, "hello");
 
   HOST h;
   int status;
@@ -342,18 +440,76 @@ static void test_hosts(void) {
     free(got);
     CSERVE_TEST_ASSERT(stop(&h) == 0, "and stopped");
   } else {
-    CSERVE_TEST_ASSERT(0, "--app hello without --cgi started");
+    CSERVE_TEST_ASSERT(0, "--app hello started");
   }
-  const char *front[] = {"--listen", "127.0.0.1:0", "--root", g_root, "--cgi",
-                         g_front,    "--climb",     "front",  NULL};
-  if (start(&h, stat_bin, front, &status) == 0) {
-    CSERVE_TEST_ASSERT(
-        replied(&h, "GET", "/a/../.htaccess", " 200 ", "front /a/../.htaccess"),
-        "--climb front: a climbing path the front's");
+  const char *bare[] = {"--listen", "127.0.0.1:0", "--root", g_root, NULL};
+  if (start(&h, stat_bin, bare, &status) == 0) {
+    CSERVE_TEST_ASSERT(replied(&h, "GET", "/nope", " 404 ", "not found") &&
+                           replied(&h, "GET", "/hello.txt", " 200 ", "a file"),
+                       "no app: files, and the host's plain 404");
     CSERVE_TEST_ASSERT(stop(&h) == 0, "and stopped");
   } else {
-    CSERVE_TEST_ASSERT(0, "--climb front started");
+    CSERVE_TEST_ASSERT(0, "no app started");
   }
+  char front_bin[PATH_MAX];
+  snprintf(front_bin, sizeof front_bin, "%s/cserve-front", CSERVE_BIN);
+  const char *front[] = {"--listen", "127.0.0.1:0", "--root", g_root, "--cgi",
+                         g_front,    "--climb",     "front",  NULL};
+  if (start(&h, front_bin, front, &status) == 0) {
+    CSERVE_TEST_ASSERT(
+        replied(&h, "GET", "/hello.txt", " 200 ", "a file") &&
+            replied(&h, "GET", "/other?x=1", " 200 ", "front /other?x=1") &&
+            replied(&h, "GET", "/a/../.htaccess", " 200 ",
+                    "front /a/../.htaccess"),
+        "cserve-front: a file, else the front, a climbing path too");
+    CSERVE_TEST_ASSERT(stop(&h) == 0, "and stopped");
+  } else {
+    CSERVE_TEST_ASSERT(0, "cserve-front started");
+  }
+  /* cserve-precompress: a copy beside a stylesheet, served to gzip */
+  char css[PATH_MAX], gz[PATH_MAX], pc[PATH_MAX * 2 + 64], text[2048];
+  snprintf(css, sizeof css, "%s/big.css", g_root);
+  snprintf(gz, sizeof gz, "%s/big.css.gz", g_root);
+  memset(text, 0, sizeof text);
+  for (size_t i = 0; i + 16 < sizeof text; i += 15) {
+    memcpy(text + i, "p{color:blue;}\n", 15);
+  }
+  put(css, text, 0600);
+  snprintf(pc, sizeof pc, "'%s/cserve-precompress' '%s' > '%s/pc.out'",
+           CSERVE_BIN, g_root, g_dir);
+  int made = system(pc);
+  struct stat zst, cst;
+  CSERVE_TEST_ASSERT(made == 0 && stat(gz, &zst) == 0 && stat(css, &cst) == 0 &&
+                         zst.st_size < cst.st_size / 4,
+                     "cserve-precompress: a copy beside the stylesheet, "
+                     "smaller");
+  int again = system(pc);
+  char out[PATH_MAX + 16], line[128] = "";
+  snprintf(out, sizeof out, "%s/pc.out", g_dir);
+  FILE *f = fopen(out, "r");
+  if (f) {
+    (void)!fgets(line, sizeof line, f);
+    fclose(f);
+  }
+  CSERVE_TEST_ASSERT(again == 0 && strstr(line, "0 written, 1 fresh"),
+                     "and run again, it's left as it is (%s)", line);
+  if (start(&h, stat_bin, bare, &status) == 0) {
+    char *got = ask_with(&h, "GET", "/big.css", "Accept-Encoding: gzip\r\n");
+    char want[64];
+    snprintf(want, sizeof want, "Content-Length: %lld\r\n",
+             (long long)zst.st_size);
+    CSERVE_TEST_ASSERT(got && strstr(got, "Content-Encoding: gzip\r\n") &&
+                           strstr(got, want) && strstr(got, "\r\n\r\n\x1f\x8b"),
+                       "cserve serves the copy to gzip: a gzip body");
+    free(got);
+    CSERVE_TEST_ASSERT(stop(&h) == 0, "and stopped");
+  }
+  unlink(gz);
+  unlink(css);
+  const char *gone[] = {"--listen", "127.0.0.1:0", "--root", g_root,
+                        "--cgi",    "php-cgi",     NULL};
+  CSERVE_TEST_ASSERT(start(&h, dev, gone, &status) != 0 && status == 2,
+                     "--cgi is no flag of the host's any more: usage, 2");
   const char *missing[] = {"--listen", "127.0.0.1:0", "--root", g_root,
                            "--app",    "nobody",      NULL};
   CSERVE_TEST_ASSERT(start(&h, stat_bin, missing, &status) != 0 && status == 1,

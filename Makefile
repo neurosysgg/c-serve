@@ -55,7 +55,7 @@ SRC = $(wildcard src/*.c) $(KIT_SRC)
 # what a server-only host compiles (the static files and the CGI with
 # it); the client is net.c
 SERVE_SRC = src/listen.c src/httpd.c src/static.c src/cgi.c src/process.c \
-	src/log.c src/route.c src/policy.c
+	src/log.c src/route.c src/policy.c src/heap.c src/pool.c src/loop.c src/tarpit.c
 CLIENT_SRC = $(filter-out $(SERVE_SRC) $(KIT_SRC),$(SRC))
 TESTS = $(patsubst tests/%_test.c,%,$(wildcard tests/*_test.c))
 FUZZERS = $(patsubst fuzz/%.c,%,$(filter-out fuzz/fuzz.h,$(wildcard fuzz/*.c)))
@@ -77,7 +77,9 @@ app_src = $(foreach a,$(1),$(if $(filter $(a),$(EXT_NAMES)),$(call ext_src,$(a))
 app_obj = $(foreach a,$(1),$(if $(filter $(a),$(EXT_NAMES)),$(patsubst \
 	$(call ext_dir_of,$(a))/%.c,$(B)/ext/$(a)/%.o,$(call ext_src,$(a))),$(call obj,$(wildcard apps/$(a)/*.c))))
 
-all: $(B)/libcserve.a $(BIN)/cserve $(BIN)/cserve-static $(APPS:%=$(BIN)/apps/%.so)
+all: $(B)/libcserve.a $(BIN)/cserve $(BIN)/cserve-static $(BIN)/cserve-front \
+	$(BIN)/cserve-precompress \
+	$(APPS:%=$(BIN)/apps/%.so)
 
 # made anew: ar updates an archive in place, so an object whose source
 # went (a rename) would stay in it
@@ -131,6 +133,14 @@ $(BIN)/cserve-static: $(B)/host/main.o $(B)/gen/apps-static.o \
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
+$(BIN)/cserve-precompress: $(B)/host/precompress.o $(B)/libcserve.a
+	@mkdir -p $(@D)
+	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+$(BIN)/cserve-front: $(B)/host/front.o $(B)/libcserve.a
+	@mkdir -p $(@D)
+	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
 .SECONDEXPANSION:
 $(BIN)/apps/%.so: $$(call app_obj,%)
 	@mkdir -p $(@D)
@@ -142,7 +152,9 @@ $(BIN)/test-%: $(call obj,tests/%_test.c) $(B)/libcserve.a
 
 # the host's suite runs both hosts and the app as built here
 $(B)/tests/host_test.o: CFLAGS += -DCSERVE_BIN='"$(BIN)"'
-$(BIN)/test-host: | $(BIN)/cserve $(BIN)/cserve-static $(APPS:%=$(BIN)/apps/%.so)
+$(BIN)/test-host: | $(BIN)/cserve $(BIN)/cserve-static $(BIN)/cserve-front \
+	$(BIN)/cserve-precompress \
+	$(APPS:%=$(BIN)/apps/%.so)
 
 # T=NAME runs one suite. The suites read tests/data/ relative to here.
 test: $(if $(T),$(BIN)/test-$(T),$(TESTS:%=$(BIN)/test-%))
@@ -151,6 +163,13 @@ test: $(if $(T),$(BIN)/test-$(T),$(TESTS:%=$(BIN)/test-%))
 $(BIN)/fuzz-%: $(call obj,fuzz/%.c) $(call obj,$(SRC))
 	@mkdir -p $(@D)
 	$(CC) -fsanitize=fuzzer,address,undefined $^ $(LDLIBS) -o $@
+
+# the host attacked (tools/abuse.py), under each sanitizer
+abuse:
+	$(MAKE) --no-print-directory -j$(shell nproc) SAN=1 TSAN= STATIC_APPS=hello all
+	python3 -I tools/abuse.py build/O2-san/bin --prompt 12
+	$(MAKE) --no-print-directory -j$(shell nproc) SAN= TSAN=1 STATIC_APPS=hello all
+	python3 -I tools/abuse.py build/O2-tsan/bin --prompt 12
 
 fuzz:
 	@test -n "$(FUZZ)" || { echo "make FUZZ=1 fuzz"; exit 1; }
@@ -215,5 +234,5 @@ clean:
 
 FORCE:
 
-.PHONY: all test fuzz check lint format clean FORCE
+.PHONY: all test fuzz check abuse lint format clean FORCE
 -include $(shell find build -name '*.d' 2>/dev/null)

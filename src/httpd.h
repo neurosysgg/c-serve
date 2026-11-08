@@ -30,6 +30,13 @@ typedef struct {
    * text, the connection (its TLS peer: cserve_conn_peer_cert()) */
   const char *peer;
   CSERVE_CONN *conn;
+  /* set by the loop (loop.h; the threaded server leaves them 0, and conn
+   * is NULL on the loop): the peer's address family (4 or 6, an IPv4
+   * address mapped into IPv6 counted as 4) and its network, the part a
+   * limit or a penalty keys on -- an IPv4 address whole, an IPv6 one's
+   * /64 -- in its first 4 or 8 bytes, the rest zero */
+  int peer_family;
+  unsigned char peer_net[16];
 } CSERVE_HTTPD_REQ;
 
 /* the head (buf: its lines up to and without the blank line, NUL-
@@ -38,25 +45,48 @@ typedef struct {
  * 431, 501, 505) and why in err */
 int cserve_httpd_parse(char *buf, CSERVE_HTTPD_REQ *r, char *err,
                        size_t err_cap);
+/* The head found in bytes as they come (pure), for a server that reads
+ * what's there rather than a line at a time (loop.h): the rules the
+ * threaded server's line reader keeps -- lines end in LF or CRLF, up to
+ * 4 empty lines before the request line are skipped, the head ends at
+ * the first empty line after it, and no line nor the head as a whole is
+ * longer than cap. Each call is handed every byte so far (buf, n: the
+ * same bytes as the last call's and maybe more) and f, zeroed before the
+ * first, carries where the last one stopped, so each byte is looked at
+ * once. The head's lines go into out (cap bytes), each ending in LF and
+ * the whole NUL-terminated: what cserve_httpd_parse() takes. 1 when the
+ * head is complete (f->pos: the bytes it took, f->len: its length in
+ * out), 0 while more bytes are needed, -1 to refuse it: *status says
+ * with what (400, 431), or 0 to close without a word (a first line
+ * too long to be a request). */
+typedef struct {
+  size_t pos; /* buf's bytes looked at */
+  size_t len; /* out's */
+  int lines;  /* the head's lines so far */
+  int blanks; /* empty lines before the request line */
+} CSERVE_HTTPD_FRAME;
+
+int cserve_httpd_frame(CSERVE_HTTPD_FRAME *f, const char *buf, size_t n,
+                       char *out, size_t cap, int *status, char *err,
+                       size_t err_cap);
+
 /* header name's value (case-insensitive name, the first one), or NULL */
 const char *cserve_httpd_header(const CSERVE_HTTPD_REQ *r, const char *name);
 /* status's reason phrase ("Not Found"; "" for one it doesn't know) */
 const char *cserve_httpd_reason(int status);
 
-/* a streamed body's writer (stream() below): n bytes of it out at once,
- * as one chunk: 0, or -1 once the client is gone (later calls do
- * nothing) */
-typedef struct CSERVE_HTTPD_OUT CSERVE_HTTPD_OUT;
-int cserve_httpd_out(CSERVE_HTTPD_OUT *o, const char *buf, size_t n);
-
 /* what a handler answers: status, the body (len bytes; free it if
  * owned), its Content-Type, extra header lines (each ending in CRLF; may
- * be NULL). Or, with stream set, a body of unknown length: called once
- * after the head is sent (always, also when it wasn't, or the reply has
- * no body: its writes fail or are dropped then; it frees stream_ud), it
- * writes the body through o and returns 0 when all of it went, -1 if it
- * failed part-way; out chunked (HTTP/1.1, the connection kept) or until
- * the connection closes (HTTP/1.0). */
+ * be NULL). Or, with pull set, a body of unknown length, pulled a piece
+ * at a time once the head is out: pull() puts up to cap bytes in buf and
+ * says how many, 0 at the end, -1 when it failed part-way. It is called
+ * only while the client takes the body (never for HEAD, 204 or 304), and
+ * done() is called once after, always -- also when pull() never was, or
+ * the client went -- and frees pull_ud. A server that serves connections
+ * from one loop (loop.h) pulls from that loop, so a pull returns as soon
+ * as a file read does; only the threaded server (serve() below) lets one
+ * wait (cgi.h's). The body goes out chunked (HTTP/1.1, the connection
+ * kept) or until the connection closes (HTTP/1.0). */
 typedef struct {
   int status;
   const char *type;
@@ -64,13 +94,41 @@ typedef struct {
   size_t len;
   int owned; /* body is malloc'd: freed after it's sent */
   char headers[4096];
-  int (*stream)(CSERVE_HTTPD_OUT *o, void *stream_ud);
-  void *stream_ud;
-  /* > 0: the streamed body's exact length, said as Content-Length (no
-   * chunks, the connection kept, a HEAD told it too); a stream that
-   * writes fewer bytes returns -1 and the connection closes */
+  long (*pull)(void *ud, char *buf, size_t cap);
+  void (*done)(void *ud);
+  void *pull_ud;
+  /* > 0: the pulled body's exact length, said as Content-Length (no
+   * chunks, the connection kept, a HEAD told it too); a body that comes
+   * out shorter or longer fails, and the connection closes */
   long long stream_length;
+  /* > 0: the loop (loop.h) holds the reply back this long before it
+   * sends it -- a failed login's, from the tarpit (tarpit.h): the
+   * connection waits on a timer, no worker does. The threaded server
+   * sends it at once. */
+  long delay_ms;
 } CSERVE_HTTPD_REPLY;
+
+/* the reply's body let go: an owned one freed, a pull's done() called
+ * (once: pull is cleared) */
+void cserve_httpd_release(CSERVE_HTTPD_REPLY *rep);
+
+/* The reply's head, as both servers write it (pure): status line, the
+ * Server header (server "" or NULL: none), the length or chunking, the
+ * type, Connection (keep), rep's own lines, the blank line -- into buf
+ * (cap bytes): its length, or -1 when it doesn't fit. *chunked says
+ * whether the body goes out in chunks, *body whether any body follows
+ * the head at all (not for HEAD, 1xx, 204, 304). r NULL: a refusal sent
+ * before a request was understood. */
+int cserve_httpd_head(const char *server, const CSERVE_HTTPD_REQ *r,
+                      const CSERVE_HTTPD_REPLY *rep, int keep, char *buf,
+                      size_t cap, int *chunked, int *body);
+
+/* whether the connection can carry another request after this reply
+ * (more: the per-connection limit allows one): the client asked, and a
+ * pulled body of unknown length doesn't end with the connection (HTTP/1.0,
+ * or a HEAD, which is said without framing) */
+int cserve_httpd_keep(const CSERVE_HTTPD_REQ *r, const CSERVE_HTTPD_REPLY *rep,
+                      int more);
 
 /* the reply's text as body: a copy (owned), or a 500 */
 void cserve_httpd_text(CSERVE_HTTPD_REPLY *rep, int status, const char *type,

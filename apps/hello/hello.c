@@ -8,6 +8,7 @@
 #include "file.h"
 #include "headers.h"
 #include "html.h"
+#include "login.h"
 #include "markup.h"
 #include "page.h"
 #include "password.h"
@@ -127,13 +128,18 @@ static void language(const CSERVE_HTTPD_REQ *r, const char *body,
 }
 
 /* /hello-file/{name}: data/name, behind Basic and in ranges -- the 401
- * the same for a file there is and one there isn't */
+ * the same for a file there is and one there isn't, and a wrong password
+ * slowed down (login.h), the file being the account tried */
 static void hello_file(const CSERVE_HTTPD_REQ *r, const char *body,
                        const CSERVE_ROUTE_MATCH *m, CSERVE_HTTPD_REPLY *rep) {
   (void)body;
   char user[64], pass[128], path[512];
-  cserve_basic_credentials(cserve_httpd_header(r, "Authorization"), user,
-                           sizeof user, pass, sizeof pass);
+  const char *auth = cserve_httpd_header(r, "Authorization");
+  const char *account = cserve_route_param(m, "name");
+  if (auth && cserve_login_check(r, account, rep)) {
+    return;
+  }
+  cserve_basic_credentials(auth, user, sizeof user, pass, sizeof pass);
   int user_ok = strcmp(user, "hello") == 0;
   int pass_ok = cserve_password_matches(DIGEST, pass, strlen(pass));
   if (!user_ok || !pass_ok) {
@@ -147,8 +153,12 @@ static void hello_file(const CSERVE_HTTPD_REQ *r, const char *body,
       return;
     }
     cserve_httpd_text(rep, 401, "text/plain; charset=utf-8", "", 0);
+    if (auth) {
+      cserve_login_fail(r, account, rep);
+    }
     return;
   }
+  cserve_login_pass(r, account);
   if (!*g_data ||
       snprintf(path, sizeof path, "%s/%s", g_data,
                cserve_route_param(m, "name")) >= (int)sizeof path ||
@@ -216,6 +226,7 @@ static const char *const IMAGES[] = {"https://images.example", NULL};
 static const CSERVE_SECURITY SECURITY = {.img = IMAGES};
 
 static int init(const CSERVE_APP_ENV *env, char *err, size_t err_cap) {
+  cserve_login_use(env->tarpit);
   if (cserve_texts_complete(TEXTS, sizeof TEXTS / sizeof *TEXTS, LANGS.n, err,
                             err_cap) != 0) {
     return -1;

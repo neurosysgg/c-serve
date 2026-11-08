@@ -182,23 +182,17 @@ static void text(CSERVE_HTTPD_REPLY *rep, int status, const char *t) {
 }
 
 /* the big file's body, a piece at a time */
-static int file_stream(CSERVE_HTTPD_OUT *o, void *ud) {
+static long file_pull(void *ud, char *buf, size_t cap) {
   int fd = (int)(intptr_t)ud;
-  char buf[65536];
-  ssize_t n;
-  int ret = 0;
-  while ((n = read(fd, buf, sizeof buf)) != 0) {
-    if (n < 0 && errno == EINTR) {
-      continue;
-    }
-    if (n < 0 || cserve_httpd_out(o, buf, (size_t)n) != 0) {
-      ret = -1;
-      break;
+  for (;;) {
+    ssize_t n = read(fd, buf, cap);
+    if (n >= 0 || errno != EINTR) {
+      return n < 0 ? -1 : (long)n;
     }
   }
-  close(fd);
-  return ret;
 }
+
+static void file_done(void *ud) { close((int)(intptr_t)ud); }
 
 /* whether an If-None-Match list has etag (or is "*") */
 static int matches(const char *list, const char *etag) {
@@ -219,6 +213,70 @@ static int matches(const char *list, const char *etag) {
   return 0;
 }
 
+/* a q value (after "q=") that is zero: 0, 0., 0.0, 0.000 -- up to its
+ * end, a space, a comma or a semicolon */
+static int q_zero(const char *v) {
+  if (*v++ != '0') {
+    return 0;
+  }
+  if (*v == '.') {
+    v += 1 + strspn(v + 1, "0");
+  }
+  return *v == '\0' || *v == ' ' || *v == '\t' || *v == ',' || *v == ';';
+}
+
+int cserve_static_accepts_gzip(const char *ae) {
+  int any = 0, gzip = -1; /* gzip: listed with q > 0 (1), q = 0 (0), not
+                             at all (-1) */
+  if (!ae) {
+    return 0;
+  }
+  for (const char *p = ae; *p;) {
+    p += strspn(p, " \t,");
+    size_t n = strcspn(p, " \t;,");
+    int is_gzip = (n == 4 && !strncasecmp(p, "gzip", 4)) ||
+                  (n == 6 && !strncasecmp(p, "x-gzip", 6));
+    int is_any = n == 1 && *p == '*';
+    p += n;
+    int zero = 0;
+    while (*p && *p != ',') {
+      p += strspn(p, " \t;");
+      if ((p[0] == 'q' || p[0] == 'Q') && p[1] == '=') {
+        zero = q_zero(p + 2);
+      }
+      p += strcspn(p, ";,");
+    }
+    if (is_gzip) {
+      gzip = !zero;
+    } else if (is_any) {
+      any = !zero;
+    }
+  }
+  return gzip == 1 || (gzip == -1 && any);
+}
+
+/* file's compressed copy beside it, when there is a fresh one: its fd
+ * (*st its stat), or -1 */
+static int fresh_copy(const char *file, const struct stat *of,
+                      struct stat *st) {
+  char gz[PATH_MAX];
+  if (snprintf(gz, sizeof gz, "%s.gz", file) >= (int)sizeof gz) {
+    return -1;
+  }
+  int fd = open(gz, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) {
+    return -1;
+  }
+  if (fstat(fd, st) != 0 || !S_ISREG(st->st_mode) ||
+      st->st_mtim.tv_sec < of->st_mtim.tv_sec ||
+      (st->st_mtim.tv_sec == of->st_mtim.tv_sec &&
+       st->st_mtim.tv_nsec < of->st_mtim.tv_nsec)) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
 void cserve_static_serve(const CSERVE_HTTPD_REQ *r,
                          const CSERVE_STATIC_ROUTE *rt,
                          CSERVE_HTTPD_REPLY *rep) {
@@ -236,13 +294,26 @@ void cserve_static_serve(const CSERVE_HTTPD_REQ *r,
     text(rep, 404, "not found\n");
     return;
   }
+  struct stat gst;
+  int gz = fresh_copy(rt->file, &st, &gst);
+  int gzipped = gz >= 0 && cserve_static_accepts_gzip(
+                               cserve_httpd_header(r, "Accept-Encoding"));
+  if (gzipped) {
+    close(fd);
+    fd = gz;
+    st = gst;
+  } else if (gz >= 0) {
+    close(gz);
+  }
   char etag[64];
   snprintf(etag, sizeof etag, "W/\"%llx-%llx\"", (unsigned long long)st.st_size,
            (unsigned long long)st.st_mtim.tv_sec * 1000000000ULL +
                (unsigned long long)st.st_mtim.tv_nsec);
   const char *cache = cserve_static_cache(rt->file, rt->immutable);
   int n = snprintf(rep->headers, sizeof rep->headers,
-                   "ETag: %s\r\nX-Content-Type-Options: nosniff\r\n", etag);
+                   "ETag: %s\r\nX-Content-Type-Options: nosniff\r\n%s%s", etag,
+                   gz >= 0 ? "Vary: Accept-Encoding\r\n" : "",
+                   gzipped ? "Content-Encoding: gzip\r\n" : "");
   if (*cache && n > 0 && (size_t)n < sizeof rep->headers) {
     snprintf(rep->headers + n, sizeof rep->headers - (size_t)n,
              "Cache-Control: %s\r\n", cache);
@@ -255,8 +326,9 @@ void cserve_static_serve(const CSERVE_HTTPD_REQ *r,
   rep->status = 200;
   rep->type = cserve_static_mime(rt->file);
   if (st.st_size > FILE_WHOLE) {
-    rep->stream = file_stream;
-    rep->stream_ud = (void *)(intptr_t)fd;
+    rep->pull = file_pull;
+    rep->done = file_done;
+    rep->pull_ud = (void *)(intptr_t)fd;
     return;
   }
   char *body = malloc((size_t)st.st_size + 1);

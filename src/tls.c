@@ -30,6 +30,8 @@
 struct CSERVE_TLS {
   int fd;
   mbedtls_ssl_context ssl;
+  char host[256]; /* the name the server's certificate must carry ("" on
+                     the server side: the client's is checked) */
 };
 
 /* process-wide: the config and the CAs it points at, set up once; a
@@ -273,17 +275,18 @@ static int again(CSERVE_TLS *t, int ret, const char *what, long deadline,
   return -1;
 }
 
-/* a connection on fd under conf, its handshake done (host: the name the
- * server's certificate must carry, NULL on the server side), or NULL */
-static CSERVE_TLS *handshake(int fd, const mbedtls_ssl_config *conf,
-                             const char *host, long deadline, char *err,
-                             size_t err_cap) {
+/* a connection on fd under conf, its handshake not begun (host: the
+ * name the server's certificate must carry, NULL on the server side), or
+ * NULL with why in err */
+static CSERVE_TLS *start(int fd, const mbedtls_ssl_config *conf,
+                         const char *host, char *err, size_t err_cap) {
   CSERVE_TLS *t = calloc(1, sizeof *t);
   if (!t) {
     snprintf(err, err_cap, "out of memory");
     return NULL;
   }
   t->fd = fd;
+  snprintf(t->host, sizeof t->host, "%s", host ? host : "");
   lock();
   mbedtls_ssl_init(&t->ssl);
   int ret = mbedtls_ssl_setup(&t->ssl, conf);
@@ -291,38 +294,65 @@ static CSERVE_TLS *handshake(int fd, const mbedtls_ssl_config *conf,
     ret = mbedtls_ssl_set_hostname(&t->ssl, host);
   }
   mbedtls_ssl_set_bio(&t->ssl, &t->fd, bio_send, bio_recv, NULL);
+  if (ret != 0) {
+    mbedtls_ssl_free(&t->ssl);
+  }
   unlock();
   if (ret != 0) {
     why(ret, "setup", err, err_cap);
-    goto fail;
+    free(t);
+    return NULL;
   }
-  for (;;) {
-    lock();
-    ret = mbedtls_ssl_handshake(&t->ssl);
-    uint32_t verify = mbedtls_ssl_get_verify_result(&t->ssl);
-    unlock();
-    if (ret == 0) {
-      break;
-    }
-    if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
-      char info[256];
-      mbedtls_x509_crt_verify_info(info, sizeof info, "", verify);
-      info[strcspn(info, "\n")] = '\0';
-      snprintf(err, err_cap, "TLS: %s's certificate: %s",
-               host ? host : "the client", info);
-      goto fail;
-    }
-    if (again(t, ret, "handshake", deadline, err, err_cap) != 0) {
-      goto fail;
+  return t;
+}
+
+/* mbedtls's WANT_READ/WANT_WRITE as this seam's */
+static int want(int ret) {
+  return ret == MBEDTLS_ERR_SSL_WANT_READ    ? CSERVE_TLS_WANT_READ
+         : ret == MBEDTLS_ERR_SSL_WANT_WRITE ? CSERVE_TLS_WANT_WRITE
+                                             : 0;
+}
+
+int cserve_tls_step(CSERVE_TLS *t, char *err, size_t err_cap) {
+  lock();
+  int ret = mbedtls_ssl_handshake(&t->ssl);
+  uint32_t verify = mbedtls_ssl_get_verify_result(&t->ssl);
+  unlock();
+  if (ret == 0) {
+    return 0;
+  }
+  if (want(ret)) {
+    return want(ret);
+  }
+  if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+    char info[256];
+    mbedtls_x509_crt_verify_info(info, sizeof info, "", verify);
+    info[strcspn(info, "\n")] = '\0';
+    snprintf(err, err_cap, "TLS: %s's certificate: %s",
+             t->host[0] ? t->host : "the client", info);
+    return -1;
+  }
+  why(ret, "handshake", err, err_cap);
+  return -1;
+}
+
+/* start()'s connection, its handshake done before deadline, or NULL */
+static CSERVE_TLS *handshake(int fd, const mbedtls_ssl_config *conf,
+                             const char *host, long deadline, char *err,
+                             size_t err_cap) {
+  CSERVE_TLS *t = start(fd, conf, host, err, err_cap);
+  for (int ret; t && (ret = cserve_tls_step(t, err, err_cap)) != 0;) {
+    if (ret == -1 ||
+        cserve_net_wait(t->fd, ret == CSERVE_TLS_WANT_READ ? POLLIN : POLLOUT,
+                        deadline, err, err_cap) != 0) {
+      lock();
+      mbedtls_ssl_free(&t->ssl);
+      unlock();
+      free(t);
+      return NULL;
     }
   }
   return t;
-fail:
-  lock();
-  mbedtls_ssl_free(&t->ssl);
-  unlock();
-  free(t);
-  return NULL;
 }
 
 CSERVE_TLS *cserve_tls_open(int fd, const char *host, long deadline, char *err,
@@ -528,6 +558,47 @@ int cserve_tls_peer(CSERVE_TLS *t, char *cn, size_t cn_cap, char fpr[65]) {
 CSERVE_TLS *cserve_tls_accept(int fd, CSERVE_TLS_SERVER *s, long deadline,
                               char *err, size_t err_cap) {
   return handshake(fd, &s->side.conf, NULL, deadline, err, err_cap);
+}
+
+CSERVE_TLS *cserve_tls_server_start(int fd, CSERVE_TLS_SERVER *s, char *err,
+                                    size_t err_cap) {
+  return start(fd, &s->side.conf, NULL, err, err_cap);
+}
+
+long cserve_tls_send(CSERVE_TLS *t, const char *buf, size_t n, char *err,
+                     size_t err_cap) {
+  lock();
+  int w = mbedtls_ssl_write(&t->ssl, (const unsigned char *)buf, n);
+  unlock();
+  if (w > 0 || want(w)) {
+    return w > 0 ? w : want(w);
+  }
+  why(w, "sending", err, err_cap);
+  return -1;
+}
+
+long cserve_tls_recv(CSERVE_TLS *t, char *buf, size_t n, char *err,
+                     size_t err_cap) {
+  for (;;) {
+    lock();
+    int r = mbedtls_ssl_read(&t->ssl, (unsigned char *)buf, n);
+    unlock();
+    if (r >= 0) {
+      return r;
+    }
+    if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY ||
+        r == MBEDTLS_ERR_SSL_CONN_EOF) {
+      return 0;
+    }
+    if (r == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) {
+      continue;
+    }
+    if (want(r)) {
+      return want(r);
+    }
+    why(r, "receiving", err, err_cap);
+    return -1;
+  }
 }
 
 int cserve_tls_write(CSERVE_TLS *t, const char *buf, size_t n, long deadline,

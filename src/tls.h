@@ -43,6 +43,29 @@ void cserve_tls_server_free(CSERVE_TLS_SERVER *s);
 CSERVE_TLS *cserve_tls_accept(int fd, CSERVE_TLS_SERVER *s, long deadline,
                               char *err, size_t err_cap);
 
+/* The server side without waiting, for a loop (loop.h) that owns the
+ * socket: each call does what it can now and says what it needs next --
+ * WANT_READ or WANT_WRITE: call it again when the socket is readable or
+ * writable. Only the loop's thread calls these. */
+#define CSERVE_TLS_WANT_READ (-2)
+#define CSERVE_TLS_WANT_WRITE (-3)
+
+/* the server's side on an accepted, non-blocking fd, its handshake not
+ * begun, or NULL with why in err */
+CSERVE_TLS *cserve_tls_server_start(int fd, CSERVE_TLS_SERVER *s, char *err,
+                                    size_t err_cap);
+/* the handshake moved on: 0 once it's done, a WANT, or -1 with why in
+ * err */
+int cserve_tls_step(CSERVE_TLS *t, char *err, size_t err_cap);
+/* up to n bytes: how many, 0 at the end, a WANT, or -1 with why in err */
+long cserve_tls_recv(CSERVE_TLS *t, char *buf, size_t n, char *err,
+                     size_t err_cap);
+/* some of buf sent: how many (> 0), a WANT, or -1 with why in err. After
+ * a WANT the next call must offer the same bytes again (mbedtls has
+ * taken some of them into a record already) */
+long cserve_tls_send(CSERVE_TLS *t, const char *buf, size_t n, char *err,
+                     size_t err_cap);
+
 /* The next PEM certificate in buf[*pos..len), decoded into der (len
  * bytes always fit) and *pos moved past it: its DER's length, 0 when none
  * is left, -1 for a block that isn't clean base64 by mbedtls's rules

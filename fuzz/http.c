@@ -12,8 +12,13 @@
  * it takes must be what mbedtls's own base64 decoder makes of it; 7 = a
  * request's path routed (static.c, in both climb modes, against a small
  * root of its own; route.c, against a fixed table): a file is always
- * inside the root, a capture never a dot-segment or more than one. Any
- * other first byte: as 3. */
+ * inside the root, a capture never a dot-segment or more than one; 8 =
+ * a request's head framed as the loop frames it (httpd.c's frame()),
+ * whole and as it comes in pieces (the next byte seeds their sizes):
+ * both decide the same, to the byte, and what it frames parses or is
+ * refused without a fault; 9 = an Accept-Encoding (static.c): read
+ * without a fault, and refusing gzip once ", gzip;q=0" follows it,
+ * whatever came before. Any other first byte: as 3. */
 #include "fuzz.h"
 
 #include "cgi.h"
@@ -393,6 +398,59 @@ static void paths(const uint8_t *data, size_t size) {
   }
 }
 
+/* the head framed whole, then again with the bytes arriving in pieces */
+static void framed(const uint8_t *data, size_t size) {
+  if (size == 0) {
+    return;
+  }
+  unsigned seed = data[0] | 1u;
+  data++;
+  size--;
+  /* a small cap, so the limits come up as often as the ends */
+  enum { CAP = 512 };
+  char *buf = malloc(size ? size : 1);
+  memcpy(buf, data, size);
+  char whole_out[CAP], piece_out[CAP], err[128];
+  CSERVE_HTTPD_FRAME fw = {0}, fp = {0};
+  int sw = -1, sp = -1;
+  int w =
+      cserve_httpd_frame(&fw, buf, size, whole_out, CAP, &sw, err, sizeof err);
+  int p = 0;
+  for (size_t have = 0; have < size && p == 0;) {
+    seed = seed * 1103515245u + 12345u;
+    size_t k = 1 + (seed >> 16) % 23;
+    have += k < size - have ? k : size - have;
+    p = cserve_httpd_frame(&fp, buf, have, piece_out, CAP, &sp, err,
+                           sizeof err);
+  }
+  FUZZ_CHECK(w == p, "whole %d, in pieces %d", w, p);
+  if (w == 1) {
+    FUZZ_CHECK(fw.pos == fp.pos && fw.len == fp.len &&
+                   !memcmp(whole_out, piece_out, fw.len + 1),
+               "in pieces, a different head");
+    FUZZ_CHECK(fw.len < CAP && whole_out[fw.len] == '\0',
+               "the head is NUL-terminated within its cap");
+    CSERVE_HTTPD_REQ *r = malloc(sizeof *r);
+    (void)cserve_httpd_parse(whole_out, r, err, sizeof err);
+    free(r);
+  } else if (w < 0) {
+    FUZZ_CHECK(sw == sp && (sw == 0 || sw == 400 || sw == 431),
+               "refused with %d whole, %d in pieces", sw, sp);
+  }
+  free(buf);
+}
+
+static void encodings(const uint8_t *data, size_t size) {
+  char *ae = malloc(size + 16);
+  memcpy(ae, data, size);
+  ae[size] = '\0';
+  (void)cserve_static_accepts_gzip(ae);
+  /* a NUL inside it ends it: what follows is appended to what's read */
+  memcpy(ae + strlen(ae), ", gzip;q=0", 11);
+  FUZZ_CHECK(!cserve_static_accepts_gzip(ae), "gzip;q=0 last, still gzip");
+  free(ae);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size == 0) {
     return 0;
@@ -411,6 +469,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     pem(data + 1, size - 1);
   } else if (data[0] == 7) {
     paths(data + 1, size - 1);
+  } else if (data[0] == 8) {
+    framed(data + 1, size - 1);
+  } else if (data[0] == 9) {
+    encodings(data + 1, size - 1);
   } else {
     request(data + 1, size - 1);
   }

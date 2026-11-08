@@ -1,6 +1,6 @@
 /* static.c: the routing (the stamp, dot-segments, PHP, a symlink out of
  * the root, both climb modes), types and cache tiers, and a file served:
- * its ETag, a 304, a 405 */
+ * its ETag, a 304, a 405; a compressed copy beside it, and who gets it */
 /* mkdtemp/symlink/realpath are POSIX, not C11 */
 #define _GNU_SOURCE
 
@@ -8,6 +8,7 @@
 
 #include "test.h"
 
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,6 +181,98 @@ static void test_serve(void) {
   done(&rep);
 }
 
+/* rel's mtime set to sec (since the epoch) */
+static void age(const char *rel, long sec) {
+  char path[PATH_MAX];
+  snprintf(path, sizeof path, "%s/%s", g_dir, rel);
+  struct timespec ts[2] = {{sec, 0}, {sec, 0}};
+  utimensat(AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW);
+}
+
+static void test_accepts(void) {
+  static const struct {
+    const char *ae;
+    int gzip;
+  } T[] = {{NULL, 0},
+           {"", 0},
+           {"gzip", 1},
+           {"gzip, deflate, br", 1},
+           {"br;q=1.0, gzip;q=0.8, *;q=0.1", 1},
+           {"x-gzip", 1},
+           {"GZIP", 1},
+           {"gzip;q=0", 0},
+           {"gzip; q=0.000", 0},
+           {"gzip;Q=0.", 0},
+           {"gzip;q=0.001", 1},
+           {"*", 1},
+           {"*;q=0", 0},
+           {"*, gzip;q=0", 0},
+           {"gzip;q=0, *", 0},
+           {"identity", 0},
+           {"deflate, br", 0},
+           {"gzipx", 0},
+           {",,; ;q=,gzip", 1}};
+  int bad = 0;
+  for (size_t i = 0; i < sizeof T / sizeof *T; i++) {
+    if (cserve_static_accepts_gzip(T[i].ae) != T[i].gzip) {
+      printf("    \"%s\": %d\n", T[i].ae ? T[i].ae : "(none)", !T[i].gzip);
+      bad++;
+    }
+  }
+  CSERVE_TEST_ASSERT(!bad, "Accept-Encoding: who takes gzip (%zu cases)",
+                     sizeof T / sizeof *T);
+}
+
+static void test_gzip(void) {
+  CSERVE_HTTPD_REPLY rep;
+  put("public/style.css", "body{color:red}");
+  put("public/style.css.gz", "the copy");
+  age("public/style.css", 1000000);
+  age("public/style.css.gz", 1000001);
+  serve("GET", "/style.css", "", &rep);
+  CSERVE_TEST_ASSERT(rep.status == 200 && rep.len == 15 &&
+                         strstr(rep.headers, "Vary: Accept-Encoding\r\n") &&
+                         !strstr(rep.headers, "Content-Encoding"),
+                     "a file with a copy, to a client without gzip: the file, "
+                     "Vary");
+  char plain[80] = "";
+  const char *e = strstr(rep.headers, "ETag: ");
+  snprintf(plain, sizeof plain, "%.*s", e ? (int)strcspn(e, "\r") : 0,
+           e ? e : "");
+  done(&rep);
+  serve("GET", "/style.css", "Accept-Encoding: gzip, br\r\n", &rep);
+  CSERVE_TEST_ASSERT(rep.status == 200 && rep.len == 8 &&
+                         !memcmp(rep.body, "the copy", 8) &&
+                         !strcmp(rep.type, "text/css; charset=utf-8") &&
+                         strstr(rep.headers, "Content-Encoding: gzip\r\n") &&
+                         strstr(rep.headers, "Vary: Accept-Encoding\r\n") &&
+                         *plain && !strstr(rep.headers, plain),
+                     "to one that takes gzip: the copy, its own ETag, the "
+                     "file's type");
+  done(&rep);
+  serve("GET", "/style.css", "Accept-Encoding: gzip;q=0\r\n", &rep);
+  CSERVE_TEST_ASSERT(rep.len == 15 && !strstr(rep.headers, "Content-Encoding"),
+                     "gzip refused with q=0: the file");
+  done(&rep);
+  age("public/style.css", 1000002);
+  serve("GET", "/style.css", "Accept-Encoding: gzip\r\n", &rep);
+  CSERVE_TEST_ASSERT(rep.len == 15 &&
+                         !strstr(rep.headers, "Content-Encoding") &&
+                         !strstr(rep.headers, "Vary"),
+                     "a copy older than its file: never served");
+  done(&rep);
+  put("public/other.css", "p{}");
+  char from[PATH_MAX], to[PATH_MAX];
+  snprintf(from, sizeof from, "%s/public/style.css.gz", g_dir);
+  snprintf(to, sizeof to, "%s/public/other.css.gz", g_dir);
+  (void)!symlink(from, to);
+  age("public/other.css", 1000000);
+  serve("GET", "/other.css", "Accept-Encoding: gzip\r\n", &rep);
+  CSERVE_TEST_ASSERT(rep.len == 3 && !strstr(rep.headers, "Content-Encoding"),
+                     "a copy that's a symlink: never served");
+  done(&rep);
+}
+
 int main(void) {
   if (!mkdtemp(g_dir)) {
     CSERVE_TEST_ASSERT(0, "a scratch dir");
@@ -198,6 +291,8 @@ int main(void) {
   }
   test_route();
   test_serve();
+  test_accepts();
+  test_gzip();
   char rm[PATH_MAX + 16];
   snprintf(rm, sizeof rm, "rm -rf '%s'", g_dir);
   int rc = system(rm);

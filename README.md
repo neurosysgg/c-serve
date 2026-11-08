@@ -8,8 +8,12 @@ and carries a small web host, `cserve`, whose sites are compiled in as first-cla
 | File | What it is |
 |---|---|
 | `src/http.{c,h}` | URLs, a request formatted, a reply decoded as it arrives (Content-Length, chunked, to the end) — pure, on buffers |
-| `src/httpd.{c,h}` | the server side: a request head parsed and bounded, its body read, a reply written or streamed |
-| `src/listen.{c,h}` | listening sockets, a thread per connection, until a stop fd turns readable |
+| `src/httpd.{c,h}` | the server side's HTTP/1.1, pure where both servers share it: a head framed and parsed, a reply's head written, keep-alive decided; the threaded server, which reads a body and writes or pulls a reply |
+| `src/loop.{c,h}` | the server for the open internet: one epoll loop owns every socket, every wait a deadline, every handler on the pool; caps per connection count and per network, a lingering close, the access log (never an address) |
+| `src/heap.{c,h}` | the loop's timers: a min-heap of deadlines, each node inside what it times |
+| `src/pool.{c,h}` | the loop's workers: a fixed set of threads, a bounded queue (past it, a 503), finished jobs handed back through an eventfd |
+| `src/tarpit.{c,h}` | the brake on guessing: a failed login's wait doubling to a cap, keyed on network and account, in a fixed table a flood can't wash out |
+| `src/listen.{c,h}` | listening sockets; the threaded server's thread per connection (ctui-remote's, and `cserve-front`'s) |
 | `src/conn.{c,h}` | a TCP connection with a monotonic deadline, TLS on top; lines and bytes for IMAP / SMTP |
 | `src/tls.{c,h}` | the TLS seam: everything that knows mbedtls — client, server, mutual TLS, a peer's certificate |
 | `src/coding.{c,h}` | gzip and deflate undone, incrementally |
@@ -26,10 +30,13 @@ and carries a small web host, `cserve`, whose sites are compiled in as first-cla
 | `kit/markup.{c,h}` + `kit/html.{c,h}` | the page as a tree, HTML's tags and attributes typed, render with escaping and the URL check in it |
 | `kit/headers.{c,h}` | a reply's headers by name, refusing a value that would end one; a Basic challenge whose realm is qdtext |
 | `kit/file.{c,h}` | a file answered, whole or the one range a GET asks for, read as it is sent |
+| `kit/login.{c,h}` | a password gate's brake, as an app calls it: a 429 while its key waits, a wrong try's 401 held back |
 | `kit/password.{c,h}` | a password against a `$pbkdf2-sha256$` digest (mbedtls), the time a wrong one or none costs the same |
 | `kit/json.{c,h}` | a file an app reads at start-up, as a tree: ctui's parser, made strict |
 | `kit/page.{c,h}` | a view answered: the shell or the fragment, the language, ETag / 304, Vary |
-| `host/main.c` | `cserve`: listeners (plain, TLS, mutual TLS), then a file, an app's route, the front, the app's 404, or 404 |
+| `host/main.c` | `cserve`: listeners (plain or TLS) on the loop, then a file, an app's route, the app's 404, or 404 |
+| `host/front.c` | `cserve-front`: a PHP site's root with its front controller as CGI, on the threaded server — the reference a native app is diffed against, never deployed |
+| `host/precompress.c` | `cserve-precompress ROOT`: a gzip copy beside each text-like file, which the host serves to a client that takes gzip |
 | `apps/hello/` | the test app: the ABI, both ways of linking, and the toolkit end to end |
 
 An app may live outside this tree: `EXTERNAL_APPS="name=DIR"` builds DIR's `*.c` (at any depth,
@@ -46,22 +53,27 @@ A host compiles `src/` into itself; there is nothing to install. `-ffunction-sec
 host's `--gc-sections` keep what it never calls out of its binary, so a server that makes no
 requests carries no client.
 
-The host, against a PHP site's web root, its front controller as CGI:
+The host, a site's web root and its app:
 
 ```bash
-build/O2/bin/cserve --listen 127.0.0.1:8081 --root /srv/http/site/public --cgi php-cgi \
-    --climb front --env PHPANTA_ENVIRONMENT=development [--app build/O2/bin/apps/hello.so] [-v]
+build/O2/bin/cserve --listen 127.0.0.1:8081 --root /srv/http/site/public \
+    --app build/O2/bin/apps/hello.so [--data DIR] [--tls CERT KEY] [--workers N] \
+    [--max-conns N] [--per-addr N] [--no-tarpit] [-v]
 ```
 
-`--climb front` hands a `..` path to the front (whose 404 it becomes) instead of answering 400;
-`--tls CERT KEY` makes the listener TLS, and `--client-ca CA` mutual. `cserve` loads apps given as
-a path (`dlopen`, for development); `cserve-static` is linked with `STATIC_APPS` (`make
-STATIC_APPS="hello"`) and loads nothing — `--app hello` picks it from the table.
+`--tls CERT KEY` makes the listeners TLS. `-v` prints the access log (one line per reply, the
+address family and never the address) along with the warnings. `--no-tarpit` turns the brake on
+guessing off, and says so at start; it exists for a diff against a server that has none.
+`cserve` loads apps given as a path (`dlopen`, for development); `cserve-static` is linked with
+`STATIC_APPS` (`make STATIC_APPS="hello"`) and loads nothing — `--app hello` picks it from the
+table. A PHP site with its front controller as CGI is `cserve-front`'s (`--cgi php-cgi [--front
+FILE] [--env K=V]... [--climb 400|front]`), kept as the reference to diff a native app against.
 
 ```bash
 make            # build/O2/: libcserve.a, bin/cserve, bin/cserve-static, bin/apps/*.so
 make test       # the suites (T=net for one)
 make check      # ASan+UBSan, TSan, -O2, then clang-format, clang-tidy and cppcheck
+make abuse      # the host attacked (tools/abuse.py) under ASan+UBSan, then TSan
 make FUZZ=1 fuzz && fuzz/seeds.py build/corpus   # libFuzzer (clang), its seeds first
 build/O2-fuzz/bin/fuzz-http build/corpus
 fuzz/seeds.py build/corpus-kit kit && build/O2-fuzz/bin/fuzz-kit build/corpus-kit

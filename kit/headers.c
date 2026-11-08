@@ -16,6 +16,7 @@ static const char *const NAMES[CSERVE_H_COUNT] = {
     [CSERVE_H_ACCEPT_RANGES] = "Accept-Ranges",
     [CSERVE_H_X_ROBOTS_TAG] = "X-Robots-Tag",
     [CSERVE_H_WWW_AUTHENTICATE] = "WWW-Authenticate",
+    [CSERVE_H_RETRY_AFTER] = "Retry-After",
 };
 
 const char *cserve_header_name(CSERVE_HEADER h) {
