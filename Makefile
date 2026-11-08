@@ -55,7 +55,8 @@ SRC = $(wildcard src/*.c) $(KIT_SRC)
 # what a server-only host compiles (the static files and the CGI with
 # it); the client is net.c
 SERVE_SRC = src/listen.c src/httpd.c src/static.c src/cgi.c src/process.c \
-	src/log.c src/route.c src/policy.c src/heap.c src/pool.c src/loop.c src/tarpit.c
+	src/log.c src/route.c src/policy.c src/heap.c src/pool.c src/loop.c src/tarpit.c \
+	src/acme.c
 CLIENT_SRC = $(filter-out $(SERVE_SRC) $(KIT_SRC),$(SRC))
 TESTS = $(patsubst tests/%_test.c,%,$(wildcard tests/*_test.c))
 FUZZERS = $(patsubst fuzz/%.c,%,$(filter-out fuzz/fuzz.h,$(wildcard fuzz/*.c)))
@@ -64,13 +65,17 @@ FUZZERS = $(patsubst fuzz/%.c,%,$(filter-out fuzz/fuzz.h,$(wildcard fuzz/*.c)))
 # the development host, and STATIC_APPS linked into the production one.
 # EXTERNAL_APPS adds apps kept elsewhere, as NAME=DIR pairs (neurosys's:
 # neurosys=/srv/http/neurosys/app): DIR's *.c, at any depth but under a
-# build/, compiled with DIR and DIR/gen on the include path
+# build/ inside DIR (DIR itself may be in one: a site's prod tree is),
+# compiled with DIR and DIR/gen on the include path. A second build of
+# the same app from another DIR takes a B= of its own, or the two share
+# objects and binaries
 EXTERNAL_APPS ?=
 ext_name = $(word 1,$(subst =, ,$(1)))
 ext_dir = $(word 2,$(subst =, ,$(1)))
 EXT_NAMES = $(foreach e,$(EXTERNAL_APPS),$(call ext_name,$(e)))
 ext_dir_of = $(foreach e,$(EXTERNAL_APPS),$(if $(filter $(1),$(call ext_name,$(e))),$(call ext_dir,$(e))))
-ext_src = $(shell find $(call ext_dir_of,$(1)) -name '*.c' -not -path '*/build/*' | sort)
+ext_src = $(shell cd $(call ext_dir_of,$(1)) && find . -name '*.c' -not -path './build/*' \
+	-not -path '*/build/*' | sed 's|^\./|$(call ext_dir_of,$(1))/|' | sort)
 APPS = $(notdir $(wildcard apps/*)) $(EXT_NAMES)
 STATIC_APPS ?= hello
 app_src = $(foreach a,$(1),$(if $(filter $(a),$(EXT_NAMES)),$(call ext_src,$(a)),$(wildcard apps/$(a)/*.c)))
@@ -78,7 +83,7 @@ app_obj = $(foreach a,$(1),$(if $(filter $(a),$(EXT_NAMES)),$(patsubst \
 	$(call ext_dir_of,$(a))/%.c,$(B)/ext/$(a)/%.o,$(call ext_src,$(a))),$(call obj,$(wildcard apps/$(a)/*.c))))
 
 all: $(B)/libcserve.a $(BIN)/cserve $(BIN)/cserve-static $(BIN)/cserve-front \
-	$(BIN)/cserve-precompress \
+	$(BIN)/cserve-precompress $(BIN)/cserve-acme \
 	$(APPS:%=$(BIN)/apps/%.so)
 
 # made anew: ar updates an archive in place, so an object whose source
@@ -137,6 +142,11 @@ $(BIN)/cserve-precompress: $(B)/host/precompress.o $(B)/libcserve.a
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
+# the certificates' fetcher: a process of its own, never the server's
+$(BIN)/cserve-acme: $(B)/host/acme.o $(B)/libcserve.a
+	@mkdir -p $(@D)
+	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
 $(BIN)/cserve-front: $(B)/host/front.o $(B)/libcserve.a
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
@@ -171,6 +181,11 @@ abuse:
 	$(MAKE) --no-print-directory -j$(shell nproc) SAN= TSAN=1 STATIC_APPS=hello all
 	python3 -I tools/abuse.py build/O2-tsan/bin --prompt 12
 
+# the certificates against Pebble (tools/acme.sh says how to get it)
+acme:
+	$(MAKE) --no-print-directory -j$(shell nproc) SAN= TSAN= all
+	bash tools/acme.sh $(BIN)
+
 fuzz:
 	@test -n "$(FUZZ)" || { echo "make FUZZ=1 fuzz"; exit 1; }
 	$(MAKE) --no-print-directory $(FUZZERS:%=$(BIN)/fuzz-%)
@@ -185,8 +200,8 @@ check:
 # (DIR/gen/) is checked for markup only
 EXT_SRC = $(foreach a,$(EXT_NAMES),$(call ext_src,$(a)))
 EXT_OWN = $(foreach f,$(EXT_SRC),$(if $(findstring /gen/,$(f)),,$(f)))
-EXT_HDR = $(foreach e,$(EXTERNAL_APPS),$(shell find $(call ext_dir,$(e)) -name '*.h' \
-	-not -path '*/build/*' -not -path '*/gen/*'))
+EXT_HDR = $(foreach e,$(EXTERNAL_APPS),$(shell cd $(call ext_dir,$(e)) && find . -name '*.h' \
+	-not -path '*/build/*' -not -path '*/gen/*' | sed 's|^\./|$(call ext_dir,$(e))/|'))
 FMT_SRC = $(wildcard src/*.[ch] kit/*.[ch] host/*.c apps/*/*.[ch] tests/*.[ch] fuzz/*.[ch]) \
 	$(EXT_OWN) $(EXT_HDR)
 # clang-tidy's bugprone-* and cert-*, minus the policy checks ctui-wm's
@@ -218,7 +233,7 @@ lint:
 		exit 1; fi; echo "markup: clean"
 	clang-format --dry-run -Werror $(FMT_SRC) && echo "clang-format: clean"
 	clang-tidy --quiet --warnings-as-errors='*' --checks='$(TIDY_CHECKS)' \
-		$(SRC) host/main.c $(wildcard apps/*/*.c) $(EXT_OWN) -- $(CFLAGS) -DCSERVE_DLOPEN \
+		$(SRC) host/main.c host/acme.c $(wildcard apps/*/*.c) $(EXT_OWN) -- $(CFLAGS) -DCSERVE_DLOPEN \
 		$(foreach e,$(EXTERNAL_APPS),-I$(call ext_dir,$(e)) -I$(call ext_dir,$(e))/gen) \
 		&& echo "clang-tidy: clean"
 	cppcheck --quiet --error-exitcode=1 --enable=warning,portability --std=c11 -Isrc -Ikit \

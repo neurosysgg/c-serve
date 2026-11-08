@@ -415,6 +415,142 @@ static void serve_through(const char *bin, const char *app) {
   CSERVE_TEST_ASSERT(stop(&h) == 0, "%s: SIGTERM: a clean exit", bin);
 }
 
+/* GET target over plain HTTP with Host: host, the whole reply */
+static char *plain_get(const HOST *h, const char *host, const char *target) {
+  char req[1024];
+  snprintf(req, sizeof req,
+           "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", target,
+           host);
+  return read_all(send_raw(h, req));
+}
+
+static int plain_says(const HOST *h, const char *host, const char *target,
+                      const char *status, const char *has) {
+  char *got = plain_get(h, host, target);
+  int ok = got && strstr(got, status) && (!has || strstr(got, has));
+  if (!ok) {
+    printf("    %s %s: %.200s\n", host, target, got ? got : "(nothing)");
+  }
+  free(got);
+  return ok;
+}
+
+/* --certs: a plain listener says only a challenge's answer or a 308, and
+ * only for the certificates' names; SIGHUP reads them again and the host
+ * goes on; the flags that must come together do */
+static void certs(const char *bin) {
+  char names[PATH_MAX], acme[PATH_MAX], tok[PATH_MAX + 64];
+  if (!realpath("tests/data/names/good", names)) {
+    CSERVE_TEST_ASSERT(0, "the names fixtures");
+    return;
+  }
+  snprintf(acme, sizeof acme, "%s/acme", g_dir);
+  mkdir(acme, 0700);
+  snprintf(tok, sizeof tok, "%s/tok-EN_1", acme);
+  put(tok, "tok-EN_1.thumbprint", 0600);
+  snprintf(tok, sizeof tok, "%s/.hidden", acme);
+  put(tok, "hidden", 0600);
+  const char *args[] = {"--listen",    "127.0.0.1:0", "--listen-tls",
+                        "127.0.0.1:0", "--certs",     names,
+                        "--acme-dir",  acme,          "--root",
+                        g_root,        NULL};
+  HOST h;
+  int status;
+  if (start(&h, bin, args, &status) != 0) {
+    CSERVE_TEST_ASSERT(0, "--certs: started (%d)", status);
+    return;
+  }
+  CSERVE_TEST_ASSERT(
+      plain_says(&h, "a.test", "/hello.txt?x=1", " 308 ",
+                 "Location: https://a.test/hello.txt?x=1\r\n") &&
+          plain_says(&h, "B.test:8080", "/", " 308 ",
+                     "Location: https://B.test/\r\n"),
+      "--certs: plain HTTP for a name: a 308 to https, the port dropped");
+  CSERVE_TEST_ASSERT(plain_says(&h, "evil.test", "/hello.txt", " 404 ", NULL) &&
+                         plain_says(&h, "a.test:x", "/", " 404 ", NULL) &&
+                         plain_says(&h, "a.test:", "/", " 404 ", NULL) &&
+                         plain_says(&h, "localhost", "/", " 404 ", NULL),
+                     "--certs: any other Host: a 404, never a redirect");
+  CSERVE_TEST_ASSERT(
+      plain_says(&h, "a.test", "/.well-known/acme-challenge/tok-EN_1", " 200 ",
+                 "\r\n\r\ntok-EN_1.thumbprint") &&
+          plain_says(&h, "a.test", "/.well-known/acme-challenge/nope", " 404 ",
+                     NULL) &&
+          plain_says(&h, "a.test", "/.well-known/acme-challenge/.hidden",
+                     " 404 ", NULL) &&
+          plain_says(&h, "a.test", "/.well-known/acme-challenge/..%2fx",
+                     " 404 ", NULL) &&
+          plain_says(&h, "a.test", "/.well-known/acme-challenge/", " 404 ",
+                     NULL) &&
+          plain_says(&h, "evil.test", "/.well-known/acme-challenge/tok-EN_1",
+                     " 200 ", "tok-EN_1.thumbprint"),
+      "--certs: a challenge's answer for a token in --acme-dir, for any "
+      "Host (it's public); a 404 for anything else");
+  kill(h.proc.pid, SIGHUP);
+  struct timespec ts = {0, 200 * 1000000L};
+  nanosleep(&ts, NULL);
+  CSERVE_TEST_ASSERT(plain_says(&h, "a.test", "/", " 308 ", NULL),
+                     "--certs: SIGHUP, and the host goes on");
+  CSERVE_TEST_ASSERT(stop(&h) == 0, "and stopped");
+
+  const char *no_tls[] = {"--listen", "127.0.0.1:0", "--certs", names,
+                          "--root",   g_root,        NULL};
+  const char *no_certs[] = {"--listen-tls", "127.0.0.1:0", "--root", g_root,
+                            NULL};
+  const char *old[] = {"--listen",
+                       "127.0.0.1:0",
+                       "--root",
+                       g_root,
+                       "--tls",
+                       "tests/data/pki/server.crt",
+                       "tests/data/pki/server.key",
+                       NULL};
+  CSERVE_TEST_ASSERT(start(&h, bin, no_tls, &status) != 0 && status == 2 &&
+                         start(&h, bin, no_certs, &status) != 0 &&
+                         status == 2 && start(&h, bin, old, &status) != 0 &&
+                         status == 2,
+                     "--certs and --listen-tls only together, --tls gone: "
+                     "usage, 2");
+  const char *broken[] = {"--listen",    "127.0.0.1:0", "--listen-tls",
+                          "127.0.0.1:0", "--certs",     "tests/data/names/rsa",
+                          "--root",      g_root,        NULL};
+  CSERVE_TEST_ASSERT(start(&h, bin, broken, &status) != 0 && status == 1,
+                     "--certs that don't load: it won't start");
+
+  /* the box before its first certificate: challenges answered, nothing
+   * else, and a --certs with no names yet starts */
+  const char *acme_alone[] = {"--listen", "127.0.0.1:0", "--acme-dir", acme,
+                              "--root",   g_root,        NULL};
+  if (start(&h, bin, acme_alone, &status) == 0) {
+    CSERVE_TEST_ASSERT(
+        plain_says(&h, "a.test", "/.well-known/acme-challenge/tok-EN_1",
+                   " 200 ", "tok-EN_1.thumbprint") &&
+            plain_says(&h, "a.test", "/hello.txt", " 404 ", NULL),
+        "--acme-dir alone: a challenge's answer, and a 404 for the rest");
+    CSERVE_TEST_ASSERT(stop(&h) == 0, "and stopped");
+  } else {
+    CSERVE_TEST_ASSERT(0, "--acme-dir alone started");
+  }
+  char none[PATH_MAX];
+  snprintf(none, sizeof none, "%s/no-names", g_dir);
+  mkdir(none, 0700);
+  const char *empty[] = {"--listen",    "127.0.0.1:0", "--listen-tls",
+                         "127.0.0.1:0", "--certs",     none,
+                         "--acme-dir",  acme,          "--root",
+                         g_root,        NULL};
+  if (start(&h, bin, empty, &status) == 0) {
+    CSERVE_TEST_ASSERT(
+        plain_says(&h, "a.test", "/.well-known/acme-challenge/tok-EN_1",
+                   " 200 ", NULL) &&
+            plain_says(&h, "a.test", "/", " 404 ", NULL),
+        "--certs with no names yet: starts, answers challenges, redirects "
+        "nobody");
+    CSERVE_TEST_ASSERT(stop(&h) == 0, "and stopped");
+  } else {
+    CSERVE_TEST_ASSERT(0, "--certs with no names yet started");
+  }
+}
+
 static void test_hosts(void) {
   char dev[PATH_MAX], stat_bin[PATH_MAX], so[PATH_MAX];
   snprintf(dev, sizeof dev, "%s/cserve", CSERVE_BIN);
@@ -423,6 +559,7 @@ static void test_hosts(void) {
   serve_through(dev, so);
   serve_through(stat_bin, "hello");
   tarpit(stat_bin, "hello");
+  certs(stat_bin);
 
   HOST h;
   int status;

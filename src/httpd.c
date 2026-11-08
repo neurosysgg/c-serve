@@ -270,6 +270,8 @@ const char *cserve_httpd_reason(int status) {
            {302, "Found"},
            {303, "See Other"},
            {304, "Not Modified"},
+           {307, "Temporary Redirect"},
+           {308, "Permanent Redirect"},
            {400, "Bad Request"},
            {401, "Unauthorized"},
            {403, "Forbidden"},

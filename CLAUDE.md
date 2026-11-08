@@ -57,6 +57,14 @@ ctui-remote's and `cserve-front`'s alone, and the box's binary never calls it.
   and the reset throws away the reply's unsent tail.
 - **`tls.h`'s client wants a non-blocking socket.** Handed a blocking one it waits in `recv()`
   inside mbedtls, holding the process's TLS lock, and the loop's next handshake waits on that lock.
+- **A TLS connection holds the certificate set it began under** (tls.c's refcount, under the TLS
+  lock), so a reload never frees a config a handshake or a session still points at. A reload runs
+  on the loop's thread (`cserve_loop_watch()`); a set that doesn't load leaves the old one.
+- **The ACME account key never enters `cserve`.** `cserve-acme` is its own process and signals
+  nothing; `cserve` only serves the answers it leaves in `--acme-dir`. `make acme` (Pebble) when
+  either side changes.
+- **mbedtls 4 parses an EC certificate through PSA**: `psa_crypto_init()` before the first
+  `mbedtls_x509_crt_parse*()`, or a good certificate reads as none.
 - **`make abuse` when the loop, the pool or the tarpit change**: every attack in
   `tools/abuse.py` must leave a page prompt and the stop clean, under both sanitizers.
 - **A test that races a password check times one first.** PBKDF2 under a sanitizer is several

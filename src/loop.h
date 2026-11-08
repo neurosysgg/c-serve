@@ -68,6 +68,14 @@ CSERVE_LOOP *cserve_loop_new(const CSERVE_LOOP_CONFIG *cfg, char *err,
  * loop closes fd when it's freed. */
 int cserve_loop_listen(CSERVE_LOOP *l, int fd, CSERVE_TLS_SERVER *tls,
                        char *err, size_t err_cap);
+/* Before cserve_loop_run(): fd (the caller's, never closed here) watched:
+ * whenever it's readable,
+ * fn(ud) runs on the loop's thread, between its events -- so it may
+ * touch what only that thread does (cserve_tls_names_reload(): a
+ * handshake runs there), and must drain fd and return soon. 0, or -1
+ * with why in err. */
+int cserve_loop_watch(CSERVE_LOOP *l, int fd, void (*fn)(void *ud), void *ud,
+                      char *err, size_t err_cap);
 /* serves until stop_fd turns readable: then the listeners close, idle
  * connections go, and the rest have grace_ms to finish (5 s) before
  * they're cut. 0, or -1 with why in err (epoll failed). */

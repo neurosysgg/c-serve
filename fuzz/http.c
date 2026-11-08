@@ -18,9 +18,16 @@
  * both decide the same, to the byte, and what it frames parses or is
  * refused without a fault; 9 = an Accept-Encoding (static.c): read
  * without a fault, and refusing gzip once ", gzip;q=0" follows it,
- * whatever came before. Any other first byte: as 3. */
+ * whatever came before; 10 = a name (an SNI's or a Host's: tls.c) and a
+ * token (an HTTP-01 challenge's: acme.c), the same bytes asked both: a
+ * name taken is lowercase labels, dot-joined, none empty; a token taken
+ * holds no '/', no '.', and nothing that would leave its directory; 11 =
+ * an ACME server's JSON (acme_client.c) read as a directory, an order, an
+ * authorization and a problem: what's taken has https:// URLs and a
+ * base64url token, and nothing faults. Any other first byte: as 3. */
 #include "fuzz.h"
 
+#include "acme.h"
 #include "cgi.h"
 #include "coding.h"
 #include "http.h"
@@ -451,6 +458,75 @@ static void encodings(const uint8_t *data, size_t size) {
   free(ae);
 }
 
+static void names(const uint8_t *data, size_t size) {
+  char *s = malloc(size ? size : 1);
+  if (!s) {
+    return;
+  }
+  memcpy(s, data, size);
+  if (cserve_tls_name_ok(s, size)) {
+    FUZZ_CHECK(size >= 1 && size <= 253, "a name's length");
+    FUZZ_CHECK(s[0] != '.' && s[size - 1] != '.' && s[0] != '-' &&
+                   s[size - 1] != '-',
+               "a name's ends");
+    size_t label = 0;
+    for (size_t i = 0; i < size; i++) {
+      FUZZ_CHECK((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= '0' && s[i] <= '9') ||
+                     s[i] == '-' || s[i] == '.',
+                 "a name's bytes");
+      FUZZ_CHECK(!(s[i] == '.' && (label == 0 || s[i - 1] == '-')),
+                 "a name's labels: none empty, none ending in '-'");
+      FUZZ_CHECK(!(s[i] == '-' && label == 0), "no label starts with '-'");
+      label = s[i] == '.' ? 0 : label + 1;
+      FUZZ_CHECK(label <= 63, "a label's length");
+    }
+  }
+  if (cserve_acme_token_ok(s, size)) {
+    FUZZ_CHECK(size >= 1 && size <= 128, "a token's length");
+    FUZZ_CHECK(!memchr(s, '/', size) && !memchr(s, '.', size) &&
+                   !memchr(s, '\0', size) && !memchr(s, '%', size),
+               "a token leaves no directory");
+  }
+  free(s);
+}
+
+static int is_https(const char *u) { return !strncmp(u, "https://", 8); }
+
+static void acme_objects(const uint8_t *data, size_t size) {
+  char *s = malloc(size + 1);
+  if (!s) {
+    return;
+  }
+  memcpy(s, data, size);
+  s[size] = '\0';
+  char err[200];
+  CSERVE_ACME_DIRECTORY d;
+  if (cserve_acme_directory(s, &d, err, sizeof err) == 0) {
+    FUZZ_CHECK(is_https(d.new_nonce) && is_https(d.new_account) &&
+                   is_https(d.new_order),
+               "a directory's URLs");
+  }
+  CSERVE_ACME_ORDER o;
+  if (cserve_acme_order(s, &o, err, sizeof err) == 0) {
+    FUZZ_CHECK(o.nauthz >= 1 && o.nauthz <= CSERVE_ACME_AUTHZ_MAX &&
+                   is_https(o.finalize) &&
+                   (!o.certificate[0] || is_https(o.certificate)),
+               "an order's URLs");
+    for (int i = 0; i < o.nauthz; i++) {
+      FUZZ_CHECK(is_https(o.authz[i]), "an authorization's URL");
+    }
+  }
+  CSERVE_ACME_AUTHZ a;
+  if (cserve_acme_authz(s, &a, err, sizeof err) == 0) {
+    FUZZ_CHECK(is_https(a.url) &&
+                   cserve_acme_token_ok(a.token, strlen(a.token)),
+               "an authorization's challenge");
+  }
+  CSERVE_ACME_PROBLEM p;
+  cserve_acme_problem(s, &p);
+  free(s);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size == 0) {
     return 0;
@@ -473,6 +549,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     framed(data + 1, size - 1);
   } else if (data[0] == 9) {
     encodings(data + 1, size - 1);
+  } else if (data[0] == 10) {
+    names(data + 1, size - 1);
+  } else if (data[0] == 11) {
+    acme_objects(data + 1, size - 1);
   } else {
     request(data + 1, size - 1);
   }

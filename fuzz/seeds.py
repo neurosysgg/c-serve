@@ -75,7 +75,22 @@ def http():
             b"\x09gzip, deflate, br",
             b"\x09br;q=1.0, gzip;q=0.8, *;q=0.1",
             b"\x09*;q=0, x-gzip; q=0.000",
-            b"\x09identity"]
+            b"\x09identity",
+            # names and tokens, asked both ways
+            b"\x0aneurosys.gg",
+            b"\x0aA.test",
+            b"\x0aa..b",
+            b"\x0a-a.b-",
+            b"\x0aLoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0",
+            b"\x0a..%2f",
+            b"\x0a" + b"a" * 64 + b".b",
+            # an ACME server's objects
+            b'\x0b{"newNonce":"https://a/n","newAccount":"https://a/a","newOrder":"https://a/o"}',
+            b'\x0b{"status":"valid","finalize":"https://a/f","certificate":"https://a/c",'
+            b'"authorizations":["https://a/z1","https://a/z2"]}',
+            b'\x0b{"status":"pending","identifier":{"type":"dns","value":"a.test"},'
+            b'"challenges":[{"type":"http-01","url":"https://a/c","token":"tok","status":"pending"}]}',
+            b'\x0b{"type":"urn:ietf:params:acme:error:badNonce","detail":"x"}']
 
 
 def kit():

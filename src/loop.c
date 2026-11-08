@@ -47,7 +47,8 @@ enum { P_HEAD, P_BODY, P_PULL, P_END };
 /* what an event is for: kind, and for a connection its slot and the
  * generation it had when it was registered (a slot is reused; an event
  * still queued for the one that left must not land on the new one) */
-enum { K_LISTEN = 1, K_POOL, K_STOP, K_CONN };
+enum { K_LISTEN = 1, K_POOL, K_STOP, K_CONN, K_WATCH };
+#define WATCH_MAX 4
 #define TAG(kind, gen, i)                                                      \
   ((uint64_t)(kind) << 56 | (uint64_t)((gen) & 0xffffff) << 32 | (uint32_t)(i))
 #define TAG_KIND(t) ((int)((t) >> 56))
@@ -102,6 +103,11 @@ struct CSERVE_LOOP {
     CSERVE_TLS_SERVER *tls;
   } ls[LISTEN_MAX];
   int nls;
+  struct {
+    void (*fn)(void *ud);
+    void *ud;
+  } ws[WATCH_MAX];
+  int nws;
   int stopping;
 };
 
@@ -311,6 +317,7 @@ static void got_head(CSERVE_LOOP *l, CONN *c) {
   c->req.peer = c->peer;
   c->req.conn = NULL;
   c->req.peer_family = c->family;
+  c->req.tls = c->tls != NULL;
   memcpy(c->req.peer_net, c->net, sizeof c->net);
   c->understood = 0;
   if (c->req.length > l->cfg.body_max) {
@@ -782,6 +789,24 @@ int cserve_loop_listen(CSERVE_LOOP *l, int fd, CSERVE_TLS_SERVER *tls,
   return 0;
 }
 
+int cserve_loop_watch(CSERVE_LOOP *l, int fd, void (*fn)(void *ud), void *ud,
+                      char *err, size_t err_cap) {
+  if (l->nws == WATCH_MAX) {
+    snprintf(err, err_cap, "more than %d watched fds", WATCH_MAX);
+    return -1;
+  }
+  l->ws[l->nws].fn = fn;
+  l->ws[l->nws].ud = ud;
+  struct epoll_event ev = {.events = EPOLLIN,
+                           .data.u64 = TAG(K_WATCH, 0, l->nws)};
+  if (epoll_ctl(l->ep, EPOLL_CTL_ADD, fd, &ev) != 0) {
+    snprintf(err, err_cap, "epoll: %s", strerror(errno));
+    return -1;
+  }
+  l->nws++;
+  return 0;
+}
+
 int cserve_loop_run(CSERVE_LOOP *l, int stop_fd, int grace_ms, char *err,
                     size_t err_cap) {
   struct epoll_event ev = {.events = EPOLLIN, .data.u64 = TAG(K_STOP, 0, 0)};
@@ -826,6 +851,8 @@ int cserve_loop_run(CSERVE_LOOP *l, int stop_fd, int grace_ms, char *err,
         on_accept(l, k);
       } else if (kind == K_POOL) {
         on_pool(l);
+      } else if (kind == K_WATCH && k < l->nws) {
+        l->ws[k].fn(l->ws[k].ud);
       } else if (kind == K_CONN && k < l->cfg.max_conns) {
         CONN *c = l->conns[k];
         if (c && c->fd >= 0 && (c->gen & 0xffffff) == TAG_GEN(t)) {

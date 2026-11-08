@@ -37,6 +37,9 @@ typedef struct {
    * /64 -- in its first 4 or 8 bytes, the rest zero */
   int peer_family;
   unsigned char peer_net[16];
+  /* set by the loop: 1 when the request came over TLS (the threaded
+   * server leaves it 0) */
+  int tls;
 } CSERVE_HTTPD_REQ;
 
 /* the head (buf: its lines up to and without the blank line, NUL-

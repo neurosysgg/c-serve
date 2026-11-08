@@ -1,11 +1,17 @@
 /* cserve: the host. Listens (plain or TLS) on one loop (loop.h), then
  * per request, on a worker: a static file from the root, else the first
  * app whose routes fit, else the first app's own 404 (a climbing path
- * too), else a plain 404. A development build dlopen()s apps given as a
- * path (--app apps/hello.so); a production one is linked with its apps
- * (the Makefile's STATIC_APPS) and loads none. */
+ * too), else a plain 404. With --certs, TLS listeners pick a certificate
+ * by SNI (tls.h) and SIGHUP reads the certificates again. With --certs or
+ * --acme-dir, a plain listener answers only an ACME challenge's answer
+ * (from --acme-dir, for any Host: it's public, and its token is the
+ * gate) or a 308 to the https address -- for one of the certificates'
+ * names alone -- and a 404 for the rest. A development build dlopen()s apps
+ * given as a path (--app apps/hello.so); a production one is linked with its
+ * apps (the Makefile's STATIC_APPS) and loads none. */
 /* realpath, sigaction, dlopen: POSIX, not C11 */
 #define _GNU_SOURCE
+#include "acme.h"
 #include "app.h"
 #include "httpd.h"
 #include "listen.h"
@@ -41,7 +47,8 @@ typedef struct {
   const CSERVE_APP *apps[APPS_MAX];
   char *security[APPS_MAX]; /* each app's security header lines, or NULL */
   int napps;
-  CSERVE_TLS_SERVER *tls;
+  CSERVE_TLS_SERVER *tls; /* --certs: the names' certificates */
+  const char *acme;       /* --acme-dir: HTTP-01 answers, by token */
   int verbose;
 } HOST;
 
@@ -119,9 +126,58 @@ static int route(int i, const CSERVE_HTTPD_REQ *r, const char *body,
   return 1;
 }
 
+/* an HTTP-01 challenge's answer: --acme-dir's file named token, or a 404 */
+static void challenge(const char *token, CSERVE_HTTPD_REPLY *rep) {
+  char path[PATH_MAX];
+  int fd = -1;
+  if (H.acme && cserve_acme_token_ok(token, strlen(token)) &&
+      snprintf(path, sizeof path, "%s/%s", H.acme, token) < (int)sizeof path) {
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  }
+  char buf[1024];
+  ssize_t n = fd >= 0 ? read(fd, buf, sizeof buf) : -1;
+  if (fd >= 0) {
+    close(fd);
+  }
+  if (n <= 0 || (size_t)n == sizeof buf) {
+    text(rep, 404, "not found\n");
+    return;
+  }
+  cserve_httpd_text(rep, 200, "application/octet-stream", buf, (size_t)n);
+}
+
+/* a request over plain HTTP to a host with certificates or challenges:
+ * an ACME challenge's answer; for one of the certificates' names, a 308
+ * to the same target over https; else a 404 -- never a redirect
+ * somewhere a request chose */
+static void plain(const CSERVE_HTTPD_REQ *r, CSERVE_HTTPD_REPLY *rep) {
+  static const char PREFIX[] = "/.well-known/acme-challenge/";
+  const char *host = cserve_httpd_header(r, "Host");
+  size_t n = host ? strcspn(host, ":") : 0;
+  int port_ok =
+      host && (!host[n] || (host[n + 1] && strspn(host + n + 1, "0123456789") ==
+                                               strlen(host + n + 1)));
+  if (!strncmp(r->target, PREFIX, sizeof PREFIX - 1)) {
+    challenge(r->target + sizeof PREFIX - 1, rep);
+  } else if (!H.tls || !port_ok || !cserve_tls_names_has(H.tls, host, n)) {
+    text(rep, 404, "not found\n");
+  } else if (snprintf(rep->headers, sizeof rep->headers,
+                      "Location: https://%.*s%s\r\n", (int)n, host,
+                      r->target) >= (int)sizeof rep->headers) {
+    rep->headers[0] = '\0';
+    text(rep, 414, "too long a target\n");
+  } else {
+    text(rep, 308, "over https\n");
+  }
+}
+
 static void handle(const CSERVE_HTTPD_REQ *r, const char *body,
                    CSERVE_HTTPD_REPLY *rep, void *ud) {
   (void)ud;
+  if ((H.tls || H.acme) && !r->tls) {
+    plain(r, rep);
+    return;
+  }
   CSERVE_STATIC_ROUTE rt;
   cserve_static_route(&H.st, r->path, &rt);
   if (rt.kind == CSERVE_STATIC_FILE) {
@@ -157,18 +213,35 @@ static void log_all(CSERVE_LOG_LEVEL level, const char *line, void *ud) {
   fprintf(stderr, "%s%s\n", level == CSERVE_LOG_WARN ? "c-serve: " : "", line);
 }
 
-static int g_stop[2] = {-1, -1};
+static int g_stop[2] = {-1, -1}, g_hup[2] = {-1, -1};
 
 static void on_signal(int sig) {
-  (void)sig;
   int e = errno;
-  (void)!write(g_stop[1], "x", 1);
+  (void)!write(sig == SIGHUP ? g_hup[1] : g_stop[1], "x", 1);
   errno = e;
+}
+
+/* SIGHUP, on the loop's thread: the certificates read again. What it
+ * did is said on stderr, -v or not -- a renewal that didn't take must
+ * not go unseen. */
+static void on_hup(void *ud) {
+  (void)ud;
+  char drain[64];
+  while (read(g_hup[0], drain, sizeof drain) > 0) {
+  }
+  char err[512];
+  if (cserve_tls_names_reload(H.tls, err, sizeof err) != 0) {
+    fprintf(stderr, "cserve: SIGHUP: %s; the certificates before stay\n", err);
+  } else {
+    fprintf(stderr, "cserve: SIGHUP: the certificates read again: %d names\n",
+            cserve_tls_names_count(H.tls));
+  }
 }
 
 static int usage(void) {
   fprintf(stderr,
-          "usage: cserve --listen HOST:PORT... --root DIR [--tls CERT KEY]\n"
+          "usage: cserve --listen HOST:PORT... --root DIR\n"
+          "       [--certs DIR --listen-tls HOST:PORT...] [--acme-dir DIR]\n"
           "       [--app NAME|PATH.so]... [--data DIR] [--workers N]\n"
           "       [--max-conns N] [--per-addr N] [--no-tarpit] [-v]\n");
   return 2;
@@ -251,20 +324,25 @@ static const CSERVE_APP *find_app(const char *name, char *err, size_t cap) {
 }
 
 int main(int argc, char **argv) {
-  const char *listen[LISTEN_MAX], *root = NULL, *cert = NULL, *key = NULL;
+  const char *listen[LISTEN_MAX], *root = NULL, *certs = NULL;
   const char *app_names[APPS_MAX], *data = NULL;
-  int nlisten = 0, napp = 0, tarpit = 1;
+  int nlisten = 0, napp = 0, tarpit = 1, secure_from = 0;
+  int is_tls[LISTEN_MAX] = {0};
   CSERVE_LOOP_CONFIG cfg = {.handler = handle, .server = "c-serve"};
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
     int more = i + 1 < argc;
-    if (!strcmp(a, "--listen") && more && nlisten < LISTEN_MAX) {
+    if ((!strcmp(a, "--listen") || !strcmp(a, "--listen-tls")) && more &&
+        nlisten < LISTEN_MAX) {
+      is_tls[nlisten] = a[8] == '-';
+      secure_from += is_tls[nlisten];
       listen[nlisten++] = argv[++i];
     } else if (!strcmp(a, "--root") && more) {
       root = argv[++i];
-    } else if (!strcmp(a, "--tls") && i + 2 < argc) {
-      cert = argv[++i];
-      key = argv[++i];
+    } else if (!strcmp(a, "--certs") && more) {
+      certs = argv[++i];
+    } else if (!strcmp(a, "--acme-dir") && more) {
+      H.acme = argv[++i];
     } else if (!strcmp(a, "--app") && more && napp < APPS_MAX) {
       app_names[napp++] = argv[++i];
     } else if (!strcmp(a, "--data") && more) {
@@ -286,7 +364,8 @@ int main(int argc, char **argv) {
       return usage();
     }
   }
-  if (!nlisten || !root) {
+  /* certificates and a TLS listener come together */
+  if (!nlisten || !root || !certs != !secure_from) {
     return usage();
   }
   if (!realpath(root, H.root)) {
@@ -334,10 +413,15 @@ int main(int argc, char **argv) {
     }
     H.apps[H.napps++] = a;
   }
-  if (cert &&
-      !(H.tls = cserve_tls_server_new(cert, key, NULL, err, sizeof err))) {
+  if (certs && !(H.tls = cserve_tls_names_new(certs, err, sizeof err))) {
     fprintf(stderr, "cserve: TLS: %s\n", err);
     return bail();
+  }
+  if (H.tls && cserve_tls_names_count(H.tls) == 0) {
+    fprintf(stderr,
+            "cserve: %s has no names yet: every handshake is "
+            "refused until a SIGHUP finds some\n",
+            certs);
   }
   CSERVE_LOOP *loop = cserve_loop_new(&cfg, err, sizeof err);
   if (!loop) {
@@ -352,7 +436,8 @@ int main(int argc, char **argv) {
       return bail();
     }
     if ((fd = cserve_listen_socket(host, port, &port, err, sizeof err)) < 0 ||
-        cserve_loop_listen(loop, fd, H.tls, err, sizeof err) != 0) {
+        cserve_loop_listen(loop, fd, is_tls[i] ? H.tls : NULL, err,
+                           sizeof err) != 0) {
       fprintf(stderr, "cserve: %s: %s\n", listen[i], err);
       return bail();
     }
@@ -361,12 +446,21 @@ int main(int argc, char **argv) {
            strchr(host, ':') ? "]" : "", port);
   }
   fflush(stdout);
-  if (pipe2(g_stop, O_CLOEXEC) != 0) {
+  if (pipe2(g_stop, O_CLOEXEC) != 0 ||
+      pipe2(g_hup, O_CLOEXEC | O_NONBLOCK) != 0) {
+    return bail();
+  }
+  if (H.tls &&
+      cserve_loop_watch(loop, g_hup[0], on_hup, NULL, err, sizeof err) != 0) {
+    fprintf(stderr, "cserve: %s\n", err);
     return bail();
   }
   struct sigaction sa = {.sa_handler = on_signal};
   sigaction(SIGINT, &sa, NULL);
   sigaction(SIGTERM, &sa, NULL);
+  if (H.tls) {
+    sigaction(SIGHUP, &sa, NULL);
+  }
   signal(SIGPIPE, SIG_IGN);
   int rc = cserve_loop_run(loop, g_stop[0], 5000, err, sizeof err);
   if (rc != 0) {

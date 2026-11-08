@@ -10,28 +10,36 @@
 
 #include "conn.h"
 
+#include <mbedtls/asn1.h>
 #include <mbedtls/error.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/ssl.h>
 #include <mbedtls/x509_crt.h>
 #include <psa/crypto.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+typedef struct SET SET;
 
 struct CSERVE_TLS {
   int fd;
   mbedtls_ssl_context ssl;
   char host[256]; /* the name the server's certificate must carry ("" on
                      the server side: the client's is checked) */
+  SET *set;       /* a names server's set it began under (one ref), or NULL */
 };
 
 /* process-wide: the config and the CAs it points at, set up once; a
@@ -317,6 +325,13 @@ int cserve_tls_step(CSERVE_TLS *t, char *err, size_t err_cap) {
   lock();
   int ret = mbedtls_ssl_handshake(&t->ssl);
   uint32_t verify = mbedtls_ssl_get_verify_result(&t->ssl);
+  /* pick() refused the name: mbedtls says nothing to the client, so the
+   * alert is sent here (as far as the socket takes it at once) */
+  if (ret == MBEDTLS_ERR_SSL_UNRECOGNIZED_NAME) {
+    (void)mbedtls_ssl_send_alert_message(
+        &t->ssl, MBEDTLS_SSL_ALERT_LEVEL_FATAL,
+        MBEDTLS_SSL_ALERT_MSG_UNRECOGNIZED_NAME);
+  }
   unlock();
   if (ret == 0) {
     return 0;
@@ -336,23 +351,37 @@ int cserve_tls_step(CSERVE_TLS *t, char *err, size_t err_cap) {
   return -1;
 }
 
-/* start()'s connection, its handshake done before deadline, or NULL */
-static CSERVE_TLS *handshake(int fd, const mbedtls_ssl_config *conf,
-                             const char *host, long deadline, char *err,
-                             size_t err_cap) {
-  CSERVE_TLS *t = start(fd, conf, host, err, err_cap);
+static void set_release(SET *set);
+
+/* t freed, and its set's ref given back (no close_notify) */
+static void tls_free(CSERVE_TLS *t) {
+  lock();
+  mbedtls_ssl_free(&t->ssl);
+  set_release(t->set);
+  unlock();
+  free(t);
+}
+
+/* a started connection (or NULL), its handshake done before deadline, or
+ * NULL (t freed) */
+static CSERVE_TLS *finish(CSERVE_TLS *t, long deadline, char *err,
+                          size_t err_cap) {
   for (int ret; t && (ret = cserve_tls_step(t, err, err_cap)) != 0;) {
     if (ret == -1 ||
         cserve_net_wait(t->fd, ret == CSERVE_TLS_WANT_READ ? POLLIN : POLLOUT,
                         deadline, err, err_cap) != 0) {
-      lock();
-      mbedtls_ssl_free(&t->ssl);
-      unlock();
-      free(t);
+      tls_free(t);
       return NULL;
     }
   }
   return t;
+}
+
+/* start()'s connection, its handshake done before deadline, or NULL */
+static CSERVE_TLS *handshake(int fd, const mbedtls_ssl_config *conf,
+                             const char *host, long deadline, char *err,
+                             size_t err_cap) {
+  return finish(start(fd, conf, host, err, err_cap), deadline, err, err_cap);
 }
 
 CSERVE_TLS *cserve_tls_open(int fd, const char *host, long deadline, char *err,
@@ -361,6 +390,12 @@ CSERVE_TLS *cserve_tls_open(int fd, const char *host, long deadline, char *err,
     return NULL;
   }
   return handshake(fd, &g_conf, host, deadline, err, err_cap);
+}
+
+/* a server's config: TLS 1.3, nothing older */
+static void only_tls13(mbedtls_ssl_config *conf) {
+  mbedtls_ssl_conf_min_tls_version(conf, MBEDTLS_SSL_VERSION_TLS1_3);
+  mbedtls_ssl_conf_max_tls_version(conf, MBEDTLS_SSL_VERSION_TLS1_3);
 }
 
 /* one side's own config: its certificate chain and key (a server's, or
@@ -373,7 +408,11 @@ typedef struct {
 } SIDE;
 
 struct CSERVE_TLS_SERVER {
-  SIDE side;
+  SIDE side; /* a server of one certificate's */
+  /* a names server's (cserve_tls_names_new()): its set now (under the
+   * lock), and the directory it's read from */
+  SET *set;
+  char dir[PATH_MAX];
 };
 struct CSERVE_TLS_CLIENT {
   SIDE side;
@@ -441,6 +480,9 @@ static int side_init(SIDE *s, int endpoint, const char *cert, const char *key,
                                       MBEDTLS_SSL_TRANSPORT_STREAM,
                                       MBEDTLS_SSL_PRESET_DEFAULT);
   }
+  if (ret == 0 && endpoint == MBEDTLS_SSL_IS_SERVER) {
+    only_tls13(&s->conf);
+  }
   if (ret == 0 && cert && key) {
     ret = mbedtls_ssl_conf_own_cert(&s->conf, &s->chain, &s->key);
   }
@@ -481,8 +523,292 @@ void cserve_tls_server_free(CSERVE_TLS_SERVER *s) {
   if (!s) {
     return;
   }
-  side_free(&s->side);
+  if (s->dir[0]) {
+    lock();
+    set_release(s->set);
+    unlock();
+  } else {
+    side_free(&s->side);
+  }
   free(s);
+}
+
+/* --- many names, picked by SNI --- */
+
+#define NAMES_MAX 32
+
+typedef struct {
+  char name[254];
+  mbedtls_x509_crt chain;
+  mbedtls_pk_context key;
+} NAMED;
+
+/* one reading of a names server's directory: freed when its last ref
+ * goes -- the server's own, or a connection's that began under it.
+ * refs is the lock's. */
+struct SET {
+  int refs;
+  mbedtls_ssl_config conf;
+  int n;
+  NAMED names[NAMES_MAX];
+};
+
+int cserve_tls_name_ok(const char *name, size_t n) {
+  if (n == 0 || n > 253) {
+    return 0;
+  }
+  size_t label = 0;
+  for (size_t i = 0; i < n; i++) {
+    char c = name[i];
+    if (c == '.') {
+      if (label == 0 || name[i - 1] == '-') {
+        return 0;
+      }
+      label = 0;
+    } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+               (c == '-' && label > 0)) {
+      if (++label > 63) {
+        return 0;
+      }
+    } else {
+      return 0;
+    }
+  }
+  return label > 0 && name[n - 1] != '-';
+}
+
+/* set's entry for host (n bytes, any case), or NULL; under the lock */
+static NAMED *find(SET *set, const char *host, size_t n) {
+  for (int i = 0; set && i < set->n; i++) {
+    if (strlen(set->names[i].name) == n &&
+        strncasecmp(set->names[i].name, host, n) == 0) {
+      return &set->names[i];
+    }
+  }
+  return NULL;
+}
+
+/* under the lock */
+static void set_release(SET *set) {
+  if (!set || --set->refs > 0) {
+    return;
+  }
+  mbedtls_ssl_config_free(&set->conf);
+  for (int i = 0; i < set->n; i++) {
+    mbedtls_x509_crt_free(&set->names[i].chain);
+    mbedtls_pk_free(&set->names[i].key);
+  }
+  free(set);
+}
+
+/* the handshake's certificate, by the name the client asked for: mbedtls
+ * calls it (under the lock) once the ClientHello is read, SNI or none */
+static int pick(mbedtls_ssl_context *ssl) {
+  CSERVE_TLS *t = (CSERVE_TLS *)((char *)ssl - offsetof(CSERVE_TLS, ssl));
+  size_t n = 0;
+  const unsigned char *sni = mbedtls_ssl_get_hs_sni(ssl, &n);
+  NAMED *e = sni ? find(t->set, (const char *)sni, n) : NULL;
+  if (!e) {
+    return MBEDTLS_ERR_SSL_UNRECOGNIZED_NAME;
+  }
+  return mbedtls_ssl_set_hs_own_cert(ssl, &e->chain, &e->key);
+}
+
+/* 1 when crt's subjectAltName carries name as a DNS name */
+static int carries(const mbedtls_x509_crt *crt, const char *name) {
+  size_t n = strlen(name);
+  for (const mbedtls_x509_sequence *s = &crt->subject_alt_names; s;
+       s = s->next) {
+    if (s->buf.tag ==
+            (MBEDTLS_ASN1_CONTEXT_SPECIFIC | MBEDTLS_X509_SAN_DNS_NAME) &&
+        s->buf.len == n && strncasecmp((const char *)s->buf.p, name, n) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* dir/name's pair into e: 0, or -1 with why in err; under the lock (e's
+ * contexts inited, freed by the caller either way) */
+static int named_load(NAMED *e, const char *dir, const char *name, char *err,
+                      size_t err_cap) {
+  char cert[PATH_MAX], key[PATH_MAX];
+  snprintf(e->name, sizeof e->name, "%s", name);
+  if (snprintf(cert, sizeof cert, "%s/%s/cert.pem", dir, name) >=
+          (int)sizeof cert ||
+      snprintf(key, sizeof key, "%s/%s/key.pem", dir, name) >=
+          (int)sizeof key) {
+    snprintf(err, err_cap, "TLS: %s/%s: too long a path", dir, name);
+    return -1;
+  }
+  const char *files[] = {cert, key};
+  for (int i = 0; i < 2; i++) {
+    if (access(files[i], R_OK) != 0) {
+      snprintf(err, err_cap, "TLS: %s: %s", files[i], strerror(errno));
+      return -1;
+    }
+  }
+  int ret = mbedtls_x509_crt_parse_file(&e->chain, cert);
+  if (ret != 0) {
+    why(ret, cert, err, err_cap);
+    return -1;
+  }
+  if ((ret = mbedtls_pk_parse_keyfile(&e->key, key, NULL)) != 0) {
+    why(ret, key, err, err_cap);
+    return -1;
+  }
+  if (mbedtls_pk_get_bitlen(&e->key) != 256 ||
+      mbedtls_pk_get_key_type(&e->key) !=
+          PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1)) {
+    snprintf(err, err_cap, "TLS: %s: not a P-256 key", key);
+    return -1;
+  }
+  if (mbedtls_pk_check_pair(&e->chain.pk, &e->key) != 0) {
+    snprintf(err, err_cap, "TLS: %s: not the key of %s", key, cert);
+    return -1;
+  }
+  if (!carries(&e->chain, name)) {
+    snprintf(err, err_cap, "TLS: %s: not a certificate for %s", cert, name);
+    return -1;
+  }
+  return 0;
+}
+
+/* dir read into a set (one ref), or NULL with why in err */
+static SET *set_load(const char *dir, char *err, size_t err_cap) {
+  lock();
+  int psa = psa_crypto_init();
+  unlock();
+  if (psa != PSA_SUCCESS) {
+    snprintf(err, err_cap, "TLS: the crypto library didn't start");
+    return NULL;
+  }
+  DIR *d = opendir(dir);
+  if (!d) {
+    snprintf(err, err_cap, "TLS: %s: %s", dir, strerror(errno));
+    return NULL;
+  }
+  SET *set = calloc(1, sizeof *set);
+  if (!set) {
+    closedir(d);
+    snprintf(err, err_cap, "out of memory");
+    return NULL;
+  }
+  set->refs = 1;
+  lock();
+  mbedtls_ssl_config_init(&set->conf);
+  int bad = 0;
+  for (const struct dirent *de; !bad && (de = readdir(d));) {
+    const char *name = de->d_name;
+    if (name[0] == '.') {
+      continue; /* ".", "..", and a writer's work in progress */
+    }
+    if (!cserve_tls_name_ok(name, strlen(name))) {
+      snprintf(err, err_cap, "TLS: %s/%s: not a lowercase DNS name", dir, name);
+      bad = 1;
+    } else if (set->n == NAMES_MAX) {
+      snprintf(err, err_cap, "TLS: %s: more than %d names", dir, NAMES_MAX);
+      bad = 1;
+    } else {
+      NAMED *e = &set->names[set->n++];
+      mbedtls_x509_crt_init(&e->chain);
+      mbedtls_pk_init(&e->key);
+      bad = named_load(e, dir, name, err, err_cap) != 0;
+    }
+  }
+  closedir(d);
+  int ret = bad ? 0
+                : mbedtls_ssl_config_defaults(&set->conf, MBEDTLS_SSL_IS_SERVER,
+                                              MBEDTLS_SSL_TRANSPORT_STREAM,
+                                              MBEDTLS_SSL_PRESET_DEFAULT);
+  if (!bad && ret != 0) {
+    why(ret, "config", err, err_cap);
+    bad = 1;
+  }
+  if (!bad) {
+    only_tls13(&set->conf);
+    mbedtls_ssl_conf_authmode(&set->conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_cert_cb(&set->conf, pick);
+  }
+  if (bad) {
+    set_release(set);
+    set = NULL;
+  }
+  unlock();
+  return set;
+}
+
+CSERVE_TLS_SERVER *cserve_tls_names_new(const char *dir, char *err,
+                                        size_t err_cap) {
+  CSERVE_TLS_SERVER *s = calloc(1, sizeof *s);
+  if (!s) {
+    snprintf(err, err_cap, "out of memory");
+    return NULL;
+  }
+  if (!*dir ||
+      snprintf(s->dir, sizeof s->dir, "%s", dir) >= (int)sizeof s->dir) {
+    snprintf(err, err_cap, "TLS: %s: not a directory's path", dir);
+    free(s);
+    return NULL;
+  }
+  if (!(s->set = set_load(dir, err, err_cap))) {
+    free(s);
+    return NULL;
+  }
+  return s;
+}
+
+int cserve_tls_names_reload(CSERVE_TLS_SERVER *s, char *err, size_t err_cap) {
+  if (!s->dir[0]) {
+    snprintf(err, err_cap, "TLS: not a server of names");
+    return -1;
+  }
+  SET *set = set_load(s->dir, err, err_cap);
+  if (!set) {
+    return -1;
+  }
+  lock();
+  SET *old = s->set;
+  s->set = set;
+  set_release(old);
+  unlock();
+  return 0;
+}
+
+int cserve_tls_names_count(CSERVE_TLS_SERVER *s) {
+  lock();
+  int n = s->dir[0] && s->set ? s->set->n : 0;
+  unlock();
+  return n;
+}
+
+int cserve_tls_names_has(CSERVE_TLS_SERVER *s, const char *host, size_t n) {
+  lock();
+  int has = s->dir[0] && find(s->set, host, n) != NULL;
+  unlock();
+  return has;
+}
+
+/* a server's connection on fd, its handshake not begun: under the set
+ * it has now, which it holds to its end */
+static CSERVE_TLS *server_start(int fd, CSERVE_TLS_SERVER *s, char *err,
+                                size_t err_cap) {
+  if (!s->dir[0]) {
+    return start(fd, &s->side.conf, NULL, err, err_cap);
+  }
+  lock();
+  SET *set = s->set;
+  set->refs++;
+  unlock();
+  CSERVE_TLS *t = start(fd, &set->conf, NULL, err, err_cap);
+  if (!t) {
+    lock();
+    set_release(set);
+    unlock();
+    return NULL;
+  }
+  t->set = set;
+  return t;
 }
 
 CSERVE_TLS_CLIENT *cserve_tls_client_new(const char *ca, const char *cert,
@@ -557,12 +883,12 @@ int cserve_tls_peer(CSERVE_TLS *t, char *cn, size_t cn_cap, char fpr[65]) {
 
 CSERVE_TLS *cserve_tls_accept(int fd, CSERVE_TLS_SERVER *s, long deadline,
                               char *err, size_t err_cap) {
-  return handshake(fd, &s->side.conf, NULL, deadline, err, err_cap);
+  return finish(server_start(fd, s, err, err_cap), deadline, err, err_cap);
 }
 
 CSERVE_TLS *cserve_tls_server_start(int fd, CSERVE_TLS_SERVER *s, char *err,
                                     size_t err_cap) {
-  return start(fd, &s->side.conf, NULL, err, err_cap);
+  return server_start(fd, s, err, err_cap);
 }
 
 long cserve_tls_send(CSERVE_TLS *t, const char *buf, size_t n, char *err,
@@ -656,6 +982,7 @@ void cserve_tls_close(CSERVE_TLS *t) {
   lock();
   mbedtls_ssl_close_notify(&t->ssl);
   mbedtls_ssl_free(&t->ssl);
+  set_release(t->set);
   unlock();
   free(t);
 }

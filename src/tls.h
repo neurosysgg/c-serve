@@ -38,6 +38,38 @@ CSERVE_TLS_SERVER *cserve_tls_server_new(const char *cert, const char *key,
                                          const char *client_ca, char *err,
                                          size_t err_cap);
 void cserve_tls_server_free(CSERVE_TLS_SERVER *s);
+
+/* Every server speaks TLS 1.3 and nothing older (a client's config keeps
+ * 1.2 too: it talks to servers this side doesn't choose).
+ *
+ * A server for many names, its certificate picked by the client's SNI:
+ * dir holds a directory per name (a lowercase DNS name: one
+ * cserve_tls_name_ok() takes), each with cert.pem (the chain, the
+ * name's own certificate first) and key.pem (its P-256 key). A pair is
+ * taken only when the key is the certificate's and the certificate's
+ * subjectAltName carries the directory's name; one that isn't fails the
+ * whole set. A client that names none of them, or none at all, is
+ * refused in the handshake (unrecognized_name): nothing is served to a
+ * stranger who asks the address what it is. A directory with no names
+ * yet is a set that refuses every handshake -- a box before its first
+ * certificate, which a reload then fills. NULL with why in err. */
+CSERVE_TLS_SERVER *cserve_tls_names_new(const char *dir, char *err,
+                                        size_t err_cap);
+/* the names' directory read again (a certificate renewed): the new set
+ * from the next handshake on, while every connection begun under the
+ * old set keeps it to its end. A set that doesn't load leaves the old
+ * one in place: 0, or -1 with why in err. Only for a server made by
+ * cserve_tls_names_new(). */
+int cserve_tls_names_reload(CSERVE_TLS_SERVER *s, char *err, size_t err_cap);
+/* how many names the set has now (0 for a one-certificate server) */
+int cserve_tls_names_count(CSERVE_TLS_SERVER *s);
+/* 1 when host (n bytes, any case) is one of the set's names now, else
+ * 0. Any thread. */
+int cserve_tls_names_has(CSERVE_TLS_SERVER *s, const char *host, size_t n);
+/* 1 when name (n bytes) is a lowercase DNS name: labels of [a-z0-9-],
+ * 1-63 bytes each, no hyphen at either end, 253 bytes at most, no
+ * trailing dot; else 0 */
+int cserve_tls_name_ok(const char *name, size_t n);
 /* the handshake done as the server on an accepted fd, or NULL with why in
  * err */
 CSERVE_TLS *cserve_tls_accept(int fd, CSERVE_TLS_SERVER *s, long deadline,
