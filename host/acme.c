@@ -396,9 +396,11 @@ static int issue(CLIENT *c, const char *name, char *err, size_t err_cap) {
   }
   /* beside their places, then renamed in: the key first, so a reload
    * between the two sees a pair that doesn't match and keeps the old
-   * set (tls.h) */
+   * set (tls.h). The key is 0640: the server reading it runs as another
+   * user than this, so the directory's group says who reads it, and the
+   * account key (0600) stays this process's alone */
   if (rc == 0 &&
-      (write_file(kn, key.pem, strlen(key.pem), 0600, err, err_cap) != 0 ||
+      (write_file(kn, key.pem, strlen(key.pem), 0640, err, err_cap) != 0 ||
        write_file(cn, rep.body, rep.len, 0644, err, err_cap) != 0 ||
        rename(kn, kp) != 0 || rename(cn, cp) != 0)) {
     if (!err[0]) {

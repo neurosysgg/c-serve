@@ -89,7 +89,8 @@ build/O2/bin/cserve-acme --directory https://acme-v02.api.letsencrypt.org/direct
 ```
 
 `cserve-acme` renews each name whose certificate is missing or has fewer than `--days` left, with
-a fresh key, writing each file beside its place and renaming it in (the key first). It signals
+a fresh key, writing each file beside its place and renaming it in (the key first, `0640`, so the
+group of its directory says who may read it; the account key is `0600`). It signals
 nobody: what runs it (a systemd timer's `ExecStartPost`) sends cserve the SIGHUP. `--ca FILE` is
 the ACME server's own CA, for a test server's. `-v` prints the access log (one line per reply, the
 address family and never the address) along with the warnings. `--no-tarpit` turns the brake on

@@ -106,7 +106,8 @@ FUZZERS = $(patsubst fuzz/%.c,%,$(filter-out fuzz/fuzz.h,$(wildcard fuzz/*.c)))
 # build/ inside DIR (DIR itself may be in one: a site's prod tree is),
 # compiled with DIR and DIR/gen on the include path. A second build of
 # the same app from another DIR takes a B= of its own, or the two share
-# objects and binaries. An app's DIR/vendor/ is code it took from
+# objects and binaries. Several pairs go space-separated (the box's host
+# carries neurosys and comms). An app's DIR/vendor/ is code it took from
 # elsewhere (comms's SQLite amalgamation): compiled with it, but with
 # warnings off and EXTERNAL_VENDOR_CFLAGS_<name> added, and left out of
 # every lint
@@ -114,7 +115,7 @@ EXTERNAL_APPS ?=
 ext_name = $(word 1,$(subst =, ,$(1)))
 ext_dir = $(word 2,$(subst =, ,$(1)))
 EXT_NAMES = $(foreach e,$(EXTERNAL_APPS),$(call ext_name,$(e)))
-ext_dir_of = $(foreach e,$(EXTERNAL_APPS),$(if $(filter $(1),$(call ext_name,$(e))),$(call ext_dir,$(e))))
+ext_dir_of = $(strip $(foreach e,$(EXTERNAL_APPS),$(if $(filter $(1),$(call ext_name,$(e))),$(call ext_dir,$(e)))))
 ext_src = $(shell cd $(call ext_dir_of,$(1)) && find . -name '*.c' -not -path './build/*' \
 	-not -path '*/build/*' | sed 's|^\./|$(call ext_dir_of,$(1))/|' | sort)
 APPS = $(notdir $(wildcard apps/*)) $(EXT_NAMES)

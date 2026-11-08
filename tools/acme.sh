@@ -118,9 +118,9 @@ check "cserve started with no names yet, and said so" grep -q "no names yet" "$t
 
 # 1. the first issuance
 check "cserve-acme: both names issued" acme
-check "their pairs in place, the key 0600" \
+check "their pairs in place, the key 0640 (its group reads it)" \
     test -s "$tmp/certs/a.localhost/cert.pem" -a -s "$tmp/certs/b.localhost/key.pem" \
-    -a "$(stat -c %a "$tmp/certs/a.localhost/key.pem")" = 600
+    -a "$(stat -c %a "$tmp/certs/a.localhost/key.pem")" = 640
 check "the account key made 0600" test "$(stat -c %a "$tmp/account.key")" = 600
 check "no challenge answer left behind" test -z "$(ls -A "$tmp/challenges")"
 kill -HUP "$cserve_pid"
