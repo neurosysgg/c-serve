@@ -381,8 +381,12 @@ static void tarpit(const char *bin, const char *app) {
   t = ms_now();
   got = read_all(send_raw(&h, TRY("slow.txt")));
   took = ms_now() - t;
-  CSERVE_TEST_ASSERT(got && strstr(got, " 401 ") && took < 900,
-                     "%s --no-tarpit: the 401 at once (%ld ms)", bin, took);
+  /* at once: the password check's own cost (timed above; under a
+   * sanitizer the crypto is instrumented too), never the tarpit's second
+   * on top of it */
+  CSERVE_TEST_ASSERT(got && strstr(got, " 401 ") && took < check + 700,
+                     "%s --no-tarpit: the 401 at once (%ld ms, a check %ld)",
+                     bin, took, check);
   free(got);
   CSERVE_TEST_ASSERT(stop(&h) == 0, "%s --no-tarpit: and stopped", bin);
 }

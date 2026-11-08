@@ -2,6 +2,10 @@
 
 An HTTP/1.1 server and client over TLS, in C11, with no dependencies beyond libc, pthreads,
 [mbedtls 4](https://www.trustedfirmware.org/projects/mbed-tls/) (with its PSA crypto) and zlib.
+mbedtls is vendored: `vendor/mbedtls/` holds the release tarball, pinned by `VERSION`'s SHA-256,
+and the config it is built with (DTLS-SRTP and threading on). The Makefile checks the tarball,
+unpacks it into `build/` and builds it per variant, so a sanitizer reaches inside the crypto too
+(CMake does that part). `tools/vendor-mbedtls.sh VERSION SHA256` brings in a release.
 It came out of [ctui-wm](https://github.com/neurosysgg/ctui-wm)'s `plugins/net`, history and all,
 and carries a small web host, `cserve`, whose sites are compiled in as first-class apps.
 

@@ -10,10 +10,17 @@ OPT ?= -O2
 CFLAGS = -Wall -Wextra -Wno-format-truncation $(WARN) -std=c11 -Isrc -Ikit -g $(OPT) \
 	-ffunction-sections -fdata-sections
 
-# mbedtls 4 (with its PSA crypto) for TLS, zlib to undo gzip / deflate
-PKGS = mbedtls mbedx509 tfpsacrypto zlib
-CFLAGS += $(shell pkg-config --cflags $(PKGS))
-LDLIBS = $(shell pkg-config --libs $(PKGS)) -lpthread
+# mbedtls 4 (with its PSA crypto) for TLS -- the vendored release, built
+# here with vendor/mbedtls/config/ (DTLS-SRTP, threading) into $(MB) -- and
+# the system's zlib to undo gzip / deflate. Everything compiled against
+# mbedtls's headers says the same config files the library was built with:
+# its structs' fields depend on them, and a mismatch is no error, only
+# corrupted memory.
+MB_CONFIG = -DMBEDTLS_USER_CONFIG_FILE='"$(CURDIR)/vendor/mbedtls/config/mbedtls_user.h"' \
+	-DTF_PSA_CRYPTO_USER_CONFIG_FILE='"$(CURDIR)/vendor/mbedtls/config/crypto_user.h"'
+CFLAGS += -I$(CURDIR)/$(MB)/include $(MB_CONFIG) $(shell pkg-config --cflags zlib)
+LDLIBS = $(MB)/lib/libmbedtls.a $(MB)/lib/libmbedx509.a $(MB)/lib/libtfpsacrypto.a \
+	$(shell pkg-config --libs zlib) -lpthread
 
 # `make SAN=1 test`: AddressSanitizer + UBSan, objects of their own
 SAN ?=
@@ -47,6 +54,37 @@ endif
 B = build/$(subst -,,$(OPT))$(if $(SAN),-san)$(if $(TSAN),-tsan)$(if $(FUZZ),-fuzz)
 BIN = $(B)/bin
 obj = $(patsubst %.c,$(B)/%.o,$(1))
+
+# the vendored mbedtls: its tarball checked against VERSION's SHA-256, then
+# unpacked and built for this variant -- the same sanitizers as the rest, so
+# ASan and TSan see inside the crypto too -- and installed into $(MB)
+MB = $(B)/mbedtls
+MB_TAR = $(wildcard vendor/mbedtls/mbedtls-*.tar.bz2)
+MB_STAMP = $(MB)/.built
+MB_CFLAGS = -g $(OPT) -ffunction-sections -fdata-sections \
+	$(filter -fsanitize=% -fno-omit-frame-pointer,$(CFLAGS))
+$(MB_STAMP): $(MB_TAR) vendor/mbedtls/VERSION vendor/mbedtls/config/mbedtls_user.h \
+		vendor/mbedtls/config/crypto_user.h
+	@want=$$(awk '$$1 == "$(notdir $(MB_TAR))" {print $$2}' vendor/mbedtls/VERSION); \
+	  got=$$(sha256sum $(MB_TAR) | cut -d' ' -f1); \
+	  [ -n "$$want" ] && [ "$$got" = "$$want" ] || \
+	    { echo "$(MB_TAR): not the vendored mbedtls (VERSION)"; exit 1; }
+	rm -rf $(B)/mbedtls-src $(B)/mbedtls-build $(MB)
+	mkdir -p $(B)/mbedtls-src
+	tar -xjf $(MB_TAR) -C $(B)/mbedtls-src --strip-components=1
+	cmake -S $(B)/mbedtls-src -B $(B)/mbedtls-build -G Ninja -DCMAKE_BUILD_TYPE=None \
+		-DCMAKE_C_COMPILER=$(CC) -DCMAKE_C_FLAGS="$(MB_CFLAGS)" \
+		-DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
+		-DUSE_SHARED_MBEDTLS_LIBRARY=OFF -DUSE_STATIC_MBEDTLS_LIBRARY=ON \
+		-DMBEDTLS_USER_CONFIG_FILE=$(CURDIR)/vendor/mbedtls/config/mbedtls_user.h \
+		-DTF_PSA_CRYPTO_USER_CONFIG_FILE=$(CURDIR)/vendor/mbedtls/config/crypto_user.h \
+		-DCMAKE_INSTALL_PREFIX=$(CURDIR)/$(MB) > $(B)/mbedtls.log 2>&1 && \
+	  cmake --build $(B)/mbedtls-build >> $(B)/mbedtls.log 2>&1 && \
+	  cmake --install $(B)/mbedtls-build >> $(B)/mbedtls.log 2>&1 || \
+	  { tail -30 $(B)/mbedtls.log; exit 1; }
+	touch $@
+
+mbedtls: $(MB_STAMP)
 
 # kit/ is an app's toolkit (reading a request, the markup tree, catalogs,
 # a page answered): what an app links, which the host itself never calls
@@ -91,11 +129,13 @@ all: $(B)/libcserve.a $(BIN)/cserve $(BIN)/cserve-static $(BIN)/cserve-front \
 
 # made anew: ar updates an archive in place, so an object whose source
 # went (a rename) would stay in it
-$(B)/libcserve.a: $(call obj,$(SRC))
+# the vendored mbedtls rebuilt: everything compiled (objects depend on its
+# stamp, since its config decides its structs) and linked against it again
+$(B)/libcserve.a: $(call obj,$(SRC)) $(MB_STAMP)
 	rm -f $@
-	$(AR) rcs $@ $^
+	$(AR) rcs $@ $(filter %.o,$^)
 
-$(B)/%.o: %.c
+$(B)/%.o: %.c $(MB_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
@@ -110,7 +150,7 @@ define EXT_RULES
 $(B)/ext/$(1)/vendor/%.o: $(2)/vendor/%.c
 	@mkdir -p $$(@D)
 	$$(CC) $$(VENDOR_CFLAGS) $$(EXTERNAL_VENDOR_CFLAGS_$(1)) -fPIC -MMD -MP -c $$< -o $$@
-$(B)/ext/$(1)/%.o: $(2)/%.c
+$(B)/ext/$(1)/%.o: $(2)/%.c $$(MB_STAMP)
 	@mkdir -p $$(@D)
 	$$(CC) $$(CFLAGS) -fPIC -I$(2) -I$(2)/gen -MMD -MP -c $$< -o $$@
 endef
@@ -119,7 +159,7 @@ $(foreach e,$(EXTERNAL_APPS),$(eval $(call EXT_RULES,$(call ext_name,$(e)),$(cal
 # the host, twice: cserve dlopen()s the apps it's given as paths (its own
 # symbols exported for them: -rdynamic, the whole library), cserve-static
 # has STATIC_APPS in its table and no dlopen at all
-$(B)/host/main-dev.o: host/main.c
+$(B)/host/main-dev.o: host/main.c $(MB_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -DCSERVE_DLOPEN -MMD -MP -c $< -o $@
 
@@ -135,7 +175,7 @@ $(B)/gen/apps-static.c: FORCE
 $(B)/gen/apps-dev.c:
 	@mkdir -p $(@D)
 	@printf '#include "app.h"\nconst CSERVE_APP *const cserve_apps[] = {NULL};\n' > $@
-$(B)/gen/%.o: $(B)/gen/%.c
+$(B)/gen/%.o: $(B)/gen/%.c $(MB_STAMP)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BIN)/cserve: $(B)/host/main-dev.o $(B)/gen/apps-dev.o $(B)/libcserve.a
@@ -238,7 +278,11 @@ CPPCHECK_QUIET = nullPointerOutOfMemory nullPointerOutOfResources \
 # literal holding a tag anywhere else in the toolkit or an app is refused
 MARKUP_FREE = $(filter-out kit/markup.c,$(KIT_SRC)) $(wildcard apps/*/*.c) $(EXT_NOT_VENDOR)
 
-lint:
+# the checks lint runs, for a repo that builds on this one (comms)
+tidy-checks:
+	@echo '$(TIDY_CHECKS)'
+
+lint: $(MB_STAMP)
 	@if grep -n '"[^"]*<[A-Za-z/!]' $(MARKUP_FREE); then \
 		echo "markup: a tag written as a string (only kit/markup.c writes '<')"; \
 		exit 1; fi; echo "markup: clean"
@@ -261,5 +305,8 @@ clean:
 
 FORCE:
 
-.PHONY: all test fuzz check abuse lint format clean FORCE
--include $(shell find build -name '*.d' 2>/dev/null)
+.PHONY: all test fuzz check abuse lint format clean FORCE mbedtls tidy-checks
+# the compiler's dependency files -- not the vendored mbedtls's own trees,
+# whose source has *.d directories of its own
+-include $(shell find build -name '*.d' -type f -not -path '*/mbedtls-src/*' \
+	-not -path '*/mbedtls-build/*' 2>/dev/null)

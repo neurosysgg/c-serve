@@ -13,6 +13,14 @@ repo's log and in ctui-wm's HISTORY.md.
   list with ctui-wm's tools/lint.py saying why.
 - **Every parser of outside input has a fuzz case** in `fuzz/`. A mode number, once given, is
   never reused: corpora outlive the code.
+- **mbedtls is the vendored one, never the system's.** `vendor/mbedtls/` holds the release tarball
+  (its SHA-256 in `VERSION`, checked at every build) and `config/`, whose two headers are what we
+  turn on (DTLS-SRTP, threading). Everything compiled against mbedtls's headers passes the same
+  `-D…_USER_CONFIG_FILE`s (`MB_CONFIG`). Without them its structs' fields differ from the library's,
+  and that is no error, only corrupted memory (an ASan find, 2026-11-08). Objects depend on the
+  mbedtls stamp, so a new mbedtls recompiles everything.
+- **Don't run two builds in one `build/<variant>` at once.** They race, and the loser links
+  whatever half-written archive it finds.
 - **Dependencies stay libc, pthreads, mbedtls/tfpsacrypto and zlib** (and `-ldl` for the
   development host alone). No buffer type, no logger, no config of anyone's: a helper that needs
   a caller's buffer takes a callback (`cserve_httpd_escape`), and what the library says goes

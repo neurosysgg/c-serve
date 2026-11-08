@@ -272,8 +272,8 @@ static void test_handshakes(void) {
   CSERVE_TEST_ASSERT(rc == 0 &&
                          cserve_tls_names_reload(s, err, sizeof err) == 0,
                      "reload: the renewed set loads (%s)", err);
-  CSERVE_TEST_ASSERT(ask(a), "reload: a connection begun before it still "
-                             "answers");
+  CSERVE_TEST_ASSERT(a && ask(a), "reload: a connection begun before it still "
+                                  "answers");
   int fa2;
   CSERVE_TLS *a2 = hello(r.port, "a.test", cl, &fa2);
   shown(a2, cn2, fpr2);
@@ -298,8 +298,8 @@ static void test_handshakes(void) {
   CSERVE_TEST_ASSERT(a2 && !strcmp(fpr3, fpr2) && ask(a2),
                      "reload: after a refused one, the set before still "
                      "serves new connections");
-  CSERVE_TEST_ASSERT(ask(a), "reload: and the first connection, begun two "
-                             "sets ago, still answers");
+  CSERVE_TEST_ASSERT(a && ask(a), "reload: and the first connection, begun two "
+                                  "sets ago, still answers");
   cserve_tls_close(a2);
   close(fa2);
   cserve_tls_close(a);
