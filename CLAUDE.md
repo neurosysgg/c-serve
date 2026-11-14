@@ -18,7 +18,10 @@ repo's log and in ctui-wm's HISTORY.md.
   turn on (DTLS-SRTP, threading). Everything compiled against mbedtls's headers passes the same
   `-D…_USER_CONFIG_FILE`s (`MB_CONFIG`). Without them its structs' fields differ from the library's,
   and that is no error, only corrupted memory (an ASan find, 2026-11-08). Objects depend on the
-  mbedtls stamp, so a new mbedtls recompiles everything.
+  mbedtls stamp, so a new mbedtls recompiles everything. This holds for c-serve's own builds:
+  ctui-wm compiles the client and the threaded server (a named list of `src/` files, never the
+  loop's) against the system's mbedtls, headers and library alike, and needs neither DTLS-SRTP
+  nor threading.
 - **Don't run two builds in one `build/<variant>` at once.** They race, and the loser links
   whatever half-written archive it finds.
 - **Dependencies stay libc, pthreads, mbedtls/tfpsacrypto and zlib** (and `-ldl` for the
