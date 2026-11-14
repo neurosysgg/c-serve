@@ -3,6 +3,10 @@
 # the gate before a commit. Nothing is installed: a host compiles src/
 # into itself (ctui-wm does, as a submodule).
 
+# `make` is `make all`, whichever rule comes first below (the mbedtls
+# stamp's did, and a plain make built nothing else)
+.DEFAULT_GOAL := all
+
 CC ?= cc
 OPT ?= -O2
 # -ffunction-sections -fdata-sections: a host's --gc-sections drops what
