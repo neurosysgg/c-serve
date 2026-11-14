@@ -70,7 +70,7 @@ The host, a site's web root and its app:
 build/O2/bin/cserve --listen 127.0.0.1:8081 --root /srv/http/site/public \
     --app build/O2/bin/apps/hello.so [--data DIR] [--workers N] \
     [--certs DIR --listen-tls HOST:PORT...] [--acme-dir DIR] \
-    [--max-conns N] [--per-addr N] [--no-tarpit] [-v]
+    [--max-conns N] [--per-addr N] [--no-tarpit] [--server NAME] [-v]
 ```
 
 `--certs DIR` holds a directory per name, `DIR/<name>/{cert,key}.pem` (a P-256 key, a certificate
@@ -95,6 +95,7 @@ nobody: what runs it (a systemd timer's `ExecStartPost`) sends cserve the SIGHUP
 the ACME server's own CA, for a test server's. `-v` prints the access log (one line per reply, the
 address family and never the address) along with the warnings. `--no-tarpit` turns the brake on
 guessing off, and says so at start; it exists for a diff against a server that has none.
+No reply names the server unless `--server NAME` is given (64 visible characters at most).
 `cserve` loads apps given as a path (`dlopen`, for development); `cserve-static` is linked with
 `STATIC_APPS` (`make STATIC_APPS="hello"`) and loads nothing — `--app hello` picks it from the
 table. A PHP site with its front controller as CGI is `cserve-front`'s (`--cgi php-cgi [--front

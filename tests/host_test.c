@@ -201,7 +201,7 @@ static void pages(const HOST *h, const char *bin) {
   snprintf(inm, sizeof inm, "If-None-Match: %s\r\n", etag);
   char *again = ask_with(h, "GET", "/hello", inm);
   CSERVE_TEST_ASSERT(again && strstr(again, " 304 ") &&
-                         strstr(again, "Content-Length: 0\r\n") &&
+                         !strstr(again, "\r\nContent-Length:") &&
                          !strstr(again, "\r\nContent-Type:") &&
                          strstr(again, CSP),
                      "%s: the copy the client holds: 304", bin);
@@ -242,8 +242,12 @@ static void refusals(const HOST *h, const char *bin) {
   got = ask(h, "OPTIONS", "/hello/x");
   CSERVE_TEST_ASSERT(got && strstr(got, " 204 ") &&
                          strstr(got, "Allow: GET, HEAD, OPTIONS\r\n") &&
-                         !strstr(got, "\r\nContent-Type:"),
-                     "%s: OPTIONS: 204, the methods and OPTIONS", bin);
+                         !strstr(got, "\r\nContent-Type:") &&
+                         !strstr(got, "\r\nContent-Length:") &&
+                         !strstr(got, "\r\nServer:"),
+                     "%s: OPTIONS: 204, the methods and OPTIONS, no length, "
+                     "no Server",
+                     bin);
   free(got);
 }
 
@@ -371,9 +375,9 @@ static void tarpit(const char *bin, const char *app) {
                      "%s: no credentials at all: the plain challenge", bin);
   CSERVE_TEST_ASSERT(stop(&h) == 0, "%s: and stopped", bin);
 
-  const char *off[] = {"--listen",    "127.0.0.1:0", "--root", g_root,
-                       "--app",       app,           "--data", g_data,
-                       "--no-tarpit", NULL};
+  const char *off[] = {"--listen",    "127.0.0.1:0", "--root",  g_root,
+                       "--app",       app,           "--data",  g_data,
+                       "--no-tarpit", "--server",    "c-serve", NULL};
   if (start(&h, bin, off, &status) != 0) {
     CSERVE_TEST_ASSERT(0, "%s --no-tarpit started", bin);
     return;
@@ -384,6 +388,8 @@ static void tarpit(const char *bin, const char *app) {
   /* at once: the password check's own cost (timed above; under a
    * sanitizer the crypto is instrumented too), never the tarpit's second
    * on top of it */
+  CSERVE_TEST_ASSERT(got && strstr(got, "\r\nServer: c-serve\r\n"),
+                     "%s --server: the name it is given", bin);
   CSERVE_TEST_ASSERT(got && strstr(got, " 401 ") && took < check + 700,
                      "%s --no-tarpit: the 401 at once (%ld ms, a check %ld)",
                      bin, took, check);
@@ -590,6 +596,13 @@ static void bound(const char *bin) {
   CSERVE_TEST_ASSERT(start(&h, bin, early, &status) != 0 && status == 2 &&
                          start(&h, bin, bad, &status) != 0 && status == 2,
                      "--for before any --app, or not a lowercase name: usage");
+  const char *crlf[] = {"--listen", "127.0.0.1:0",          "--root", g_root,
+                        "--server", "a\r\nSet-Cookie: x=1", NULL};
+  const char *blank[] = {
+      "--listen", "127.0.0.1:0", "--root", g_root, "--server", "", NULL};
+  CSERVE_TEST_ASSERT(start(&h, bin, crlf, &status) != 0 && status == 2 &&
+                         start(&h, bin, blank, &status) != 0 && status == 2,
+                     "--server that would end its header, or empty: usage");
 }
 
 static void test_hosts(void) {

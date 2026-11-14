@@ -323,8 +323,21 @@ static int usage(void) {
           "       [--certs DIR --listen-tls HOST:PORT...] [--acme-dir DIR]\n"
           "       [--app NAME|PATH.so [--for HOST]... [--app-root DIR]]...\n"
           "       [--data DIR] [--workers N]\n"
-          "       [--max-conns N] [--per-addr N] [--no-tarpit] [-v]\n");
+          "       [--max-conns N] [--per-addr N] [--no-tarpit]\n"
+          "       [--server NAME] [-v]\n");
   return 2;
+}
+
+/* --server's value: 1 to 64 of HTTP's visible characters and spaces, so it
+ * can't end the header or start another: 1, or 0 */
+static int server_ok(const char *a) {
+  size_t n = strlen(a);
+  for (size_t i = 0; i < n; i++) {
+    if (a[i] < 0x20 || a[i] > 0x7e) {
+      return 0;
+    }
+  }
+  return n >= 1 && n <= 64 && a[0] != ' ' && a[n - 1] != ' ';
 }
 
 /* argv[i] as a count from 1 to max: 0, or -1 */
@@ -409,8 +422,7 @@ int main(int argc, char **argv) {
   const char *app_roots[APPS_MAX] = {0};
   int nlisten = 0, napp = 0, tarpit = 1, secure_from = 0;
   int is_tls[LISTEN_MAX] = {0};
-  CSERVE_LOOP_CONFIG cfg = {
-      .handler = handle, .slow = slow, .server = "c-serve"};
+  CSERVE_LOOP_CONFIG cfg = {.handler = handle, .slow = slow};
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
     int more = i + 1 < argc;
@@ -445,6 +457,10 @@ int main(int argc, char **argv) {
     } else if (!strcmp(a, "--per-addr") && more &&
                count(argv[i + 1], 1 << 20, &cfg.per_addr) == 0) {
       i++;
+    } else if (!strcmp(a, "--server") && more && server_ok(argv[i + 1])) {
+      /* no Server header unless asked: what runs here is no stranger's
+       * business */
+      cfg.server = argv[++i];
     } else if (!strcmp(a, "--no-tarpit")) {
       tarpit = 0;
     } else if (!strcmp(a, "-v")) {

@@ -425,7 +425,11 @@ int cserve_httpd_head(const char *server, const CSERVE_HTTPD_REQ *r,
    * reads the reply as a GET's -- curl -X HEAD -- isn't left waiting */
   int sized = rep->pull && rep->stream_length > 0;
   int chunks = rep->pull && !sized && r && r->minor >= 1 && !head_only;
-  if (!rep->pull) {
+  /* a 1xx, 204 or 304 has no length at all (RFC 9110 8.6): a 304's may
+   * only be the 200's, and a 204's or 1xx's never sent */
+  if (!has_body) {
+    length[0] = '\0';
+  } else if (!rep->pull) {
     snprintf(length, sizeof length, "Content-Length: %zu\r\n",
              has_body ? rep->len : 0);
   } else if (sized) {
